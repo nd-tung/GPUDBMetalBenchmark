@@ -1,7 +1,5 @@
 # GPU Database Benchmark
 
-> **Note**: The **ICDE implementation version** is tagged as `icde-v1`. The current codebase includes further optimizations.
-
 GPU-accelerated database operations using Apple Metal vs DuckDB vs CedarDB comparison.
 
 ## Latest Benchmark Results
