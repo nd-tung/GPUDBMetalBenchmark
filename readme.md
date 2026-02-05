@@ -4,71 +4,72 @@ GPU-accelerated database operations using Apple Metal vs DuckDB vs CedarDB compa
 
 ## Latest Benchmark Results
 
-**Timestamp**: 2025-12-25  
+**Timestamp**: 2026-02-01  
+**System**: Apple M4 Pro, 14 CPU cores (10 performance + 4 efficiency), 48 GB RAM, 20 GPU cores, macOS Sequoia 15.5, Metal 3  
 **Methodology**: Warm cache (data pre-loaded), execution time only
 
 <img width="3600" height="1800" alt="sf1_comparison" src="https://github.com/user-attachments/assets/cc16778e-95b4-49ae-9237-21c6de63154b" />
 <img width="3600" height="1800" alt="sf10_comparison" src="https://github.com/user-attachments/assets/657ab6d8-ad19-4894-8bac-8c2055f86292" />
 
-### GPU Metal Results (Timestamp: 20251225_190157)
+### Metal API Results
 
 #### SF-1 Dataset (6M lineitem rows)
-| Query | GPU Time (ms) | CPU Time (ms) | Wall Clock (ms) |
-|-------|--------------|----------------|----------------|
-| Q1    | 26.83        | 0.00           | 26.84          |
-| Q3    | 1.65         | 1.25           | 2.90           |
-| Q6    | 1.65         | 0.00           | 1.65           |
-| Q9    | 23.97        | 0.03           | 24.00          |
-| Q13   | 21.55        | 2.14           | 23.69          |
+| Query | Execution time (ms) |
+|-------|---------------------|
+| Q1    | 6.52                |
+| Q3    | 1.75                |
+| Q6    | 0.86                |
+| Q9    | 5.80                |
+| Q13   | 3.53                |
 
 #### SF-10 Dataset (60M lineitem rows)
-| Query | GPU Time (ms) | CPU Time (ms) | Wall Clock (ms) |
-|-------|--------------|----------------|----------------|
-| Q1    | 157.01       | 0.01           | 157.02         |
-| Q3    | 17.35        | 20.73          | 38.08          |
-| Q6    | 9.66         | 0.00           | 9.67           |
-| Q9    | 364.58       | 0.13           | 364.71         |
-| Q13   | 215.71       | 33.94          | 249.64         |
+| Query | Execution time (ms) |
+|-------|---------------------|
+| Q1    | 34.70               |
+| Q3    | 13.53               |
+| Q6    | 2.12                |
+| Q9    | 82.23               |
+| Q13   | 21.85               |
 
-### DuckDB Results (Timestamp: 20251225_191603)
-
-#### SF-1 Dataset
-| Query | Wall Clock (ms) |
-|-------|-----------------|
-| Q1    | 64              |
-| Q3    | 28              |
-| Q6    | 12              |
-| Q9    | 76              |
-| Q13   | 71              |
-
-#### SF-10 Dataset
-| Query | Wall Clock (ms) |
-|-------|-----------------|
-| Q1    | 574             |
-| Q3    | 276             |
-| Q6    | 102             |
-| Q9    | 1461            |
-| Q13   | 805             |
-
-### CedarDB Results (Timestamp: 20251225_191707)
+### DuckDB Results (SF-1: 20260201_124955, SF-10: 20260201_125031)
 
 #### SF-1 Dataset
-| Query | Wall Clock (ms) |
-|-------|-----------------|
-| Q1    | 91              |
-| Q3    | 117             |
-| Q6    | 8               |
-| Q9    | 489             |
-| Q13   | 166             |
+| Query | Execution time (ms) |
+|-------|---------------------|
+| Q1    | 19.12               |
+| Q3    | 11.47               |
+| Q6    | 4.48                |
+| Q9    | 30.33               |
+| Q13   | 35.15               |
 
 #### SF-10 Dataset
-| Query | Wall Clock (ms) |
-|-------|-----------------|
-| Q1    | 493             |
-| Q3    | 2248            |
-| Q6    | 37              |
-| Q9    | 1666            |
-| Q13   | 2365            |
+| Query | Execution time (ms) |
+|-------|---------------------|
+| Q1    | 153.08              |
+| Q3    | 81.7                |
+| Q6    | 33.67               |
+| Q9    | 253.83              |
+| Q13   | 210.57              |
+
+### CedarDB Results (SF-1: 20260201_131951, SF-10: 20260201_132006)
+
+#### SF-1 Dataset
+| Query | Execution time (ms) |
+|-------|---------------------|
+| Q1    | 27.274              |
+| Q3    | 10.559              |
+| Q6    | 1.043               |
+| Q9    | 38.951              |
+| Q13   | 33.253              |
+
+#### SF-10 Dataset
+| Query | Execution time (ms) |
+|-------|---------------------|
+| Q1    | 141.963             |
+| Q3    | 178.606             |
+| Q6    | 5.737               |
+| Q9    | 479.747             |
+| Q13   | 605.358             |
 
 ## How to Run Benchmarks
 
