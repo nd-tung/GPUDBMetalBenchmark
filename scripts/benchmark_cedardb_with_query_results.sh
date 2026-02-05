@@ -7,6 +7,7 @@ set -e
 # Parse command line arguments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+SCHEMA_LOCAL_PATH="$PROJECT_ROOT/sql/schema.sql"
 SCALE_FACTOR=${1:-SF-1}
 DATA_DIR="$PROJECT_ROOT/data/${SCALE_FACTOR}"
 RESULTS_FILE="$PROJECT_ROOT/results/cedardb_results.csv"
@@ -36,6 +37,45 @@ mkdir -p "${LOG_DIR}/${TIMESTAMP}"
 if [ ! -f "${RESULTS_FILE}" ]; then
     echo "timestamp,scale_factor,query,execution_time_ms" > "${RESULTS_FILE}"
 fi
+
+round_ms() {
+    local raw="$1"
+    raw="$(echo "$raw" | head -n 1 | tr -d '[:space:],')"
+    if [ -z "$raw" ]; then
+        echo "0"
+        return 0
+    fi
+    awk -v t="$raw" 'BEGIN{ if(t=="" || t==".") {print 0} else {printf "%.0f", t} }'
+}
+
+schema_table_count() {
+    docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb \
+        psql -h localhost -p 5432 -U "${CEDAR_USER}" -d "${CEDAR_DB}" -tAc \
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('nation','region','part','supplier','partsupp','customer','orders','lineitem');" \
+        2>/dev/null | tr -d '[:space:]' || echo "0"
+}
+
+ensure_schema() {
+    if [ ! -f "${SCHEMA_LOCAL_PATH}" ]; then
+        echo "Error: schema file not found at ${SCHEMA_LOCAL_PATH}"
+        exit 1
+    fi
+
+    local table_count
+    table_count="$(schema_table_count)"
+    if [ "$table_count" -ne 8 ]; then
+        echo "  Creating schema (found ${table_count}/8 tables)..."
+        docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb \
+            psql -h localhost -p 5432 -U "${CEDAR_USER}" -d "${CEDAR_DB}" \
+            -v ON_ERROR_STOP=1 \
+            -c "DROP TABLE IF EXISTS lineitem, orders, customer, partsupp, supplier, part, region, nation CASCADE;" >/dev/null
+
+        docker cp "${SCHEMA_LOCAL_PATH}" cedardb:/tmp/schema.sql
+        docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb \
+            psql -h localhost -p 5432 -U "${CEDAR_USER}" -d "${CEDAR_DB}" \
+            -v ON_ERROR_STOP=1 -f /tmp/schema.sql >/dev/null
+    fi
+}
 
 # Function to run a query, extract timing, and save results
 run_query_with_results() {
@@ -73,7 +113,7 @@ run_query_with_results() {
             exec_time="0"
         else
             # Round to integer milliseconds
-            exec_time=$(printf "%.0f" "$exec_time")
+            exec_time=$(round_ms "$exec_time")
             echo "  ✓ Execution time: ${exec_time} ms"
             echo "  ✓ Results saved to: ${log_file}"
         fi
@@ -112,18 +152,17 @@ fi
 
 if [ "$NEED_RELOAD" -eq 1 ]; then
     if [ "$DB_EXISTS" -eq 1 ]; then
+        ensure_schema
+
         echo "Truncating existing tables to reload with ${SCALE_FACTOR}..."
-        for table in lineitem orders customer partsupp supplier part region nation; do
-            docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb psql -h localhost -p 5432 -U "${CEDAR_USER}" -d "${CEDAR_DB}" -c "TRUNCATE TABLE ${table} CASCADE;" 2>/dev/null || true
-        done
+        docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb \
+            psql -h localhost -p 5432 -U "${CEDAR_USER}" -d "${CEDAR_DB}" \
+            -c "TRUNCATE TABLE lineitem, orders, customer, partsupp, supplier, part, region, nation CASCADE;" 2>/dev/null || true
     else
         echo "Creating TPC-H database..."
         docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb psql -h localhost -p 5432 -U "${CEDAR_USER}" -d postgres -c "CREATE DATABASE ${CEDAR_DB};"
-        
-        # Create schema
-        echo "  Creating schema..."
-        docker cp schema.sql cedardb:/tmp/schema.sql
-        docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb psql -h localhost -p 5432 -U "${CEDAR_USER}" -d "${CEDAR_DB}" -f /tmp/schema.sql
+
+        ensure_schema
     fi
     
     echo "Loading TPC-H data for ${SCALE_FACTOR}..."

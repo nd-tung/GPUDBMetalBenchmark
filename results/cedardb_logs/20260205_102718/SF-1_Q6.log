@@ -1,0 +1,12 @@
+=== CedarDB Q6 Results ===
+Timestamp: 20260205_102718
+Scale Factor: SF-1
+Query: Q6
+
+Timing is on.
+    revenue     
+----------------
+ 123141078.2283
+(1 row)
+
+Time: 2.344 ms
