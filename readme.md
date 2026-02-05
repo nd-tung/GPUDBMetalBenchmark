@@ -8,8 +8,8 @@ GPU-accelerated database operations using Apple Metal vs DuckDB vs CedarDB compa
 **System**: Apple M4 Pro, 14 CPU cores (10 performance + 4 efficiency), 48 GB RAM, 20 GPU cores, macOS Sequoia 15.5, Metal 3  
 **Methodology**: Warm cache (data pre-loaded), execution time only
 
-<img width="3600" height="1800" alt="sf1_comparison" src="https://github.com/user-attachments/assets/cc16778e-95b4-49ae-9237-21c6de63154b" />
-<img width="3600" height="1800" alt="sf10_comparison" src="https://github.com/user-attachments/assets/657ab6d8-ad19-4894-8bac-8c2055f86292" />
+<img width="3600" height="1800" alt="sf1_comparison" src="https://github.com/user-attachments/assets/4e1d9462-6db5-4bcb-bb8d-0113a77d7184" />
+<img width="3600" height="1800" alt="sf10_comparison" src="https://github.com/user-attachments/assets/66ab971c-ca04-4c71-b111-3248a50f8819" />
 
 ### Metal API Results
 
