@@ -15,3 +15,4 @@ GPUDBMetalBenchmark/Data/SF-10/
 */xcuserdata/
 DerivedData/
 .vscode/
+temp_tpch/tpch-dbgen/

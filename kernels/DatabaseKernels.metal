@@ -1,6 +1,387 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// ===================================================================
+// SF100 CHUNKED EXECUTION KERNELS
+// ===================================================================
+
+// --- Q1 Chunked: processes a chunk of lineitem rows, accumulating into
+//     per-threadgroup partial buffers (same two-pass integer-cent approach) ---
+kernel void q1_chunked_stage1(
+    const device int*   l_shipdate        [[buffer(0)]],
+    const device char*  l_returnflag      [[buffer(1)]],
+    const device char*  l_linestatus      [[buffer(2)]],
+    const device float* l_quantity        [[buffer(3)]],
+    const device float* l_extendedprice   [[buffer(4)]],
+    const device float* l_discount        [[buffer(5)]],
+    const device float* l_tax             [[buffer(6)]],
+    device long*  p_sum_qty_cents         [[buffer(7)]],
+    device long*  p_sum_base_cents        [[buffer(8)]],
+    device long*  p_sum_disc_price_cents  [[buffer(9)]],
+    device long*  p_sum_charge_cents      [[buffer(10)]],
+    device uint*  p_sum_discount_bp       [[buffer(11)]],
+    device uint*  p_count                 [[buffer(12)]],
+    constant uint& chunk_size             [[buffer(13)]],
+    constant int&  cutoff_date            [[buffer(14)]],
+    constant uint& num_threadgroups       [[buffer(15)]],
+    uint group_id         [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group  [[threads_per_threadgroup]],
+    uint grid_size          [[threads_per_grid]])
+{
+    const int BINS = 6;
+    long sum_qty_c[BINS], sum_base_c[BINS], sum_disc_c[BINS], sum_charge_c[BINS];
+    uint sum_disc_bp[BINS], cnt[BINS];
+    for (int b = 0; b < BINS; ++b) {
+        sum_qty_c[b]=0; sum_base_c[b]=0; sum_disc_c[b]=0; sum_charge_c[b]=0;
+        sum_disc_bp[b]=0u; cnt[b]=0u;
+    }
+
+    auto rf_index = [](char rf) -> int { return (rf=='A')?0:(rf=='N')?1:(rf=='R')?2:-1; };
+    auto ls_index = [](char ls) -> int { return (ls=='F')?0:(ls=='O')?1:-1; };
+
+    for (uint i = (group_id * threads_per_group) + thread_id_in_group;
+         i < chunk_size; i += grid_size) {
+        if (l_shipdate[i] > cutoff_date) continue;
+        int rfi = rf_index(l_returnflag[i]); if (rfi < 0) continue;
+        int lsi = ls_index(l_linestatus[i]); if (lsi < 0) continue;
+        int bin = rfi * 2 + lsi;
+        float base = l_extendedprice[i], qty = l_quantity[i], d = l_discount[i], t = l_tax[i];
+        long base_c = (long)floor(base * 100.0f + 0.5f);
+        long qty_c  = (long)floor(qty  * 100.0f + 0.5f);
+        int  d_bp   = (int)floor(d * 100.0f + 0.5f);
+        int  t_bp   = (int)floor(t * 100.0f + 0.5f);
+        long disc_c   = (base_c * (long)(100 - d_bp) + 50) / 100;
+        long charge_c = (disc_c * (long)(100 + t_bp) + 50) / 100;
+        sum_qty_c[bin] += qty_c; sum_base_c[bin] += base_c;
+        sum_disc_c[bin] += disc_c; sum_charge_c[bin] += charge_c;
+        sum_disc_bp[bin] += (uint)d_bp; cnt[bin] += 1u;
+    }
+
+    // Threadgroup reduction
+    threadgroup long tg64[1024];
+    threadgroup uint tg32[1024];
+
+    for (int b = 0; b < BINS; ++b) {
+        // qty
+        tg64[thread_id_in_group] = sum_qty_c[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+            if (thread_id_in_group < stride) tg64[thread_id_in_group] += tg64[thread_id_in_group + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (thread_id_in_group == 0) p_sum_qty_cents[group_id * BINS + b] = tg64[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // base
+        tg64[thread_id_in_group] = sum_base_c[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+            if (thread_id_in_group < stride) tg64[thread_id_in_group] += tg64[thread_id_in_group + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (thread_id_in_group == 0) p_sum_base_cents[group_id * BINS + b] = tg64[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // disc_price
+        tg64[thread_id_in_group] = sum_disc_c[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+            if (thread_id_in_group < stride) tg64[thread_id_in_group] += tg64[thread_id_in_group + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (thread_id_in_group == 0) p_sum_disc_price_cents[group_id * BINS + b] = tg64[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // charge
+        tg64[thread_id_in_group] = sum_charge_c[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+            if (thread_id_in_group < stride) tg64[thread_id_in_group] += tg64[thread_id_in_group + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (thread_id_in_group == 0) p_sum_charge_cents[group_id * BINS + b] = tg64[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // discount_bp
+        tg32[thread_id_in_group] = sum_disc_bp[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+            if (thread_id_in_group < stride) tg32[thread_id_in_group] += tg32[thread_id_in_group + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (thread_id_in_group == 0) p_sum_discount_bp[group_id * BINS + b] = tg32[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // count
+        tg32[thread_id_in_group] = cnt[b];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+            if (thread_id_in_group < stride) tg32[thread_id_in_group] += tg32[thread_id_in_group + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (thread_id_in_group == 0) p_count[group_id * BINS + b] = tg32[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Q1 chunked stage2: identical to existing q1_bins_reduce_int_stage2
+kernel void q1_chunked_stage2(
+    const device long* p_sum_qty_cents,
+    const device long* p_sum_base_cents,
+    const device long* p_sum_disc_price_cents,
+    const device long* p_sum_charge_cents,
+    const device uint* p_sum_discount_bp,
+    const device uint* p_count,
+    device long* out_sum_qty_cents,
+    device long* out_sum_base_cents,
+    device long* out_sum_disc_price_cents,
+    device long* out_sum_charge_cents,
+    device uint* out_sum_discount_bp,
+    device uint* out_count,
+    constant uint& num_threadgroups,
+    uint index [[thread_position_in_grid]])
+{
+    if (index != 0) return;
+    const uint BINS = 6;
+    for (uint b = 0; b < BINS; ++b) {
+        long s_qty = 0, s_base = 0, s_disc = 0, s_charge = 0;
+        uint s_dbp = 0, s_cnt = 0;
+        for (uint g = 0; g < num_threadgroups; ++g) {
+            uint idx = g * BINS + b;
+            s_qty    += p_sum_qty_cents[idx];
+            s_base   += p_sum_base_cents[idx];
+            s_disc   += p_sum_disc_price_cents[idx];
+            s_charge += p_sum_charge_cents[idx];
+            s_dbp    += p_sum_discount_bp[idx];
+            s_cnt    += p_count[idx];
+        }
+        out_sum_qty_cents[b]        = s_qty;
+        out_sum_base_cents[b]       = s_base;
+        out_sum_disc_price_cents[b] = s_disc;
+        out_sum_charge_cents[b]     = s_charge;
+        out_sum_discount_bp[b]      = s_dbp;
+        out_count[b]                = s_cnt;
+    }
+}
+
+// --- Q6 Chunked: processes a chunk of lineitem rows ---
+kernel void q6_chunked_stage1(
+    const device int*   l_shipdate        [[buffer(0)]],
+    const device float* l_discount        [[buffer(1)]],
+    const device float* l_quantity        [[buffer(2)]],
+    const device float* l_extendedprice   [[buffer(3)]],
+    device float* partial_revenues        [[buffer(4)]],
+    constant uint& chunk_size             [[buffer(5)]],
+    constant int&  start_date             [[buffer(6)]],
+    constant int&  end_date               [[buffer(7)]],
+    constant float& min_discount          [[buffer(8)]],
+    constant float& max_discount          [[buffer(9)]],
+    constant float& max_quantity          [[buffer(10)]],
+    uint group_id           [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group  [[threads_per_threadgroup]],
+    uint grid_size          [[threads_per_grid]])
+{
+    float local_revenue = 0.0f;
+    for (uint i = (group_id * threads_per_group) + thread_id_in_group;
+         i < chunk_size; i += grid_size) {
+        if (l_shipdate[i] >= start_date && l_shipdate[i] < end_date &&
+            l_discount[i] >= min_discount && l_discount[i] <= max_discount &&
+            l_quantity[i] < max_quantity) {
+            local_revenue += l_extendedprice[i] * l_discount[i];
+        }
+    }
+    threadgroup float shared[1024];
+    shared[thread_id_in_group] = local_revenue;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+        if (thread_id_in_group < stride) shared[thread_id_in_group] += shared[thread_id_in_group + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (thread_id_in_group == 0) partial_revenues[group_id] = shared[0];
+}
+
+// Q6 chunked stage2: reduce partials to a single value
+kernel void q6_chunked_stage2(
+    const device float* partial_revenues [[buffer(0)]],
+    device float* final_revenue          [[buffer(1)]],
+    constant uint& num_threadgroups      [[buffer(2)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index != 0) return;
+    float total = 0.0f;
+    for (uint i = 0; i < num_threadgroups; ++i) total += partial_revenues[i];
+    final_revenue[0] = total;
+}
+
+// ===================================================================
+// SF100 RADIX PARTITIONED HASH JOIN KERNELS
+// ===================================================================
+
+constant uint SF100_RADIX_BITS = 10;
+constant uint SF100_NUM_PARTITIONS = 1024; // 1 << 10
+
+inline uint sf100_hash_key(int key) {
+    uint h = as_type<uint>(key);
+    h ^= h >> 16;
+    h *= 0x45d9f3b;
+    h ^= h >> 16;
+    return h;
+}
+
+inline uint sf100_get_partition(int key) {
+    return sf100_hash_key(key) & (SF100_NUM_PARTITIONS - 1);
+}
+
+// Phase 1: Build histogram — count rows per partition (with threadgroup-local histogram)
+kernel void sf100_radix_histogram(
+    device const int*  keys       [[buffer(0)]],
+    device atomic_uint* histogram [[buffer(1)]],
+    constant uint& num_rows       [[buffer(2)]],
+    uint tid              [[thread_position_in_grid]],
+    uint grid_size        [[threads_per_grid]],
+    uint tg_tid           [[thread_index_in_threadgroup]],
+    uint threads_per_tg   [[threads_per_threadgroup]])
+{
+    threadgroup uint local_hist[1024]; // SF100_NUM_PARTITIONS
+    for (uint i = tg_tid; i < 1024; i += threads_per_tg) local_hist[i] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < num_rows; i += grid_size) {
+        uint part = sf100_get_partition(keys[i]);
+        atomic_fetch_add_explicit((threadgroup atomic_uint*)&local_hist[part], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tg_tid; i < 1024; i += threads_per_tg) {
+        if (local_hist[i] > 0)
+            atomic_fetch_add_explicit(&histogram[i], local_hist[i], memory_order_relaxed);
+    }
+}
+
+// Phase 2: Exclusive prefix sum on histogram (single threadgroup for 1024 elements)
+kernel void sf100_radix_prefix_sum(
+    device uint* histogram       [[buffer(0)]],
+    device uint* total_counts    [[buffer(1)]],
+    constant uint& num_partitions [[buffer(2)]],
+    uint tid         [[thread_index_in_threadgroup]],
+    uint tg_size     [[threads_per_threadgroup]])
+{
+    threadgroup uint shared[1024];
+    for (uint i = tid; i < num_partitions; i += tg_size) {
+        shared[i] = histogram[i];
+        total_counts[i] = histogram[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Blelloch exclusive scan — up-sweep
+    for (uint stride = 1; stride < num_partitions; stride *= 2) {
+        uint max_idx = num_partitions / (2 * stride);
+        for (uint i = tid; i < max_idx; i += tg_size) {
+            uint idx = (2 * stride) * (i + 1) - 1;
+            shared[idx] += shared[idx - stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) shared[num_partitions - 1] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Down-sweep
+    for (uint stride = num_partitions / 2; stride >= 1; stride /= 2) {
+        uint max_idx = num_partitions / (2 * stride);
+        for (uint i = tid; i < max_idx; i += tg_size) {
+            uint idx = (2 * stride) * (i + 1) - 1;
+            uint temp = shared[idx];
+            shared[idx] += shared[idx - stride];
+            shared[idx - stride] = temp;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = tid; i < num_partitions; i += tg_size) histogram[i] = shared[i];
+}
+
+// Phase 3: Scatter keys and payloads into partitioned positions
+kernel void sf100_radix_scatter(
+    device const int*  keys_in     [[buffer(0)]],
+    device const int*  payload_in  [[buffer(1)]],
+    device int*        keys_out    [[buffer(2)]],
+    device int*        payload_out [[buffer(3)]],
+    device atomic_uint* offsets    [[buffer(4)]],
+    constant uint& num_rows        [[buffer(5)]],
+    uint tid        [[thread_position_in_grid]],
+    uint grid_size  [[threads_per_grid]])
+{
+    for (uint i = tid; i < num_rows; i += grid_size) {
+        int key = keys_in[i];
+        uint part = sf100_get_partition(key);
+        uint pos = atomic_fetch_add_explicit(&offsets[part], 1u, memory_order_relaxed);
+        keys_out[pos] = key;
+        payload_out[pos] = payload_in[i];
+    }
+}
+
+// Phase 4: Per-partition local hash join (build + probe in threadgroup memory)
+constant uint SF100_LOCAL_HT_CAP = 16384; // per-partition hash table capacity
+
+kernel void sf100_partition_join(
+    device const int* build_keys      [[buffer(0)]],
+    device const int* build_payloads  [[buffer(1)]],
+    constant uint& build_count        [[buffer(2)]],
+    device const int* probe_keys      [[buffer(3)]],
+    device const int* probe_payloads  [[buffer(4)]],
+    constant uint& probe_count        [[buffer(5)]],
+    device int*       out_build_idx   [[buffer(6)]],
+    device int*       out_probe_idx   [[buffer(7)]],
+    device atomic_uint* out_count     [[buffer(8)]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint tg_size      [[threads_per_threadgroup]])
+{
+    // Use threadgroup memory for hash table
+    threadgroup int ht_keys[SF100_LOCAL_HT_CAP];
+    threadgroup int ht_vals[SF100_LOCAL_HT_CAP];
+
+    for (uint i = tid; i < SF100_LOCAL_HT_CAP; i += tg_size) ht_keys[i] = -1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Build phase
+    for (uint i = tid; i < build_count; i += tg_size) {
+        int key = build_keys[i];
+        uint h = sf100_hash_key(key) & (SF100_LOCAL_HT_CAP - 1);
+        for (uint j = 0; j < SF100_LOCAL_HT_CAP; ++j) {
+            uint slot = (h + j) & (SF100_LOCAL_HT_CAP - 1);
+            int expected = -1;
+            if (atomic_compare_exchange_weak_explicit(
+                    (threadgroup atomic_int*)&ht_keys[slot], &expected, key,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                ht_vals[slot] = (int)i;
+                break;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Probe phase
+    for (uint i = tid; i < probe_count; i += tg_size) {
+        int key = probe_keys[i];
+        uint h = sf100_hash_key(key) & (SF100_LOCAL_HT_CAP - 1);
+        for (uint j = 0; j < SF100_LOCAL_HT_CAP; ++j) {
+            uint slot = (h + j) & (SF100_LOCAL_HT_CAP - 1);
+            int sk = ht_keys[slot];
+            if (sk == -1) break;
+            if (sk == key) {
+                uint out_idx = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+                out_build_idx[out_idx] = ht_vals[slot];
+                out_probe_idx[out_idx] = (int)i;
+            }
+        }
+    }
+}
+
+// ===================================================================
+// END SF100 KERNELS
+// ===================================================================
+
 // --- SELECTION KERNELS ---
 // SELECT * FROM lineitem WHERE column < filterValue;
 kernel void selection_kernel(const device int  *inData,        // Input data column

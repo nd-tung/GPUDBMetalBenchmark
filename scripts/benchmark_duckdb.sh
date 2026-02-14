@@ -465,7 +465,7 @@ cleanup() {
 
 # Main execution
 main() {
-    local scale_factors=("SF-1" "SF-10")
+    local scale_factors=("SF-1" "SF-10" "SF-100")
     
     # Handle command line arguments
     if [[ $# -gt 0 ]]; then

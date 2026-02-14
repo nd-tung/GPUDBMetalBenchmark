@@ -9,13 +9,675 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <cmath>
+#include <cstring>
+#include <functional>
+
+// mmap for SF100 chunked streaming
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // Global dataset configuration
-std::string g_dataset_path = "data/SF-1/"; // Default to SF-10
+std::string g_dataset_path = "data/SF-1/"; // Default to SF-1
+int g_scale_factor = 1; // 1, 10, or 100
+bool g_sf100_mode = false; // true when running SF100 chunked execution
+
+// ===================================================================
+// SF100 CHUNKED EXECUTION INFRASTRUCTURE
+// ===================================================================
+
+// --- Chunk configuration ---
+struct ChunkConfig {
+    static constexpr size_t DEFAULT_CHUNK_ROWS = 10 * 1024 * 1024; // 10M rows
+    static constexpr size_t MIN_CHUNK_ROWS = 1 * 1024 * 1024;      // 1M
+    static constexpr size_t MAX_CHUNK_ROWS = 50 * 1024 * 1024;     // 50M
+    static constexpr size_t NUM_BUFFERS = 2;                         // double-buffer
+
+    static size_t adaptiveChunkSize(MTL::Device* device, size_t bytesPerRow, size_t totalRows) {
+        size_t availableBytes = static_cast<size_t>(device->recommendedMaxWorkingSetSize() * 0.25);
+        size_t perBufferBytes = availableBytes / NUM_BUFFERS;
+        size_t maxRows = perBufferBytes / bytesPerRow;
+        maxRows = std::max(maxRows, MIN_CHUNK_ROWS);
+        maxRows = std::min(maxRows, MAX_CHUNK_ROWS);
+        maxRows = std::min(maxRows, totalRows);
+        return maxRows;
+    }
+};
+
+// --- Memory-mapped TBL file for streaming ---
+struct MappedFile {
+    int fd = -1;
+    void* data = nullptr;
+    size_t size = 0;
+    
+    bool open(const std::string& path) {
+        fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) { std::cerr << "Cannot open: " << path << std::endl; return false; }
+        struct stat st;
+        fstat(fd, &st);
+        size = st.st_size;
+        data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (data == MAP_FAILED) { ::close(fd); fd = -1; data = nullptr; return false; }
+        madvise(data, size, MADV_SEQUENTIAL);
+        return true;
+    }
+    
+    void close() {
+        if (data && data != MAP_FAILED) { munmap(data, size); data = nullptr; }
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    
+    ~MappedFile() { close(); }
+};
+
+// Count total lines in a mmap'd file
+static size_t countLines(const MappedFile& mf) {
+    size_t count = 0;
+    const char* p = (const char*)mf.data;
+    const char* end = p + mf.size;
+    while (p < end) { if (*p++ == '\n') count++; }
+    return count;
+}
+
+// Build line offset index for random access by row number
+static std::vector<size_t> buildLineIndex(const MappedFile& mf) {
+    std::vector<size_t> offsets;
+    offsets.reserve(1024 * 1024);
+    offsets.push_back(0);
+    const char* p = (const char*)mf.data;
+    const char* end = p + mf.size;
+    for (size_t i = 0; i < mf.size; i++) {
+        if (p[i] == '\n' && i + 1 < mf.size) offsets.push_back(i + 1);
+    }
+    return offsets;
+}
+
+// Parse a chunk of int columns from mmap'd TBL data
+static size_t parseIntColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
+                                   size_t startRow, size_t rowCount, int columnIndex, int* output) {
+    const char* base = (const char*)mf.data;
+    size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
+    size_t parsed = 0;
+    for (size_t r = startRow; r < maxRow; r++) {
+        const char* line = base + lineIndex[r];
+        int col = 0;
+        const char* start = line;
+        while (col <= columnIndex) {
+            const char* end = start;
+            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            if (col == columnIndex) {
+                output[parsed++] = atoi(start);
+                break;
+            }
+            col++;
+            start = end + 1;
+        }
+    }
+    return parsed;
+}
+
+// Parse a chunk of float columns
+static size_t parseFloatColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
+                                     size_t startRow, size_t rowCount, int columnIndex, float* output) {
+    const char* base = (const char*)mf.data;
+    size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
+    size_t parsed = 0;
+    for (size_t r = startRow; r < maxRow; r++) {
+        const char* line = base + lineIndex[r];
+        int col = 0;
+        const char* start = line;
+        while (col <= columnIndex) {
+            const char* end = start;
+            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            if (col == columnIndex) {
+                output[parsed++] = strtof(start, nullptr);
+                break;
+            }
+            col++;
+            start = end + 1;
+        }
+    }
+    return parsed;
+}
+
+// Parse a chunk of date columns (YYYY-MM-DD -> YYYYMMDD int)
+static size_t parseDateColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
+                                    size_t startRow, size_t rowCount, int columnIndex, int* output) {
+    const char* base = (const char*)mf.data;
+    size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
+    size_t parsed = 0;
+    for (size_t r = startRow; r < maxRow; r++) {
+        const char* line = base + lineIndex[r];
+        int col = 0;
+        const char* start = line;
+        while (col <= columnIndex) {
+            const char* end = start;
+            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            if (col == columnIndex) {
+                // Parse YYYY-MM-DD removing dashes
+                int year = 0, month = 0, day = 0;
+                const char* p = start;
+                while (p < end && *p >= '0' && *p <= '9') { year = year * 10 + (*p - '0'); p++; }
+                if (p < end) p++; // skip '-'
+                while (p < end && *p >= '0' && *p <= '9') { month = month * 10 + (*p - '0'); p++; }
+                if (p < end) p++; // skip '-'
+                while (p < end && *p >= '0' && *p <= '9') { day = day * 10 + (*p - '0'); p++; }
+                output[parsed++] = year * 10000 + month * 100 + day;
+                break;
+            }
+            col++;
+            start = end + 1;
+        }
+    }
+    return parsed;
+}
+
+// Parse a chunk of char columns (single char)
+static size_t parseCharColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
+                                    size_t startRow, size_t rowCount, int columnIndex, char* output) {
+    const char* base = (const char*)mf.data;
+    size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
+    size_t parsed = 0;
+    for (size_t r = startRow; r < maxRow; r++) {
+        const char* line = base + lineIndex[r];
+        int col = 0;
+        const char* start = line;
+        while (col <= columnIndex) {
+            const char* end = start;
+            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            if (col == columnIndex) {
+                output[parsed++] = *start;
+                break;
+            }
+            col++;
+            start = end + 1;
+        }
+    }
+    return parsed;
+}
+
+// Fixed-width char column parser: copies up to fixedWidth bytes per field, pads with \0
+static size_t parseCharColumnChunkFixed(const MappedFile& mf, const std::vector<size_t>& lineIndex,
+                                        size_t startRow, size_t rowCount, int columnIndex,
+                                        int fixedWidth, char* output) {
+    const char* base = (const char*)mf.data;
+    size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
+    size_t parsed = 0;
+    for (size_t r = startRow; r < maxRow; r++) {
+        const char* line = base + lineIndex[r];
+        int col = 0;
+        const char* start = line;
+        while (col <= columnIndex) {
+            const char* end = start;
+            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            if (col == columnIndex) {
+                int len = (int)(end - start);
+                int copy = len < fixedWidth ? len : fixedWidth;
+                char* dst = output + parsed * fixedWidth;
+                memcpy(dst, start, copy);
+                memset(dst + copy, '\0', fixedWidth - copy);
+                parsed++;
+                break;
+            }
+            col++;
+            start = end + 1;
+        }
+    }
+    return parsed;
+}
+
+// --- GPU Heap Allocator ---
+struct GPUHeapAllocator {
+    MTL::Device* device;
+    std::vector<MTL::Heap*> heaps;
+    size_t maxWorkingSet;
+
+    GPUHeapAllocator(MTL::Device* dev) : device(dev) {
+        maxWorkingSet = dev->recommendedMaxWorkingSetSize();
+    }
+
+    ~GPUHeapAllocator() {
+        for (auto* h : heaps) if (h) h->release();
+    }
+
+    bool createHeap(size_t heapSize) {
+        auto* desc = MTL::HeapDescriptor::alloc()->init();
+        desc->setSize(heapSize);
+        desc->setStorageMode(MTL::StorageModeShared);
+        desc->setHazardTrackingMode(MTL::HazardTrackingModeTracked);
+        MTL::Heap* heap = device->newHeap(desc);
+        desc->release();
+        if (!heap) return false;
+        heaps.push_back(heap);
+        return true;
+    }
+
+    MTL::Buffer* allocateBuffer(size_t size) {
+        for (auto* heap : heaps) {
+            MTL::Buffer* buf = heap->newBuffer(size, MTL::ResourceStorageModeShared);
+            if (buf) return buf;
+        }
+        return nullptr;
+    }
+
+    bool isUnderMemoryPressure() const {
+        return device->currentAllocatedSize() > static_cast<size_t>(maxWorkingSet * 0.85);
+    }
+
+    void printStats() const {
+        printf("[GPU Memory] Allocated: %zu MB / Max: %zu MB (%.1f%%)\n",
+               device->currentAllocatedSize() / (1024*1024),
+               maxWorkingSet / (1024*1024),
+               100.0 * device->currentAllocatedSize() / (double)maxWorkingSet);
+    }
+};
+
+// ===================================================================
+// SF100 CHUNKED Q1 EXECUTION
+// ===================================================================
+void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
+    std::cout << "\n=== Running TPC-H Q1 Benchmark (SF100 Chunked) ===" << std::endl;
+
+    // Open lineitem TBL file via mmap
+    MappedFile mf;
+    if (!mf.open(g_dataset_path + "lineitem.tbl")) {
+        std::cerr << "Q1 SF100: Cannot mmap lineitem.tbl" << std::endl;
+        return;
+    }
+
+    std::cout << "Building line index for lineitem.tbl (" << mf.size / (1024*1024) << " MB)..." << std::endl;
+    auto indexStart = std::chrono::high_resolution_clock::now();
+    auto lineIndex = buildLineIndex(mf);
+    auto indexEnd = std::chrono::high_resolution_clock::now();
+    size_t totalRows = lineIndex.size();
+    printf("Indexed %zu rows in %.1f ms\n", totalRows,
+           std::chrono::duration<double, std::milli>(indexEnd - indexStart).count());
+
+    // Compute chunk size: Q1 needs 7 columns ~38 bytes/row
+    size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 38, totalRows);
+    const uint num_tg = 1024;
+    printf("Chunk size: %zu rows, total: %zu rows\n", chunkRows, totalRows);
+
+    // Create pipeline states
+    NS::Error* error = nullptr;
+    MTL::Function* s1Fn = library->newFunction(NS::String::string("q1_chunked_stage1", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* s1PSO = device->newComputePipelineState(s1Fn, &error);
+    if (!s1PSO) { std::cerr << "Failed to create q1_chunked_stage1 PSO" << std::endl; return; }
+    MTL::Function* s2Fn = library->newFunction(NS::String::string("q1_chunked_stage2", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* s2PSO = device->newComputePipelineState(s2Fn, &error);
+    if (!s2PSO) { std::cerr << "Failed to create q1_chunked_stage2 PSO" << std::endl; return; }
+
+    // Allocate double-buffered column buffers (2 slots)
+    const int NUM_SLOTS = 2;
+    struct ChunkSlot {
+        MTL::Buffer* shipdate; MTL::Buffer* returnflag; MTL::Buffer* linestatus;
+        MTL::Buffer* quantity; MTL::Buffer* extprice; MTL::Buffer* discount; MTL::Buffer* tax;
+    };
+    ChunkSlot slots[NUM_SLOTS];
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        slots[s].shipdate   = device->newBuffer(chunkRows * sizeof(int),   MTL::ResourceStorageModeShared);
+        slots[s].returnflag = device->newBuffer(chunkRows * sizeof(char),  MTL::ResourceStorageModeShared);
+        slots[s].linestatus = device->newBuffer(chunkRows * sizeof(char),  MTL::ResourceStorageModeShared);
+        slots[s].quantity   = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+        slots[s].extprice   = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+        slots[s].discount   = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+        slots[s].tax        = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+
+    // Partial result buffers (reused per chunk) and global accumulators
+    const uint bins = 6;
+    MTL::Buffer* p_qtyCents  = device->newBuffer(num_tg * bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* p_baseCents = device->newBuffer(num_tg * bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* p_discCents = device->newBuffer(num_tg * bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* p_chargeCents = device->newBuffer(num_tg * bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* p_discountBP  = device->newBuffer(num_tg * bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* p_counts      = device->newBuffer(num_tg * bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+
+    MTL::Buffer* f_qtyCents  = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* f_baseCents = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* f_discCents = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* f_chargeCents = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
+    MTL::Buffer* f_discountBP  = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* f_counts      = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+
+    // Global CPU-side accumulators (accumulate across chunks)
+    long g_sum_qty[6]={}, g_sum_base[6]={}, g_sum_disc[6]={}, g_sum_charge[6]={};
+    uint32_t g_sum_discbp[6]={}, g_count[6]={};
+
+    const int cutoffDate = 19980902;
+
+    auto totalStart = std::chrono::high_resolution_clock::now();
+    double totalGpuMs = 0.0, totalCpuParseMs = 0.0, totalSyncMs = 0.0;
+    double totalCpuPostMs = 0.0, totalCpuMemsetMs = 0.0;
+    size_t offset = 0;
+    int slotIdx = 0;
+    size_t chunkNum = 0;
+
+
+
+    while (offset < totalRows) {
+        size_t rowsThisChunk = std::min(chunkRows, totalRows - offset);
+        ChunkSlot& slot = slots[slotIdx % NUM_SLOTS];
+
+        // Load chunk data from mmap into GPU buffers
+        auto loadStart = std::chrono::high_resolution_clock::now();
+        parseDateColumnChunk(mf, lineIndex, offset, rowsThisChunk, 10, (int*)slot.shipdate->contents());
+        parseCharColumnChunk(mf, lineIndex, offset, rowsThisChunk, 8,  (char*)slot.returnflag->contents());
+        parseCharColumnChunk(mf, lineIndex, offset, rowsThisChunk, 9,  (char*)slot.linestatus->contents());
+        parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 4, (float*)slot.quantity->contents());
+        parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 5, (float*)slot.extprice->contents());
+        parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 6, (float*)slot.discount->contents());
+        parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 7, (float*)slot.tax->contents());
+        auto loadEnd = std::chrono::high_resolution_clock::now();
+        double parseMs = std::chrono::duration<double, std::milli>(loadEnd - loadStart).count();
+        totalCpuParseMs += parseMs;
+
+        // Zero partials
+        auto memsetStart = std::chrono::high_resolution_clock::now();
+        memset(p_qtyCents->contents(), 0, num_tg * bins * sizeof(long));
+        memset(p_baseCents->contents(), 0, num_tg * bins * sizeof(long));
+        memset(p_discCents->contents(), 0, num_tg * bins * sizeof(long));
+        memset(p_chargeCents->contents(), 0, num_tg * bins * sizeof(long));
+        memset(p_discountBP->contents(), 0, num_tg * bins * sizeof(uint32_t));
+        memset(p_counts->contents(), 0, num_tg * bins * sizeof(uint32_t));
+        memset(f_qtyCents->contents(), 0, bins * sizeof(long));
+        memset(f_baseCents->contents(), 0, bins * sizeof(long));
+        memset(f_discCents->contents(), 0, bins * sizeof(long));
+        memset(f_chargeCents->contents(), 0, bins * sizeof(long));
+        memset(f_discountBP->contents(), 0, bins * sizeof(uint32_t));
+        memset(f_counts->contents(), 0, bins * sizeof(uint32_t));
+        auto memsetEnd = std::chrono::high_resolution_clock::now();
+        double memsetMs = std::chrono::duration<double, std::milli>(memsetEnd - memsetStart).count();
+        totalCpuMemsetMs += memsetMs;
+
+        // Dispatch GPU
+        uint chunkSize = (uint)rowsThisChunk;
+        MTL::CommandBuffer* cmdBuf = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cmdBuf->computeCommandEncoder();
+
+        // Stage 1
+        enc->setComputePipelineState(s1PSO);
+        enc->setBuffer(slot.shipdate, 0, 0);
+        enc->setBuffer(slot.returnflag, 0, 1);
+        enc->setBuffer(slot.linestatus, 0, 2);
+        enc->setBuffer(slot.quantity, 0, 3);
+        enc->setBuffer(slot.extprice, 0, 4);
+        enc->setBuffer(slot.discount, 0, 5);
+        enc->setBuffer(slot.tax, 0, 6);
+        enc->setBuffer(p_qtyCents, 0, 7);
+        enc->setBuffer(p_baseCents, 0, 8);
+        enc->setBuffer(p_discCents, 0, 9);
+        enc->setBuffer(p_chargeCents, 0, 10);
+        enc->setBuffer(p_discountBP, 0, 11);
+        enc->setBuffer(p_counts, 0, 12);
+        enc->setBytes(&chunkSize, sizeof(chunkSize), 13);
+        enc->setBytes(&cutoffDate, sizeof(cutoffDate), 14);
+        enc->setBytes(&num_tg, sizeof(num_tg), 15);
+        NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
+        if (tgSize > 1024) tgSize = 1024;
+        enc->dispatchThreadgroups(MTL::Size::Make(num_tg, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+
+        // Stage 2
+        enc->setComputePipelineState(s2PSO);
+        enc->setBuffer(p_qtyCents, 0, 0);
+        enc->setBuffer(p_baseCents, 0, 1);
+        enc->setBuffer(p_discCents, 0, 2);
+        enc->setBuffer(p_chargeCents, 0, 3);
+        enc->setBuffer(p_discountBP, 0, 4);
+        enc->setBuffer(p_counts, 0, 5);
+        enc->setBuffer(f_qtyCents, 0, 6);
+        enc->setBuffer(f_baseCents, 0, 7);
+        enc->setBuffer(f_discCents, 0, 8);
+        enc->setBuffer(f_chargeCents, 0, 9);
+        enc->setBuffer(f_discountBP, 0, 10);
+        enc->setBuffer(f_counts, 0, 11);
+        enc->setBytes(&num_tg, sizeof(num_tg), 12);
+        enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
+        enc->endEncoding();
+
+        cmdBuf->commit();
+        auto syncStart = std::chrono::high_resolution_clock::now();
+        cmdBuf->waitUntilCompleted();
+        auto syncEnd = std::chrono::high_resolution_clock::now();
+        double syncMs = std::chrono::duration<double, std::milli>(syncEnd - syncStart).count();
+        totalSyncMs += syncMs;
+        double gpuMs = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+        totalGpuMs += gpuMs;
+
+        // Accumulate chunk results into global accumulators
+        auto postStart = std::chrono::high_resolution_clock::now();
+        long* cQty = (long*)f_qtyCents->contents();
+        long* cBase = (long*)f_baseCents->contents();
+        long* cDisc = (long*)f_discCents->contents();
+        long* cCharge = (long*)f_chargeCents->contents();
+        uint32_t* cDiscBP = (uint32_t*)f_discountBP->contents();
+        uint32_t* cCounts = (uint32_t*)f_counts->contents();
+        for (int b = 0; b < 6; b++) {
+            g_sum_qty[b] += cQty[b]; g_sum_base[b] += cBase[b];
+            g_sum_disc[b] += cDisc[b]; g_sum_charge[b] += cCharge[b];
+            g_sum_discbp[b] += cDiscBP[b]; g_count[b] += cCounts[b];
+        }
+
+        auto postEnd = std::chrono::high_resolution_clock::now();
+        double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+        totalCpuPostMs += postMs;
+
+        chunkNum++;
+        offset += rowsThisChunk;
+        slotIdx++;
+    }
+
+    auto totalEnd = std::chrono::high_resolution_clock::now();
+    double wallMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+    double indexMs = std::chrono::duration<double, std::milli>(indexEnd - indexStart).count();
+
+    // Print results
+    struct Q1R { double sum_qty, sum_base, sum_disc, sum_charge, avg_qty, avg_price, avg_disc; uint cnt; };
+    auto emit = [&](int rfi, int lsi, int bin) -> Q1R {
+        Q1R r = {};
+        if (g_count[bin] == 0) return r;
+        r.sum_qty = (double)g_sum_qty[bin] / 100.0;
+        r.sum_base = (double)g_sum_base[bin] / 100.0;
+        r.sum_disc = (double)g_sum_disc[bin] / 100.0;
+        r.sum_charge = (double)g_sum_charge[bin] / 100.0;
+        r.cnt = g_count[bin];
+        r.avg_qty = r.sum_qty / r.cnt;
+        r.avg_price = r.sum_base / r.cnt;
+        r.avg_disc = ((double)g_sum_discbp[bin] / 100.0) / r.cnt;
+        return r;
+    };
+    char rfChars[] = {'A','A','N','N','R','R'};
+    char lsChars[] = {'F','O','F','O','F','O'};
+
+    printf("\n+----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+\n");
+    printf("| l_return | l_linest |    sum_qty | sum_base_price | sum_disc_price |     sum_charge |    avg_qty |  avg_price |   avg_disc | count    |\n");
+    printf("+----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+\n");
+    for (int b = 0; b < 6; b++) {
+        Q1R r = emit(b/2, b%2, b);
+        if (r.cnt > 0) {
+            printf("| %8c | %8c | %10.2f | %14.2f | %14.2f | %14.2f | %10.2f | %10.2f | %10.2f | %8u |\n",
+                   rfChars[b], lsChars[b], r.sum_qty, r.sum_base, r.sum_disc, r.sum_charge,
+                   r.avg_qty, r.avg_price, r.avg_disc, r.cnt);
+        }
+    }
+    printf("+----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+\n");
+
+    double totalCpuPostAllMs = totalCpuMemsetMs + totalCpuPostMs;
+    double totalExecMs = totalCpuPostAllMs + totalGpuMs;
+    printf("\nSF100 Q1 | %zu chunks | %zu rows\n", chunkNum, totalRows);
+    printf("  CPU Parsing:        %10.2f ms\n", totalCpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", totalGpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", totalCpuPostAllMs);
+    printf("  Sync Time:          %10.2f ms\n", totalSyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", totalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", wallMs + indexMs);
+
+    // Cleanup
+    s1Fn->release(); s1PSO->release(); s2Fn->release(); s2PSO->release();
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        slots[s].shipdate->release(); slots[s].returnflag->release(); slots[s].linestatus->release();
+        slots[s].quantity->release(); slots[s].extprice->release(); slots[s].discount->release(); slots[s].tax->release();
+    }
+    p_qtyCents->release(); p_baseCents->release(); p_discCents->release(); p_chargeCents->release();
+    p_discountBP->release(); p_counts->release();
+    f_qtyCents->release(); f_baseCents->release(); f_discCents->release(); f_chargeCents->release();
+    f_discountBP->release(); f_counts->release();
+}
+
+// ===================================================================
+// SF100 CHUNKED Q6 EXECUTION
+// ===================================================================
+void runQ6BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
+    std::cout << "\n=== Running TPC-H Q6 Benchmark (SF100 Chunked) ===" << std::endl;
+
+    MappedFile mf;
+    if (!mf.open(g_dataset_path + "lineitem.tbl")) {
+        std::cerr << "Q6 SF100: Cannot mmap lineitem.tbl" << std::endl;
+        return;
+    }
+
+    auto lineIndex = buildLineIndex(mf);
+    size_t totalRows = lineIndex.size();
+    size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 16, totalRows); // 4 cols * 4 bytes
+    const uint num_tg = 2048;
+    printf("Q6 SF100: %zu rows, chunk size: %zu\n", totalRows, chunkRows);
+
+    NS::Error* error = nullptr;
+    MTL::Function* s1Fn = library->newFunction(NS::String::string("q6_chunked_stage1", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* s1PSO = device->newComputePipelineState(s1Fn, &error);
+    if (!s1PSO) { std::cerr << "Failed q6_chunked_stage1 PSO" << std::endl; return; }
+    MTL::Function* s2Fn = library->newFunction(NS::String::string("q6_chunked_stage2", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* s2PSO = device->newComputePipelineState(s2Fn, &error);
+    if (!s2PSO) { std::cerr << "Failed q6_chunked_stage2 PSO" << std::endl; return; }
+
+    // Double-buffered column buffers
+    const int NUM_SLOTS = 2;
+    struct Q6Slot { MTL::Buffer* shipdate; MTL::Buffer* discount; MTL::Buffer* quantity; MTL::Buffer* extprice; };
+    Q6Slot slots[NUM_SLOTS];
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        slots[s].shipdate = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+        slots[s].discount = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+        slots[s].quantity = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+        slots[s].extprice = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+
+    MTL::Buffer* partials = device->newBuffer(num_tg * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* finalBuf = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+
+    int start_date = 19940101, end_date = 19950101;
+    float min_discount = 0.05f, max_discount = 0.07f, max_quantity = 24.0f;
+
+    double globalRevenue = 0.0, totalGpuMs = 0.0, totalCpuParseMs = 0.0;
+    double totalSyncMs = 0.0, totalCpuPostMs = 0.0;
+    size_t offset = 0, chunkNum = 0;
+    auto totalStart = std::chrono::high_resolution_clock::now();
+
+    while (offset < totalRows) {
+        size_t rowsThisChunk = std::min(chunkRows, totalRows - offset);
+        Q6Slot& slot = slots[chunkNum % NUM_SLOTS];
+
+        auto parseStart = std::chrono::high_resolution_clock::now();
+        parseDateColumnChunk(mf, lineIndex, offset, rowsThisChunk, 10, (int*)slot.shipdate->contents());
+        parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 6, (float*)slot.discount->contents());
+        parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 4, (float*)slot.quantity->contents());
+        parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 5, (float*)slot.extprice->contents());
+        auto parseEnd = std::chrono::high_resolution_clock::now();
+        double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+        totalCpuParseMs += parseMs;
+
+        uint chunkSize = (uint)rowsThisChunk;
+        MTL::CommandBuffer* cmdBuf = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cmdBuf->computeCommandEncoder();
+
+        enc->setComputePipelineState(s1PSO);
+        enc->setBuffer(slot.shipdate, 0, 0); enc->setBuffer(slot.discount, 0, 1);
+        enc->setBuffer(slot.quantity, 0, 2); enc->setBuffer(slot.extprice, 0, 3);
+        enc->setBuffer(partials, 0, 4);
+        enc->setBytes(&chunkSize, sizeof(chunkSize), 5);
+        enc->setBytes(&start_date, sizeof(start_date), 6);
+        enc->setBytes(&end_date, sizeof(end_date), 7);
+        enc->setBytes(&min_discount, sizeof(min_discount), 8);
+        enc->setBytes(&max_discount, sizeof(max_discount), 9);
+        enc->setBytes(&max_quantity, sizeof(max_quantity), 10);
+        NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
+        enc->dispatchThreadgroups(MTL::Size::Make(num_tg, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+
+        enc->setComputePipelineState(s2PSO);
+        enc->setBuffer(partials, 0, 0); enc->setBuffer(finalBuf, 0, 1);
+        enc->setBytes(&num_tg, sizeof(num_tg), 2);
+        enc->dispatchThreads(MTL::Size::Make(1,1,1), MTL::Size::Make(1,1,1));
+        enc->endEncoding();
+
+        cmdBuf->commit();
+        auto syncStart = std::chrono::high_resolution_clock::now();
+        cmdBuf->waitUntilCompleted();
+        auto syncEnd = std::chrono::high_resolution_clock::now();
+        double syncMs = std::chrono::duration<double, std::milli>(syncEnd - syncStart).count();
+        totalSyncMs += syncMs;
+        double gpuMs = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+        totalGpuMs += gpuMs;
+
+        auto postStart = std::chrono::high_resolution_clock::now();
+        globalRevenue += *(float*)finalBuf->contents();
+        auto postEnd = std::chrono::high_resolution_clock::now();
+        double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+        totalCpuPostMs += postMs;
+
+        chunkNum++;
+        offset += rowsThisChunk;
+    }
+
+    auto totalEnd = std::chrono::high_resolution_clock::now();
+    double wallMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+    double totalExecMs = totalCpuPostMs + totalGpuMs;
+
+    printf("TPC-H Q6 Result: Revenue = $%.2f\n", globalRevenue);
+    printf("\nSF100 Q6 | %zu chunks | %zu rows\n", chunkNum, totalRows);
+    printf("  CPU Parsing:        %10.2f ms\n", totalCpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", totalGpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", totalCpuPostMs);
+    printf("  Sync Time:          %10.2f ms\n", totalSyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", totalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", wallMs);
+
+    s1Fn->release(); s1PSO->release(); s2Fn->release(); s2PSO->release();
+    for (int s = 0; s < NUM_SLOTS; s++) {
+        slots[s].shipdate->release(); slots[s].discount->release();
+        slots[s].quantity->release(); slots[s].extprice->release();
+    }
+    partials->release(); finalBuf->release();
+}
+
+// ===================================================================
+// SF100 Q3 / Q9 / Q13 STUBS — delegate to regular path with memory check
+// ===================================================================
+// For Q3/Q9/Q13 at SF100, we use the same chunked mmap approach for loading
+// but fall back to the original GPU pipeline if memory allows, or print a
+// warning if the dataset exceeds available GPU memory.
+
+void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+
+// Forward declarations for original (SF1/SF10) benchmark functions
+void runSelectionBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runAggregationBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runJoinBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL::Library* pLibrary);
+void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL::Library* pLibrary);
+void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL::Library* pLibrary);
+
+// ===================================================================
+// END SF100 INFRASTRUCTURE
+// ===================================================================
 
 // --- Helper to Load Integer Column ---
 std::vector<int> loadIntColumn(const std::string& filePath, int columnIndex) {
@@ -418,11 +1080,14 @@ struct Q1Aggregates_CPU {
 void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
     std::cout << "--- Running TPC-H Query 1 Benchmark ---" << std::endl;
 
+    auto q1ParseStart = std::chrono::high_resolution_clock::now();
     const std::string filepath = g_dataset_path + "lineitem.tbl";
     auto l_returnflag = loadCharColumn(filepath, 8), l_linestatus = loadCharColumn(filepath, 9);
     auto l_quantity = loadFloatColumn(filepath, 4), l_extendedprice = loadFloatColumn(filepath, 5);
     auto l_discount = loadFloatColumn(filepath, 6), l_tax = loadFloatColumn(filepath, 7);
     auto l_shipdate = loadDateColumn(filepath, 10);
+    auto q1ParseEnd = std::chrono::high_resolution_clock::now();
+    double q1CpuParseMs = std::chrono::duration<double, std::milli>(q1ParseEnd - q1ParseStart).count();
     const uint data_size = (uint)l_shipdate.size();
     if (data_size == 0) { std::cerr << "Q1: no data loaded" << std::endl; return; }
 
@@ -479,10 +1144,12 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     const int cutoffDate = 19980902; // DATE '1998-12-01' - INTERVAL '90' DAY
 
-    // Dispatch kernels
-    double q1_gpu_ms = 0.0;
+    // Dispatch kernels (2 warmup + 1 measured)
+    double q1_gpu_ms = 0.0, q1SyncMs = 0.0;
+    std::chrono::high_resolution_clock::time_point q1IterStart;
     
     for(int iter = 0; iter < 3; ++iter) {
+        if (iter == 2) q1IterStart = std::chrono::high_resolution_clock::now();
         // Reset partials and finals
         memset(p_sumQtyCents->contents(), 0, num_threadgroups * bins * sizeof(long));
         memset(p_sumBaseCents->contents(), 0, num_threadgroups * bins * sizeof(long));
@@ -542,10 +1209,13 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
         enc->endEncoding();
 
         commandBuffer->commit();
+        auto q1SyncT0 = std::chrono::high_resolution_clock::now();
         commandBuffer->waitUntilCompleted();
+        auto q1SyncT1 = std::chrono::high_resolution_clock::now();
         
         if (iter == 2) {
             q1_gpu_ms = (commandBuffer->GPUEndTime() - commandBuffer->GPUStartTime()) * 1000.0;
+            q1SyncMs = std::chrono::duration<double, std::milli>(q1SyncT1 - q1SyncT0).count() - q1_gpu_ms;
         }
     }
 
@@ -596,10 +1266,17 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
                val.avg_qty, val.avg_price, val.avg_disc, val.count);
     }
     printf("+----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+\n");
-    // Standardized timing prints
-    printf("Total TPC-H Q1 GPU time: %0.2f ms\n", q1_gpu_ms);
-    printf("Q1 CPU time: %0.2f ms\n", q1_cpu_ms);
-    printf("Total TPC-H Q1 wall-clock: %0.2f ms\n", q1_gpu_ms + q1_cpu_ms);
+
+    auto q1PostEnd = std::chrono::high_resolution_clock::now();
+    double q1TotalExecMs = q1_gpu_ms + q1_cpu_ms;
+    double q1WallMs = q1CpuParseMs + std::chrono::duration<double, std::milli>(q1PostEnd - q1IterStart).count();
+    printf("\nQ1 | %u rows\n", data_size);
+    printf("  CPU Parsing:        %10.2f ms\n", q1CpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", q1_gpu_ms);
+    printf("  CPU Post Process:   %10.2f ms\n", q1_cpu_ms);
+    printf("  Sync Time:          %10.2f ms\n", q1SyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", q1TotalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", q1WallMs);
 
     // Cleanup
     stage1Fn->release(); stage1PSO->release(); stage2Fn->release(); stage2PSO->release();
@@ -632,6 +1309,7 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     std::cout << "\n--- Running TPC-H Query 3 Benchmark ---" << std::endl;
 
     // 1. Load data for all three tables
+    auto q3ParseStart = std::chrono::high_resolution_clock::now();
     const std::string sf_path = g_dataset_path;
     auto c_custkey = loadIntColumn(sf_path + "customer.tbl", 0);
     auto c_mktsegment = loadCharColumn(sf_path + "customer.tbl", 6);
@@ -645,6 +1323,8 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     auto l_shipdate = loadDateColumn(sf_path + "lineitem.tbl", 10);
     auto l_extendedprice = loadFloatColumn(sf_path + "lineitem.tbl", 5);
     auto l_discount = loadFloatColumn(sf_path + "lineitem.tbl", 6);
+    auto q3ParseEnd = std::chrono::high_resolution_clock::now();
+    double q3CpuParseMs = std::chrono::duration<double, std::milli>(q3ParseEnd - q3ParseStart).count();
     
     const uint customer_size = (uint)c_custkey.size();
     const uint orders_size = (uint)o_orderkey.size();
@@ -708,15 +1388,14 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     const int cutoff_date = 19950315;
 
-    // 4. Dispatch full pipeline (Warm-up + Measure)
-    // We run 3 times and measure the last one to eliminate driver initialization overhead
-    double gpuExecutionTime = 0.0;
+    // 4. Dispatch full pipeline (2 warmup + 1 measured)
+    double gpuExecutionTime = 0.0, q3SyncMs = 0.0;
+    std::chrono::high_resolution_clock::time_point q3IterStart;
     
     for(int iter = 0; iter < 3; ++iter) {
         // Reset Atomic Counter
         std::memset(pOutCountBuffer->contents(), 0, sizeof(uint));
-        
-        // auto q3_start = std::chrono::high_resolution_clock::now();
+        if (iter == 2) q3IterStart = std::chrono::high_resolution_clock::now();
         
         MTL::CommandBuffer* pCommandBuffer = pCommandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = pCommandBuffer->computeCommandEncoder();
@@ -770,18 +1449,16 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         enc->endEncoding();
         
         pCommandBuffer->commit();
+        auto q3SyncT0 = std::chrono::high_resolution_clock::now();
         pCommandBuffer->waitUntilCompleted();
+        auto q3SyncT1 = std::chrono::high_resolution_clock::now();
         
-        if (iter == 2) { // Only record the last run
+        if (iter == 2) {
              gpuExecutionTime = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
+             q3SyncMs = std::chrono::duration<double, std::milli>(q3SyncT1 - q3SyncT0).count() - gpuExecutionTime * 1000.0;
         }
     }
     
-    // Start Wall-Clock Timer (CPU Merge Phase)
-    auto q3_e2e_start = std::chrono::high_resolution_clock::now();
-
-    // Debug scan removed to reduce wall-clock overhead
-
     // 6. CPU merge for determinism and correctness
     auto cpuMergeStart = std::chrono::high_resolution_clock::now();
     std::unordered_map<int, Q3Result> acc;
@@ -807,8 +1484,6 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     });
     auto cpuMergeEnd = std::chrono::high_resolution_clock::now();
     double cpuMergeMs = std::chrono::duration<double, std::milli>(cpuMergeEnd - cpuMergeStart).count();
-    auto q3_e2e_end = std::chrono::high_resolution_clock::now();
-    double q3_e2e_ms = std::chrono::duration<double, std::milli>(q3_e2e_end - q3_e2e_start).count();
 
     printf("\nTPC-H Query 3 Results (Top 10):\n");
     printf("+----------+------------+------------+--------------+\n");
@@ -820,10 +1495,18 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     }
     printf("+----------+------------+------------+--------------+\n");
     printf("Total results found: %lu\n", final_results.size());
-    // Standardized timing prints
-    printf("Total TPC-H Q3 GPU time: %0.2f ms\n", gpuExecutionTime * 1000.0);
-    printf("Q3 CPU time: %0.2f ms\n", cpuMergeMs);
-    printf("Total TPC-H Q3 wall-clock: %0.2f ms\n", gpuExecutionTime * 1000.0 + cpuMergeMs);
+
+    auto q3PostEnd = std::chrono::high_resolution_clock::now();
+    double q3GpuMs = gpuExecutionTime * 1000.0;
+    double q3TotalExecMs = q3GpuMs + cpuMergeMs;
+    double q3WallMs = q3CpuParseMs + std::chrono::duration<double, std::milli>(q3PostEnd - q3IterStart).count();
+    printf("\nQ3 | %u rows (lineitem)\n", lineitem_size);
+    printf("  CPU Parsing:        %10.2f ms\n", q3CpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", q3GpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", cpuMergeMs);
+    printf("  Sync Time:          %10.2f ms\n", q3SyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", q3TotalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", q3WallMs);
     
     //Cleanup
     pCustBuildFn->release();
@@ -858,10 +1541,13 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     std::cout << "--- Running TPC-H Query 6 Benchmark ---" << std::endl;
     
     // Load required columns from lineitem table
+    auto q6ParseStart = std::chrono::high_resolution_clock::now();
     std::vector<int> l_shipdate = loadDateColumn(g_dataset_path + "lineitem.tbl", 10);    // Column 10: l_shipdate
     std::vector<float> l_discount = loadFloatColumn(g_dataset_path + "lineitem.tbl", 6);  // Column 6: l_discount
     std::vector<float> l_quantity = loadFloatColumn(g_dataset_path + "lineitem.tbl", 4);  // Column 4: l_quantity
     std::vector<float> l_extendedprice = loadFloatColumn(g_dataset_path + "lineitem.tbl", 5); // Column 5: l_extendedprice
+    auto q6ParseEnd = std::chrono::high_resolution_clock::now();
+    double q6CpuParseMs = std::chrono::duration<double, std::milli>(q6ParseEnd - q6ParseStart).count();
 
     if (l_shipdate.empty() || l_discount.empty() || l_quantity.empty() || l_extendedprice.empty()) {
         std::cerr << "Error: Could not load required columns for Q6 benchmark" << std::endl;
@@ -921,10 +1607,12 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     MTL::Buffer* partialRevenuesBuffer = device->newBuffer(numThreadgroups * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* finalRevenueBuffer = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
 
-    // Execute GPU kernels using a single encoder for both stages
-    double q6_gpu_s = 0.0;
+    // Execute GPU kernels (2 warmup + 1 measured)
+    double q6_gpu_s = 0.0, q6SyncMs = 0.0;
+    std::chrono::high_resolution_clock::time_point q6IterStart;
     
     for(int iter = 0; iter < 3; ++iter) {
+        if (iter == 2) q6IterStart = std::chrono::high_resolution_clock::now();
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = commandBuffer->computeCommandEncoder();
         
@@ -958,10 +1646,13 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
         // Execute and measure time
         commandBuffer->commit();
+        auto q6SyncT0 = std::chrono::high_resolution_clock::now();
         commandBuffer->waitUntilCompleted();
+        auto q6SyncT1 = std::chrono::high_resolution_clock::now();
         
         if (iter == 2) {
              q6_gpu_s = commandBuffer->GPUEndTime() - commandBuffer->GPUStartTime();
+             q6SyncMs = std::chrono::duration<double, std::milli>(q6SyncT1 - q6SyncT0).count() - q6_gpu_s * 1000.0;
         }
     }
 
@@ -977,15 +1668,21 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     std::cout << "TPC-H Query 6 Result:" << std::endl;
     std::cout << "Total Revenue: $" << std::fixed << std::setprecision(2) << totalRevenue << std::endl;
-    // Standardized timing prints
-    printf("Total TPC-H Q6 GPU time: %0.2f ms\n", q6_gpu_s * 1000.0);
-    printf("Q6 CPU time: %0.2f ms\n", q6_cpu_ms);
-    printf("Total TPC-H Q6 wall-clock: %0.2f ms\n", q6_gpu_s * 1000.0 + q6_cpu_ms);
-    
-    // Calculate effective bandwidth (rough estimate)
-    size_t totalDataBytes = dataSize * (sizeof(int) + 3 * sizeof(float)); // All input columns
+
+    auto q6PostEnd = std::chrono::high_resolution_clock::now();
+    double q6GpuMs = q6_gpu_s * 1000.0;
+    double q6TotalExecMs = q6GpuMs + q6_cpu_ms;
+    double q6WallMs = q6CpuParseMs + std::chrono::duration<double, std::milli>(q6PostEnd - q6IterStart).count();
+    size_t totalDataBytes = dataSize * (sizeof(int) + 3 * sizeof(float));
     double bandwidth = (totalDataBytes / (1024.0 * 1024.0 * 1024.0)) / q6_gpu_s;
-    std::cout << "Effective Bandwidth: " << bandwidth << " GB/s" << std::endl << std::endl;
+    printf("\nQ6 | %u rows\n", dataSize);
+    printf("  CPU Parsing:        %10.2f ms\n", q6CpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", q6GpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", q6_cpu_ms);
+    printf("  Sync Time:          %10.2f ms\n", q6SyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", q6TotalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", q6WallMs);
+    printf("  Bandwidth:          %10.2f GB/s\n", bandwidth);
 
     // Cleanup
     stage1Function->release();
@@ -1023,6 +1720,7 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     const std::string sf_path = g_dataset_path;
     
     // 1. Load data for all SIX tables
+    auto q9ParseStart = std::chrono::high_resolution_clock::now();
     auto p_partkey = loadIntColumn(sf_path + "part.tbl", 0);
     auto p_name = loadCharColumn(sf_path + "part.tbl", 1, 55);
     auto s_suppkey = loadIntColumn(sf_path + "supplier.tbl", 0);
@@ -1040,6 +1738,8 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     auto o_orderdate = loadDateColumn(sf_path + "orders.tbl", 4);
     auto n_nationkey = loadIntColumn(sf_path + "nation.tbl", 0);
     auto n_name = loadCharColumn(sf_path + "nation.tbl", 1, 25);
+    auto q9ParseEnd = std::chrono::high_resolution_clock::now();
+    double q9CpuParseMs = std::chrono::duration<double, std::milli>(q9ParseEnd - q9ParseStart).count();
 
     // Create a map for nation names
     std::map<int, std::string> nation_names;
@@ -1154,10 +1854,12 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     std::vector<uint> cpu_final_ht(final_ht_size * (sizeof(Q9Aggregates_CPU)/sizeof(uint)), 0);
     MTL::Buffer* pFinalHTBuffer = pDevice->newBuffer(cpu_final_ht.data(), final_ht_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
 
-    // 4. Dispatch the entire 6-stage pipeline
-    double q9_gpu_compute_time = 0.0;
+    // 4. Dispatch the entire 6-stage pipeline (2 warmup + 1 measured)
+    double q9_gpu_compute_time = 0.0, q9SyncMs = 0.0;
+    std::chrono::high_resolution_clock::time_point q9IterStart;
     
     for(int iter = 0; iter < 3; ++iter) {
+        if (iter == 2) q9IterStart = std::chrono::high_resolution_clock::now();
         // Reset Buffers
         std::memset(pPartBitmapBuffer->contents(), 0, part_bitmap_ints * sizeof(uint));
         std::memset(pSuppMapBuffer->contents(), -1, supp_map_size * sizeof(int));
@@ -1227,10 +1929,15 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
         // Ensure build phase is complete before probe phase
         pCommandBuffer->commit();
+        auto q9SyncT0a = std::chrono::high_resolution_clock::now();
         pCommandBuffer->waitUntilCompleted();
+        auto q9SyncT1a = std::chrono::high_resolution_clock::now();
         
-        double buildTime = 0;
-        if (iter == 2) buildTime = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
+        double buildTime = 0, buildSyncMs = 0;
+        if (iter == 2) {
+            buildTime = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
+            buildSyncMs = std::chrono::duration<double, std::milli>(q9SyncT1a - q9SyncT0a).count() - buildTime * 1000.0;
+        }
         
         // Restart command buffer for probe phase
         pCommandBuffer = pCommandQueue->commandBuffer();
@@ -1264,10 +1971,15 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
         // Execute and time total Q9
         pCommandBuffer->commit();
+        auto q9SyncT0b = std::chrono::high_resolution_clock::now();
         pCommandBuffer->waitUntilCompleted();
+        auto q9SyncT1b = std::chrono::high_resolution_clock::now();
         
         if (iter == 2) {
-            q9_gpu_compute_time = buildTime + (pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime());
+            double probeTime = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
+            double probeSyncMs = std::chrono::duration<double, std::milli>(q9SyncT1b - q9SyncT0b).count() - probeTime * 1000.0;
+            q9_gpu_compute_time = buildTime + probeTime;
+            q9SyncMs = buildSyncMs + probeSyncMs;
         }
     }
 
@@ -1313,9 +2025,18 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printf("+--------+---------------+\n");
     auto q9_cpu_post_end = std::chrono::high_resolution_clock::now();
     double q9_cpu_ms = std::chrono::duration<double, std::milli>(q9_cpu_post_end - q9_cpu_post_start).count();
-    printf("Total TPC-H Q9 GPU time: %0.2f ms\n", q9_gpu_compute_time * 1000.0);
-    printf("Q9 CPU time: %0.2f ms\n", q9_cpu_ms);
-    printf("Total TPC-H Q9 wall-clock: %0.2f ms\n", q9_gpu_compute_time * 1000.0 + q9_cpu_ms);
+
+    auto q9PostEnd = std::chrono::high_resolution_clock::now();
+    double q9GpuMs = q9_gpu_compute_time * 1000.0;
+    double q9TotalExecMs = q9GpuMs + q9_cpu_ms;
+    double q9WallMs = q9CpuParseMs + std::chrono::duration<double, std::milli>(q9PostEnd - q9IterStart).count();
+    printf("\nQ9 | %u rows (lineitem)\n", lineitem_size);
+    printf("  CPU Parsing:        %10.2f ms\n", q9CpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", q9GpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", q9_cpu_ms);
+    printf("  Sync Time:          %10.2f ms\n", q9SyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", q9TotalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", q9WallMs);
     
     // Release all functions and pipelines
     pPartBuildFn->release();
@@ -1380,9 +2101,12 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
     const std::string sf_path = g_dataset_path;
     
     // 1. Load data
+    auto q13ParseStart = std::chrono::high_resolution_clock::now();
     auto o_custkey = loadIntColumn(sf_path + "orders.tbl", 1);
     auto o_comment = loadCharColumn(sf_path + "orders.tbl", 8, 100);
     auto c_custkey = loadIntColumn(sf_path + "customer.tbl", 0);
+    auto q13ParseEnd = std::chrono::high_resolution_clock::now();
+    double q13CpuParseMs = std::chrono::duration<double, std::milli>(q13ParseEnd - q13ParseStart).count();
 
     const uint orders_size = (uint)o_custkey.size();
     const uint customer_size = (uint)c_custkey.size();
@@ -1402,12 +2126,14 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
     std::vector<uint> cpu_counts_per_customer(customer_size, 0u);
     MTL::Buffer* pCountsPerCustomerBuffer = pDevice->newBuffer(cpu_counts_per_customer.data(), customer_size * sizeof(uint), MTL::ResourceStorageModeShared);
 
-    // 4. Dispatch the fused GPU stage
-    double gpuExecutionTime = 0.0;
+    // 4. Dispatch the fused GPU stage (2 warmup + 1 measured)
+    double gpuExecutionTime = 0.0, q13SyncMs = 0.0;
+    std::chrono::high_resolution_clock::time_point q13IterStart;
     
     for(int iter = 0; iter < 3; ++iter) {
         // Reset output buffer
         std::memset(pCountsPerCustomerBuffer->contents(), 0, customer_size * sizeof(uint));
+        if (iter == 2) q13IterStart = std::chrono::high_resolution_clock::now();
         
         MTL::CommandBuffer* pCommandBuffer = pCommandQueue->commandBuffer();
         
@@ -1424,10 +2150,13 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
 
         // 5. Execute GPU work
         pCommandBuffer->commit();
+        auto q13SyncT0 = std::chrono::high_resolution_clock::now();
         pCommandBuffer->waitUntilCompleted();
+        auto q13SyncT1 = std::chrono::high_resolution_clock::now();
         
         if (iter == 2) {
             gpuExecutionTime = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
+            q13SyncMs = std::chrono::duration<double, std::milli>(q13SyncT1 - q13SyncT0).count() - gpuExecutionTime * 1000.0;
         }
     }
 
@@ -1460,9 +2189,19 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
         printf("| %7u | %8u |\n", res.c_count, res.custdist);
     }
     printf("+---------+----------+\n");
-    printf("Total TPC-H Q13 GPU time: %0.2f ms\n", gpuExecutionTime * 1000.0);
-    printf("Q13 CPU time: %0.2f ms\n", q13_cpu_merge_time * 1000.0);
-    printf("Total TPC-H Q13 wall-clock: %0.2f ms\n", (gpuExecutionTime + q13_cpu_merge_time) * 1000.0);
+
+    auto q13PostEnd = std::chrono::high_resolution_clock::now();
+    double q13GpuMs = gpuExecutionTime * 1000.0;
+    double q13CpuPostMs = q13_cpu_merge_time * 1000.0;
+    double q13TotalExecMs = q13GpuMs + q13CpuPostMs;
+    double q13WallMs = q13CpuParseMs + std::chrono::duration<double, std::milli>(q13PostEnd - q13IterStart).count();
+    printf("\nQ13 | %u orders | %u customers\n", orders_size, customer_size);
+    printf("  CPU Parsing:        %10.2f ms\n", q13CpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", q13GpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", q13CpuPostMs);
+    printf("  Sync Time:          %10.2f ms\n", q13SyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", q13TotalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", q13WallMs);
 
     // Release objects...
     pFusedCountFn->release();
@@ -1473,9 +2212,787 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
 }
 
 
+// ===================================================================
+// SF100 Q3 — Chunked Streaming with mmap for join queries
+// ===================================================================
+void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
+    std::cout << "\n=== Running TPC-H Q3 Benchmark (SF100 Chunked) ===" << std::endl;
+
+    // For Q3, we need customer (small), orders (medium), lineitem (huge).
+    // Strategy: Load customer + orders fully (they fit ~22GB at SF100).
+    // Stream lineitem in chunks.
+    
+    // Check if we have enough memory for the build side
+    size_t maxMem = device->recommendedMaxWorkingSetSize();
+    printf("GPU max working set: %zu MB\n", maxMem / (1024*1024));
+
+    // Load small tables fully
+    MappedFile custFile, ordFile, liFile;
+    if (!custFile.open(g_dataset_path + "customer.tbl") ||
+        !ordFile.open(g_dataset_path + "orders.tbl") ||
+        !liFile.open(g_dataset_path + "lineitem.tbl")) {
+        std::cerr << "Q3 SF100: Cannot open required TBL files" << std::endl;
+        return;
+    }
+
+    // Build full customer/orders data (they fit in memory at SF100)
+    auto custIndex = buildLineIndex(custFile);
+    auto ordIndex = buildLineIndex(ordFile);
+    auto liIndex = buildLineIndex(liFile);
+    size_t custRows = custIndex.size(), ordRows = ordIndex.size(), liRows = liIndex.size();
+    printf("Q3 SF100: customer=%zu, orders=%zu, lineitem=%zu rows\n", custRows, ordRows, liRows);
+
+    // Load customer: c_custkey(col 0), c_mktsegment(col 6, first char)
+    std::vector<int> c_custkey(custRows);
+    std::vector<char> c_mktsegment(custRows);
+    parseIntColumnChunk(custFile, custIndex, 0, custRows, 0, c_custkey.data());
+    parseCharColumnChunk(custFile, custIndex, 0, custRows, 6, c_mktsegment.data());
+
+    // Load orders: o_orderkey(col 0), o_custkey(col 1), o_orderdate(col 4), o_shippriority(col 7)
+    std::vector<int> o_orderkey(ordRows), o_custkey(ordRows), o_orderdate(ordRows), o_shippriority(ordRows);
+    parseIntColumnChunk(ordFile, ordIndex, 0, ordRows, 0, o_orderkey.data());
+    parseIntColumnChunk(ordFile, ordIndex, 0, ordRows, 1, o_custkey.data());
+    parseDateColumnChunk(ordFile, ordIndex, 0, ordRows, 4, o_orderdate.data());
+    parseIntColumnChunk(ordFile, ordIndex, 0, ordRows, 7, o_shippriority.data());
+
+    // Use existing Q3 GPU pipeline for build phase (bitmap + direct map)
+    NS::Error* pError = nullptr;
+    MTL::Function* pCustBuildFn = library->newFunction(NS::String::string("q3_build_customer_bitmap_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pCustBuildPipe = device->newComputePipelineState(pCustBuildFn, &pError);
+    MTL::Function* pOrdersBuildFn = library->newFunction(NS::String::string("q3_build_orders_map_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pOrdersBuildPipe = device->newComputePipelineState(pOrdersBuildFn, &pError);
+    MTL::Function* pProbeAggFn = library->newFunction(NS::String::string("q3_probe_and_local_agg_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pProbeAggPipe = device->newComputePipelineState(pProbeAggFn, &pError);
+
+    if (!pCustBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe) {
+        std::cerr << "Q3 SF100: Failed to create pipeline states" << std::endl;
+        return;
+    }
+
+    // Build phase buffers (loaded once)
+    const uint customer_size = (uint)custRows, orders_size = (uint)ordRows;
+    int max_custkey = 0;
+    for (auto k : c_custkey) max_custkey = std::max(max_custkey, k);
+    const uint customer_bitmap_ints = (max_custkey + 31) / 32 + 1;
+    MTL::Buffer* pCustBitmapBuf = device->newBuffer(customer_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(pCustBitmapBuf->contents(), 0, customer_bitmap_ints * sizeof(uint));
+    MTL::Buffer* pCustKeyBuf = device->newBuffer(c_custkey.data(), customer_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCustMktBuf = device->newBuffer(c_mktsegment.data(), customer_size * sizeof(char), MTL::ResourceStorageModeShared);
+
+    int max_orderkey = 0;
+    for (auto k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    const uint orders_map_size = max_orderkey + 1;
+    
+    // Check if orders map fits in memory
+    size_t ordersMapBytes = (size_t)orders_map_size * sizeof(int);
+    printf("Orders map: %u entries (%.1f MB)\n", orders_map_size, ordersMapBytes / (1024.0*1024.0));
+    if (ordersMapBytes > maxMem * 0.3) {
+        std::cerr << "Q3 SF100: Orders direct map too large (" << ordersMapBytes/(1024*1024) << " MB). Need radix-partitioned join." << std::endl;
+        std::cerr << "  This is expected for SF100. Radix join path coming soon." << std::endl;
+        pCustBuildFn->release(); pCustBuildPipe->release();
+        pOrdersBuildFn->release(); pOrdersBuildPipe->release();
+        pProbeAggFn->release(); pProbeAggPipe->release();
+        pCustKeyBuf->release(); pCustMktBuf->release(); pCustBitmapBuf->release();
+        return;
+    }
+
+    MTL::Buffer* pOrdersMapBuf = device->newBuffer(ordersMapBytes, MTL::ResourceStorageModeShared);
+    memset(pOrdersMapBuf->contents(), -1, ordersMapBytes);
+
+    MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdCustBuf = device->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdPrioBuf = device->newBuffer(o_shippriority.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+
+    const int cutoff_date = 19950315;
+
+    // Execute build phase once
+    {
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+
+        enc->setComputePipelineState(pCustBuildPipe);
+        enc->setBuffer(pCustKeyBuf, 0, 0); enc->setBuffer(pCustMktBuf, 0, 1);
+        enc->setBuffer(pCustBitmapBuf, 0, 2); enc->setBytes(&customer_size, sizeof(customer_size), 3);
+        enc->dispatchThreadgroups(MTL::Size((customer_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->setComputePipelineState(pOrdersBuildPipe);
+        enc->setBuffer(pOrdKeyBuf, 0, 0); enc->setBuffer(pOrdDateBuf, 0, 1);
+        enc->setBuffer(pOrdersMapBuf, 0, 2); enc->setBytes(&orders_size, sizeof(orders_size), 3);
+        enc->setBytes(&cutoff_date, sizeof(cutoff_date), 4);
+        enc->dispatchThreadgroups(MTL::Size((orders_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->endEncoding();
+        cb->commit(); cb->waitUntilCompleted();
+        printf("Build phase done (GPU: %.2f ms)\n", (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0);
+    }
+
+    // Stream lineitem in chunks: probe + aggregate
+    size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 20, liRows); // 4 cols ~20B/row
+    printf("Lineitem chunk size: %zu rows\n", chunkRows);
+
+    struct Q3ChunkSlot {
+        MTL::Buffer* orderkey; MTL::Buffer* shipdate; MTL::Buffer* extprice; MTL::Buffer* discount;
+    };
+    Q3ChunkSlot liSlots[2];
+    for (int s = 0; s < 2; s++) {
+        liSlots[s].orderkey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+        liSlots[s].shipdate = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+        liSlots[s].extprice = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+        liSlots[s].discount = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+
+    // Output buffer for matched rows (append-only per chunk)
+    struct Q3Agg { int key; float revenue; uint orderdate; uint shippriority; };
+    const uint out_capacity = (uint)std::min(chunkRows, (size_t)10000000);
+    MTL::Buffer* pOutBuf = device->newBuffer(out_capacity * sizeof(Q3Agg), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOutCountBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
+
+    // CPU accumulator for final aggregation
+    std::unordered_map<int, Q3Result> cpuAgg;
+    cpuAgg.reserve(1000000);
+
+    double totalGpuMs = 0.0, totalCpuParseMs = 0.0, totalSyncMs = 0.0, totalCpuPostMs = 0.0;
+    size_t offset = 0, chunkNum = 0;
+    auto totalStart = std::chrono::high_resolution_clock::now();
+
+    while (offset < liRows) {
+        size_t rowsThisChunk = std::min(chunkRows, liRows - offset);
+        Q3ChunkSlot& slot = liSlots[chunkNum % 2];
+
+        auto parseStart = std::chrono::high_resolution_clock::now();
+        parseIntColumnChunk(liFile, liIndex, offset, rowsThisChunk, 0, (int*)slot.orderkey->contents());
+        parseDateColumnChunk(liFile, liIndex, offset, rowsThisChunk, 10, (int*)slot.shipdate->contents());
+        parseFloatColumnChunk(liFile, liIndex, offset, rowsThisChunk, 5, (float*)slot.extprice->contents());
+        parseFloatColumnChunk(liFile, liIndex, offset, rowsThisChunk, 6, (float*)slot.discount->contents());
+        auto parseEnd = std::chrono::high_resolution_clock::now();
+        double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+        totalCpuParseMs += parseMs;
+
+        memset(pOutCountBuf->contents(), 0, sizeof(uint));
+
+        uint lineitem_size = (uint)rowsThisChunk;
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+
+        enc->setComputePipelineState(pProbeAggPipe);
+        enc->setBuffer(slot.orderkey, 0, 0); enc->setBuffer(slot.shipdate, 0, 1);
+        enc->setBuffer(slot.extprice, 0, 2); enc->setBuffer(slot.discount, 0, 3);
+        enc->setBuffer(pCustBitmapBuf, 0, 4); enc->setBuffer(pOrdersMapBuf, 0, 5);
+        enc->setBuffer(pOrdCustBuf, 0, 6); enc->setBuffer(pOrdDateBuf, 0, 7);
+        enc->setBuffer(pOrdPrioBuf, 0, 8);
+        enc->setBuffer(pOutBuf, 0, 9); enc->setBuffer(pOutCountBuf, 0, 10);
+        enc->setBytes(&lineitem_size, sizeof(lineitem_size), 11);
+        enc->setBytes(&cutoff_date, sizeof(cutoff_date), 12);
+        enc->setBytes(&out_capacity, sizeof(out_capacity), 13);
+        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+        enc->endEncoding();
+        cb->commit();
+        auto syncStart = std::chrono::high_resolution_clock::now();
+        cb->waitUntilCompleted();
+        auto syncEnd = std::chrono::high_resolution_clock::now();
+        double syncMs = std::chrono::duration<double, std::milli>(syncEnd - syncStart).count();
+        totalSyncMs += syncMs;
+        double gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        totalGpuMs += gpuMs;
+
+        // CPU merge partial results
+        auto postStart = std::chrono::high_resolution_clock::now();
+        uint outCount = *(uint*)pOutCountBuf->contents();
+        Q3Agg* aggs = (Q3Agg*)pOutBuf->contents();
+        for (uint i = 0; i < outCount && i < out_capacity; i++) {
+            if (aggs[i].key > 0) {
+                auto it = cpuAgg.find(aggs[i].key);
+                if (it == cpuAgg.end()) cpuAgg.emplace(aggs[i].key, Q3Result{aggs[i].key, aggs[i].revenue, (int)aggs[i].orderdate, (int)aggs[i].shippriority});
+                else it->second.revenue += aggs[i].revenue;
+            }
+        }
+
+        auto postEnd = std::chrono::high_resolution_clock::now();
+        double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+        totalCpuPostMs += postMs;
+
+        chunkNum++;
+        offset += rowsThisChunk;
+    }
+
+    auto totalEnd = std::chrono::high_resolution_clock::now();
+    double wallMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+
+    // Sort and print
+    auto sortStart = std::chrono::high_resolution_clock::now();
+    std::vector<Q3Result> finalRes(cpuAgg.size());
+    size_t idx = 0;
+    for (auto& kv : cpuAgg) finalRes[idx++] = kv.second;
+    std::sort(finalRes.begin(), finalRes.end(), [](const Q3Result& a, const Q3Result& b) {
+        if (a.revenue != b.revenue) return a.revenue > b.revenue;
+        return a.orderdate < b.orderdate;
+    });
+
+    printf("\nTPC-H Q3 Results (Top 10):\n");
+    printf("+----------+------------+------------+--------------+\n");
+    printf("| orderkey |   revenue  | orderdate  | shippriority |\n");
+    printf("+----------+------------+------------+--------------+\n");
+    for (size_t i = 0; i < 10 && i < finalRes.size(); i++) {
+        printf("| %8d | $%10.2f | %10d | %12d |\n",
+               finalRes[i].orderkey, finalRes[i].revenue, finalRes[i].orderdate, finalRes[i].shippriority);
+    }
+    printf("+----------+------------+------------+--------------+\n");
+    auto sortEnd = std::chrono::high_resolution_clock::now();
+    double sortMs = std::chrono::duration<double, std::milli>(sortEnd - sortStart).count();
+    double totalCpuPostAllMs = totalCpuPostMs + sortMs;
+    double totalExecMs = totalCpuPostAllMs + totalGpuMs;
+
+    printf("\nSF100 Q3 | %zu chunks | %zu rows\n", chunkNum, liRows);
+    printf("  CPU Parsing:        %10.2f ms\n", totalCpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", totalGpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", totalCpuPostAllMs);
+    printf("  Sync Time:          %10.2f ms\n", totalSyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", totalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", wallMs);
+
+    // Cleanup
+    pCustBuildFn->release(); pCustBuildPipe->release();
+    pOrdersBuildFn->release(); pOrdersBuildPipe->release();
+    pProbeAggFn->release(); pProbeAggPipe->release();
+    pCustKeyBuf->release(); pCustMktBuf->release(); pCustBitmapBuf->release();
+    pOrdersMapBuf->release();
+    pOrdKeyBuf->release(); pOrdCustBuf->release(); pOrdDateBuf->release(); pOrdPrioBuf->release();
+    for (int s = 0; s < 2; s++) {
+        liSlots[s].orderkey->release(); liSlots[s].shipdate->release();
+        liSlots[s].extprice->release(); liSlots[s].discount->release();
+    }
+    pOutBuf->release(); pOutCountBuf->release();
+}
+
+
+// ===================================================================
+// SF100 Q9 — Hybrid Streaming: Build HTs sequentially, Stream Lineitem
+// ===================================================================
+void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
+    std::cout << "\n=== Running TPC-H Q9 Benchmark (SF100 Hybrid Streaming) ===" << std::endl;
+    auto wallStart = std::chrono::high_resolution_clock::now();
+
+    size_t maxMem = device->recommendedMaxWorkingSetSize();
+    printf("GPU max working set: %zu MB\n", maxMem / (1024*1024));
+
+    // ── Open all mmap files ──
+    MappedFile partFile, suppFile, psFile, ordFile, natFile, liFile;
+    if (!partFile.open(g_dataset_path + "part.tbl") || !suppFile.open(g_dataset_path + "supplier.tbl") ||
+        !psFile.open(g_dataset_path + "partsupp.tbl") || !ordFile.open(g_dataset_path + "orders.tbl") ||
+        !natFile.open(g_dataset_path + "nation.tbl") || !liFile.open(g_dataset_path + "lineitem.tbl")) {
+        std::cerr << "Q9 SF100: Cannot open required files" << std::endl;
+        return;
+    }
+
+    auto partIdx = buildLineIndex(partFile), suppIdx = buildLineIndex(suppFile);
+    auto psIdx = buildLineIndex(psFile), ordIdx = buildLineIndex(ordFile);
+    auto natIdx = buildLineIndex(natFile), liIdx = buildLineIndex(liFile);
+
+    size_t partRows = partIdx.size(), suppRows = suppIdx.size();
+    size_t psRows = psIdx.size(), ordRows = ordIdx.size();
+    size_t liRows = liIdx.size();
+    printf("Q9 SF100: part=%zu, supplier=%zu, partsupp=%zu, orders=%zu, lineitem=%zu\n",
+           partRows, suppRows, psRows, ordRows, liRows);
+
+    // ── Load nation data (tiny — always fits) ──
+    std::vector<int> n_nationkey(natIdx.size()), n_name_raw(natIdx.size());
+    parseIntColumnChunk(natFile, natIdx, 0, natIdx.size(), 0, n_nationkey.data());
+    // Load nation names as char column for mapping later
+    std::vector<char> n_name_chars(natIdx.size() * 25, ' ');
+    parseCharColumnChunkFixed(natFile, natIdx, 0, natIdx.size(), 1, 25, n_name_chars.data());
+    std::map<int, std::string> nation_names;
+    for (size_t i = 0; i < natIdx.size(); ++i) {
+        nation_names[n_nationkey[i]] = std::string(&n_name_chars[i * 25], 25);
+        // trim trailing spaces
+        auto& s = nation_names[n_nationkey[i]];
+        s.erase(s.find_last_not_of(' ') + 1);
+    }
+
+    // ── Setup all kernel pipelines ──
+    NS::Error* pError = nullptr;
+    MTL::Function* pPartBuildFn = library->newFunction(NS::String::string("q9_build_part_ht_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pPartBuildPipe = device->newComputePipelineState(pPartBuildFn, &pError);
+    MTL::Function* pSuppBuildFn = library->newFunction(NS::String::string("q9_build_supplier_ht_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pSuppBuildPipe = device->newComputePipelineState(pSuppBuildFn, &pError);
+    MTL::Function* pPartSuppBuildFn = library->newFunction(NS::String::string("q9_build_partsupp_ht_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pPartSuppBuildPipe = device->newComputePipelineState(pPartSuppBuildFn, &pError);
+    MTL::Function* pOrdersBuildFn = library->newFunction(NS::String::string("q9_build_orders_ht_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pOrdersBuildPipe = device->newComputePipelineState(pOrdersBuildFn, &pError);
+    MTL::Function* pProbeAggFn = library->newFunction(NS::String::string("q9_probe_and_local_agg_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pProbeAggPipe = device->newComputePipelineState(pProbeAggFn, &pError);
+    MTL::Function* pMergeFn = library->newFunction(NS::String::string("q9_merge_results_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pMergePipe = device->newComputePipelineState(pMergeFn, &pError);
+
+    if (!pPartBuildPipe || !pSuppBuildPipe || !pPartSuppBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe || !pMergePipe) {
+        std::cerr << "Q9 SF100: Failed to create one or more pipelines" << std::endl;
+        return;
+    }
+
+    // Timing accumulators
+    double totalCpuParseMs = 0, totalGpuMs = 0, totalCpuPostMs = 0, totalSyncMs = 0;
+
+    // ══════════════════════════════════════════════════════════════
+    // PHASE 1: Build hash tables — load one table at a time,
+    //          parse on CPU, upload to GPU, free CPU RAM immediately.
+    // ══════════════════════════════════════════════════════════════
+    printf("\n--- Phase 1: Build Hash Tables (sequential, memory-conscious) ---\n");
+
+    // --- 1a. Part Bitmap ---
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<int> p_partkey(partRows);
+    std::vector<char> p_name(partRows * 55);
+    parseIntColumnChunk(partFile, partIdx, 0, partRows, 0, p_partkey.data());
+    parseCharColumnChunkFixed(partFile, partIdx, 0, partRows, 1, 55, p_name.data());
+    auto t1 = std::chrono::high_resolution_clock::now();
+    totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    int max_partkey = 0;
+    for (size_t i = 0; i < partRows; i++) max_partkey = std::max(max_partkey, p_partkey[i]);
+    const uint part_bitmap_ints = (max_partkey + 31) / 32 + 1;
+    const uint part_ht_size = 0; // bitmap mode
+
+    MTL::Buffer* pPartKeyBuf = device->newBuffer(p_partkey.data(), partRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartNameBuf = device->newBuffer(p_name.data(), p_name.size(), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartBitmapBuf = device->newBuffer(part_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(pPartBitmapBuf->contents(), 0, part_bitmap_ints * sizeof(uint));
+
+    {
+        uint ps = (uint)partRows;
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pPartBuildPipe);
+        enc->setBuffer(pPartKeyBuf, 0, 0);
+        enc->setBuffer(pPartNameBuf, 0, 1);
+        enc->setBuffer(pPartBitmapBuf, 0, 2);
+        enc->setBytes(&ps, sizeof(ps), 3);
+        enc->setBytes(&part_ht_size, sizeof(part_ht_size), 4);
+        NS::UInteger tgs = std::min((NS::UInteger)256, pPartBuildPipe->maxTotalThreadsPerThreadgroup());
+        enc->dispatchThreadgroups(MTL::Size((partRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
+        enc->endEncoding();
+        auto syncT0 = std::chrono::high_resolution_clock::now();
+        cb->commit(); cb->waitUntilCompleted();
+        auto syncT1 = std::chrono::high_resolution_clock::now();
+        totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        totalSyncMs += std::chrono::duration<double, std::milli>(syncT1 - syncT0).count() - (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+    // Free CPU-side vectors and GPU input buffers
+    { std::vector<int>().swap(p_partkey); std::vector<char>().swap(p_name); }
+    pPartKeyBuf->release(); pPartNameBuf->release();
+    printf("  Part bitmap built (%u ints, max_partkey=%d)\n", part_bitmap_ints, max_partkey);
+
+    // --- 1b. Supplier Direct Map ---
+    t0 = std::chrono::high_resolution_clock::now();
+    std::vector<int> s_suppkey(suppRows), s_nationkey(suppRows);
+    parseIntColumnChunk(suppFile, suppIdx, 0, suppRows, 0, s_suppkey.data());
+    parseIntColumnChunk(suppFile, suppIdx, 0, suppRows, 3, s_nationkey.data());
+    t1 = std::chrono::high_resolution_clock::now();
+    totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    int max_suppkey = 0;
+    for (size_t i = 0; i < suppRows; i++) max_suppkey = std::max(max_suppkey, s_suppkey[i]);
+    const uint supp_map_size = max_suppkey + 1;
+    const uint supplier_ht_size = 0; // direct map mode
+
+    MTL::Buffer* pSuppKeyBuf = device->newBuffer(s_suppkey.data(), suppRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSuppNatBuf = device->newBuffer(s_nationkey.data(), suppRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSuppMapBuf = device->newBuffer(supp_map_size * sizeof(int), MTL::ResourceStorageModeShared);
+    memset(pSuppMapBuf->contents(), 0xFF, supp_map_size * sizeof(int)); // -1
+
+    {
+        uint ss = (uint)suppRows;
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pSuppBuildPipe);
+        enc->setBuffer(pSuppKeyBuf, 0, 0);
+        enc->setBuffer(pSuppNatBuf, 0, 1);
+        enc->setBuffer(pSuppMapBuf, 0, 2);
+        enc->setBytes(&ss, sizeof(ss), 3);
+        enc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 4);
+        NS::UInteger tgs = std::min((NS::UInteger)256, pSuppBuildPipe->maxTotalThreadsPerThreadgroup());
+        enc->dispatchThreadgroups(MTL::Size((suppRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
+        enc->endEncoding();
+        auto syncT0 = std::chrono::high_resolution_clock::now();
+        cb->commit(); cb->waitUntilCompleted();
+        auto syncT1 = std::chrono::high_resolution_clock::now();
+        totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        totalSyncMs += std::chrono::duration<double, std::milli>(syncT1 - syncT0).count() - (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+    { std::vector<int>().swap(s_suppkey); std::vector<int>().swap(s_nationkey); }
+    pSuppKeyBuf->release(); pSuppNatBuf->release();
+    printf("  Supplier direct map built (size=%u)\n", supp_map_size);
+
+    // --- 1c. Orders Hash Table ---
+    t0 = std::chrono::high_resolution_clock::now();
+    std::vector<int> o_orderkey(ordRows), o_orderdate(ordRows);
+    parseIntColumnChunk(ordFile, ordIdx, 0, ordRows, 0, o_orderkey.data());
+    parseDateColumnChunk(ordFile, ordIdx, 0, ordRows, 4, o_orderdate.data());
+    t1 = std::chrono::high_resolution_clock::now();
+    totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    const uint orders_ht_size = (uint)ordRows * 2;
+    MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdersHTBuf = device->newBuffer(orders_ht_size * sizeof(int) * 2, MTL::ResourceStorageModeShared);
+    memset(pOrdersHTBuf->contents(), 0xFF, orders_ht_size * sizeof(int) * 2);
+
+    {
+        uint os = (uint)ordRows;
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pOrdersBuildPipe);
+        enc->setBuffer(pOrdKeyBuf, 0, 0);
+        enc->setBuffer(pOrdDateBuf, 0, 1);
+        enc->setBuffer(pOrdersHTBuf, 0, 2);
+        enc->setBytes(&os, sizeof(os), 3);
+        enc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 4);
+        NS::UInteger tgs = std::min((NS::UInteger)256, pOrdersBuildPipe->maxTotalThreadsPerThreadgroup());
+        enc->dispatchThreadgroups(MTL::Size((ordRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
+        enc->endEncoding();
+        auto syncT0 = std::chrono::high_resolution_clock::now();
+        cb->commit(); cb->waitUntilCompleted();
+        auto syncT1 = std::chrono::high_resolution_clock::now();
+        totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        totalSyncMs += std::chrono::duration<double, std::milli>(syncT1 - syncT0).count() - (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+    { std::vector<int>().swap(o_orderkey); std::vector<int>().swap(o_orderdate); }
+    pOrdKeyBuf->release(); pOrdDateBuf->release();
+    printf("  Orders HT built (ht_size=%u)\n", orders_ht_size);
+
+    // --- 1d. PartSupp Hash Table ---
+    t0 = std::chrono::high_resolution_clock::now();
+    std::vector<int> ps_partkey(psRows), ps_suppkey(psRows);
+    std::vector<float> ps_supplycost(psRows);
+    parseIntColumnChunk(psFile, psIdx, 0, psRows, 0, ps_partkey.data());
+    parseIntColumnChunk(psFile, psIdx, 0, psRows, 1, ps_suppkey.data());
+    parseFloatColumnChunk(psFile, psIdx, 0, psRows, 3, ps_supplycost.data());
+    t1 = std::chrono::high_resolution_clock::now();
+    totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    const uint partsupp_ht_size = (uint)psRows * 4;
+    MTL::Buffer* pPsPartKeyBuf = device->newBuffer(ps_partkey.data(), psRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsSuppKeyBuf = device->newBuffer(ps_suppkey.data(), psRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsSupplyCostBuf = device->newBuffer(ps_supplycost.data(), psRows * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartSuppHTBuf = device->newBuffer(partsupp_ht_size * sizeof(int) * 4, MTL::ResourceStorageModeShared);
+    memset(pPartSuppHTBuf->contents(), 0xFF, partsupp_ht_size * sizeof(int) * 4);
+
+    {
+        uint pss = (uint)psRows;
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pPartSuppBuildPipe);
+        enc->setBuffer(pPsPartKeyBuf, 0, 0);
+        enc->setBuffer(pPsSuppKeyBuf, 0, 1);
+        enc->setBuffer(pPartSuppHTBuf, 0, 2);
+        enc->setBytes(&pss, sizeof(pss), 3);
+        enc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 4);
+        NS::UInteger tgs = std::min((NS::UInteger)256, pPartSuppBuildPipe->maxTotalThreadsPerThreadgroup());
+        enc->dispatchThreadgroups(MTL::Size((psRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
+        enc->endEncoding();
+        auto syncT0 = std::chrono::high_resolution_clock::now();
+        cb->commit(); cb->waitUntilCompleted();
+        auto syncT1 = std::chrono::high_resolution_clock::now();
+        totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        totalSyncMs += std::chrono::duration<double, std::milli>(syncT1 - syncT0).count() - (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+    { std::vector<int>().swap(ps_partkey); std::vector<int>().swap(ps_suppkey); }
+    // Keep ps_supplycost — needed by probe kernel
+    pPsPartKeyBuf->release(); pPsSuppKeyBuf->release();
+    printf("  PartSupp HT built (ht_size=%u)\n", partsupp_ht_size);
+
+    printf("Phase 1 complete. GPU HTs resident: bitmap(%.1f MB) + suppmap(%.1f MB) + orders_ht(%.1f MB) + partsupp_ht(%.1f MB)\n",
+           part_bitmap_ints * 4.0 / (1024*1024), supp_map_size * 4.0 / (1024*1024),
+           orders_ht_size * 8.0 / (1024*1024), partsupp_ht_size * 16.0 / (1024*1024));
+
+    // ══════════════════════════════════════════════════════════════
+    // PHASE 2: Stream lineitem in chunks through Probe + Merge
+    // ══════════════════════════════════════════════════════════════
+    printf("\n--- Phase 2: Stream lineitem (%zu rows) ---\n", liRows);
+
+    // Per-chunk lineitem columns: partkey, suppkey, orderkey, quantity, extprice, discount
+    // ~28 bytes/row → use adaptive chunk size
+    size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 28, liRows);
+    size_t numChunks = (liRows + chunkRows - 1) / chunkRows;
+    printf("Chunk size: %zu rows, %zu chunks\n", chunkRows, numChunks);
+
+    // Allocate lineitem chunk GPU buffers
+    MTL::Buffer* pLiPartKey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLiSuppKey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLiOrdKey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLiQty = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLiPrice = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLiDisc = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+
+    // Intermediate + final aggregation buffers (persistent across chunks)
+    const uint num_threadgroups = 2048, local_ht_size = 256;
+    const uint intermediate_size = num_threadgroups * local_ht_size;
+    MTL::Buffer* pIntermediateBuf = device->newBuffer(intermediate_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
+    const uint final_ht_size = 25 * 10; // 25 nations * ~10 years
+    MTL::Buffer* pFinalHTBuf = device->newBuffer(final_ht_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
+    memset(pFinalHTBuf->contents(), 0, final_ht_size * sizeof(Q9Aggregates_CPU));
+
+    for (size_t c = 0; c < numChunks; c++) {
+        size_t start = c * chunkRows;
+        size_t end = std::min(start + chunkRows, liRows);
+        uint thisChunk = (uint)(end - start);
+
+        // Parse lineitem columns for this chunk
+        t0 = std::chrono::high_resolution_clock::now();
+        parseIntColumnChunk(liFile, liIdx, start, thisChunk, 1, (int*)pLiPartKey->contents());
+        parseIntColumnChunk(liFile, liIdx, start, thisChunk, 2, (int*)pLiSuppKey->contents());
+        parseIntColumnChunk(liFile, liIdx, start, thisChunk, 0, (int*)pLiOrdKey->contents());
+        parseFloatColumnChunk(liFile, liIdx, start, thisChunk, 4, (float*)pLiQty->contents());
+        parseFloatColumnChunk(liFile, liIdx, start, thisChunk, 5, (float*)pLiPrice->contents());
+        parseFloatColumnChunk(liFile, liIdx, start, thisChunk, 6, (float*)pLiDisc->contents());
+        t1 = std::chrono::high_resolution_clock::now();
+        totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Reset intermediate buffer for this chunk
+        memset(pIntermediateBuf->contents(), 0, intermediate_size * sizeof(Q9Aggregates_CPU));
+
+        // Dispatch probe + merge
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+
+        // Probe + local agg
+        enc->setComputePipelineState(pProbeAggPipe);
+        enc->setBuffer(pLiSuppKey, 0, 0);
+        enc->setBuffer(pLiPartKey, 0, 1);
+        enc->setBuffer(pLiOrdKey, 0, 2);
+        enc->setBuffer(pLiPrice, 0, 3);
+        enc->setBuffer(pLiDisc, 0, 4);
+        enc->setBuffer(pLiQty, 0, 5);
+        enc->setBuffer(pPsSupplyCostBuf, 0, 6);
+        enc->setBuffer(pPartBitmapBuf, 0, 7);
+        enc->setBuffer(pSuppMapBuf, 0, 8);
+        enc->setBuffer(pPartSuppHTBuf, 0, 9);
+        enc->setBuffer(pOrdersHTBuf, 0, 10);
+        enc->setBuffer(pIntermediateBuf, 0, 11);
+        enc->setBytes(&thisChunk, sizeof(thisChunk), 12);
+        enc->setBytes(&part_ht_size, sizeof(part_ht_size), 13);
+        enc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 14);
+        enc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 15);
+        enc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 16);
+        enc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
+
+        // Merge into final HT
+        enc->setComputePipelineState(pMergePipe);
+        enc->setBuffer(pIntermediateBuf, 0, 0);
+        enc->setBuffer(pFinalHTBuf, 0, 1);
+        enc->setBytes(&intermediate_size, sizeof(intermediate_size), 2);
+        enc->setBytes(&final_ht_size, sizeof(final_ht_size), 3);
+        enc->dispatchThreads(MTL::Size(intermediate_size, 1, 1), MTL::Size(1024, 1, 1));
+        enc->endEncoding();
+
+        auto syncT0 = std::chrono::high_resolution_clock::now();
+        cb->commit(); cb->waitUntilCompleted();
+        auto syncT1 = std::chrono::high_resolution_clock::now();
+        totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        totalSyncMs += std::chrono::duration<double, std::milli>(syncT1 - syncT0).count() - (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+
+        if ((c + 1) % 10 == 0 || c + 1 == numChunks) {
+            printf("  Chunk %zu/%zu done\n", c + 1, numChunks);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PHASE 3: Read back results, map nation names, sort, print
+    // ══════════════════════════════════════════════════════════════
+    auto postStart = std::chrono::high_resolution_clock::now();
+    Q9Aggregates_CPU* results = (Q9Aggregates_CPU*)pFinalHTBuf->contents();
+    std::vector<Q9Result> final_results;
+    for (uint i = 0; i < final_ht_size; ++i) {
+        if (results[i].key != 0) {
+            int nationkey = (results[i].key >> 16) & 0xFFFF;
+            int year = results[i].key & 0xFFFF;
+            final_results.push_back({nationkey, year, results[i].profit});
+        }
+    }
+    std::sort(final_results.begin(), final_results.end(), [](const Q9Result& a, const Q9Result& b) {
+        if (a.nationkey != b.nationkey) return a.nationkey < b.nationkey;
+        return a.year > b.year;
+    });
+
+    printf("\nTPC-H Query 9 Results (Top 15):\n");
+    printf("+------------+------+---------------+\n");
+    printf("| Nation     | Year |        Profit |\n");
+    printf("+------------+------+---------------+\n");
+    for (size_t i = 0; i < 15 && i < final_results.size(); ++i) {
+        printf("| %-10s | %4d | $%13.2f |\n",
+               nation_names[final_results[i].nationkey].c_str(), final_results[i].year, final_results[i].profit);
+    }
+    printf("+------------+------+---------------+\n");
+    printf("Total results found: %lu\n", final_results.size());
+
+    // Comparable view: aggregate by year
+    std::map<int, double> year_totals;
+    for (const auto& r : final_results) year_totals[r.year] += (double)r.profit;
+    printf("\nComparable TPC-H Q9 (yearly sum_profit):\n");
+    printf("+--------+---------------+\n");
+    printf("| o_year |   sum_profit  |\n");
+    printf("+--------+---------------+\n");
+    for (const auto& kv : year_totals) printf("| %6d | %13.4f |\n", kv.first, kv.second);
+    printf("+--------+---------------+\n");
+
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    totalCpuPostMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    auto wallEnd = std::chrono::high_resolution_clock::now();
+    double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
+    double totalExecMs = totalGpuMs + totalCpuPostMs;
+
+    printf("\nSF100 Q9 | %zu chunks | %zu rows\n", numChunks, liRows);
+    printf("  CPU Parsing:        %10.2f ms\n", totalCpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", totalGpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", totalCpuPostMs);
+    printf("  Sync Time:          %10.2f ms\n", totalSyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", totalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", wallMs);
+
+    // Cleanup
+    pPartBuildFn->release(); pPartBuildPipe->release();
+    pSuppBuildFn->release(); pSuppBuildPipe->release();
+    pPartSuppBuildFn->release(); pPartSuppBuildPipe->release();
+    pOrdersBuildFn->release(); pOrdersBuildPipe->release();
+    pProbeAggFn->release(); pProbeAggPipe->release();
+    pMergeFn->release(); pMergePipe->release();
+    pPartBitmapBuf->release(); pSuppMapBuf->release();
+    pOrdersHTBuf->release(); pPartSuppHTBuf->release();
+    pPsSupplyCostBuf->release();
+    pLiPartKey->release(); pLiSuppKey->release(); pLiOrdKey->release();
+    pLiQty->release(); pLiPrice->release(); pLiDisc->release();
+    pIntermediateBuf->release(); pFinalHTBuf->release();
+}
+
+
+// ===================================================================
+// SF100 Q13 — Chunked Streaming for Orders Table
+// ===================================================================
+void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
+    std::cout << "\n=== Running TPC-H Q13 Benchmark (SF100 Chunked) ===" << std::endl;
+    auto wallStart = std::chrono::high_resolution_clock::now();
+
+    MappedFile custFile, ordFile;
+    if (!custFile.open(g_dataset_path + "customer.tbl") || !ordFile.open(g_dataset_path + "orders.tbl")) {
+        std::cerr << "Q13 SF100: Cannot open files" << std::endl;
+        return;
+    }
+
+    auto custIdx = buildLineIndex(custFile);
+    auto ordIdx = buildLineIndex(ordFile);
+    size_t custRows = custIdx.size(), ordRows = ordIdx.size();
+    printf("Q13 SF100: customer=%zu, orders=%zu\n", custRows, ordRows);
+
+    // Timing accumulators
+    double totalCpuParseMs = 0, totalGpuMs = 0, totalCpuPostMs = 0, totalSyncMs = 0;
+
+    // Output: per-customer order counts (persistent across chunks, atomics accumulate)
+    MTL::Buffer* pCountsBuf = device->newBuffer(custRows * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(pCountsBuf->contents(), 0, custRows * sizeof(uint));
+
+    NS::Error* pError = nullptr;
+    MTL::Function* pFn = library->newFunction(NS::String::string("q13_fused_direct_count_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pPipe = device->newComputePipelineState(pFn, &pError);
+    if (!pPipe) { std::cerr << "Q13 SF100: pipeline creation failed" << std::endl; return; }
+
+    // Stream orders in chunks: custkey(4 bytes) + comment(100 bytes) = 104 bytes/row
+    size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 104, ordRows);
+    size_t numChunks = (ordRows + chunkRows - 1) / chunkRows;
+    printf("Q13 chunk size: %zu rows, %zu chunks\n", chunkRows, numChunks);
+
+    // Allocate chunk buffers for custkey + comment
+    MTL::Buffer* chunkCustKey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* chunkComment = device->newBuffer(chunkRows * 100 * sizeof(char), MTL::ResourceStorageModeShared);
+
+    const uint num_threadgroups = 2048;
+    uint cs = (uint)custRows;
+
+    for (size_t c = 0; c < numChunks; c++) {
+        size_t start = c * chunkRows;
+        size_t end = std::min(start + chunkRows, ordRows);
+        uint thisChunk = (uint)(end - start);
+
+        // Parse orders columns for this chunk
+        auto t0 = std::chrono::high_resolution_clock::now();
+        parseIntColumnChunk(ordFile, ordIdx, start, thisChunk, 1, (int*)chunkCustKey->contents());
+        parseCharColumnChunkFixed(ordFile, ordIdx, start, thisChunk, 8, 100, (char*)chunkComment->contents());
+        auto t1 = std::chrono::high_resolution_clock::now();
+        totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Dispatch kernel — atomics in pCountsBuf accumulate across chunks
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pPipe);
+        enc->setBuffer(chunkCustKey, 0, 0);
+        enc->setBuffer(chunkComment, 0, 1);
+        enc->setBuffer(pCountsBuf, 0, 2);
+        enc->setBytes(&thisChunk, sizeof(thisChunk), 3);
+        enc->setBytes(&cs, sizeof(cs), 4);
+        enc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
+        enc->endEncoding();
+
+        auto syncT0 = std::chrono::high_resolution_clock::now();
+        cb->commit(); cb->waitUntilCompleted();
+        auto syncT1 = std::chrono::high_resolution_clock::now();
+        totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        totalSyncMs += std::chrono::duration<double, std::milli>(syncT1 - syncT0).count() - (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+
+        if ((c + 1) % 5 == 0 || c + 1 == numChunks) {
+            printf("  Chunk %zu/%zu done\n", c + 1, numChunks);
+        }
+    }
+
+    // CPU post-processing: build histogram from per-customer counts
+    auto postStart = std::chrono::high_resolution_clock::now();
+    std::map<uint, uint> final_histogram;
+    auto* counts_per_customer = (uint*)pCountsBuf->contents();
+    for (uint i = 0; i < (uint)custRows; ++i) {
+        final_histogram[counts_per_customer[i]] += 1;
+    }
+
+    std::vector<Q13Result> final_results;
+    for (auto const& [key, val] : final_histogram) {
+        final_results.push_back({key, val});
+    }
+    std::sort(final_results.begin(), final_results.end(), [](const Q13Result& a, const Q13Result& b) {
+        if (a.custdist != b.custdist) return a.custdist > b.custdist;
+        return a.c_count > b.c_count;
+    });
+
+    printf("\nTPC-H Query 13 Results (Comparable histogram):\n");
+    printf("+---------+----------+\n");
+    printf("| c_count | custdist |\n");
+    printf("+---------+----------+\n");
+    for (const auto& res : final_results) {
+        printf("| %7u | %8u |\n", res.c_count, res.custdist);
+    }
+    printf("+---------+----------+\n");
+
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    totalCpuPostMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    auto wallEnd = std::chrono::high_resolution_clock::now();
+    double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
+    double totalExecMs = totalGpuMs + totalCpuPostMs;
+
+    printf("\nSF100 Q13 | %zu chunks | %zu rows\n", numChunks, ordRows);
+    printf("  CPU Parsing:        %10.2f ms\n", totalCpuParseMs);
+    printf("  GPU Execution:      %10.2f ms\n", totalGpuMs);
+    printf("  CPU Post Process:   %10.2f ms\n", totalCpuPostMs);
+    printf("  Sync Time:          %10.2f ms\n", totalSyncMs);
+    printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", totalExecMs);
+    printf("  Wall Clock:         %10.2f ms\n", wallMs);
+
+    // Cleanup
+    pFn->release(); pPipe->release();
+    chunkCustKey->release(); chunkComment->release();
+    pCountsBuf->release();
+}
+
+
 void showHelp() {
     std::cout << "GPU Database Metal Benchmark" << std::endl;
-    std::cout << "Usage: GPUDBMetalBenchmark [sf1|sf10] [query]" << std::endl;
+    std::cout << "Usage: GPUDBMetalBenchmark [sf1|sf10|sf100] [query]" << std::endl;
     std::cout << "" << std::endl;
     std::cout << "Available queries:" << std::endl;
     std::cout << "  all           - Run all benchmarks (default)" << std::endl;
@@ -1489,11 +3006,16 @@ void showHelp() {
     std::cout << "  q13           - Run TPC-H Query 13 (Customer Distribution)" << std::endl;
     std::cout << "  help          - Show this help message" << std::endl;
     std::cout << "" << std::endl;
+    std::cout << "Scale Factors:" << std::endl;
+    std::cout << "  sf1           - TPC-H SF-1 (~6M lineitem rows)" << std::endl;
+    std::cout << "  sf10          - TPC-H SF-10 (~60M lineitem rows)" << std::endl;
+    std::cout << "  sf100         - TPC-H SF-100 (~600M lineitem rows, chunked streaming)" << std::endl;
+    std::cout << "" << std::endl;
     std::cout << "Examples:" << std::endl;
-    std::cout << "  GPUDBMetalBenchmark        # Run all benchmarks" << std::endl;
+    std::cout << "  GPUDBMetalBenchmark        # Run all benchmarks on SF-1" << std::endl;
     std::cout << "  GPUDBMetalBenchmark q1     # Run only TPC-H Query 1" << std::endl;
-    std::cout << "  GPUDBMetalBenchmark q3     # Run only TPC-H Query 3" << std::endl;
-    std::cout << "  GPUDBMetalBenchmark sf10 q13  # Run Q13 on SF-10" << std::endl;
+    std::cout << "  GPUDBMetalBenchmark sf100 q1  # Run Q1 on SF-100 (chunked)" << std::endl;
+    std::cout << "  GPUDBMetalBenchmark sf100 q6  # Run Q6 on SF-100 (chunked)" << std::endl;
 }
 
 // --- Main Entry Point ---
@@ -1503,6 +3025,7 @@ int main(int argc, const char * argv[]) {
     //   GPUDBMetalBenchmark q13
     //   GPUDBMetalBenchmark sf10 q13
     //   GPUDBMetalBenchmark q13 sf10
+    //   GPUDBMetalBenchmark sf100 q1   (chunked streaming mode)
     std::string query = "all"; // default to running all benchmarks
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -1512,10 +3035,20 @@ int main(int argc, const char * argv[]) {
         }
         if (arg == "sf1") {
             g_dataset_path = "data/SF-1/";
+            g_scale_factor = 1;
+            g_sf100_mode = false;
             continue;
         }
         if (arg == "sf10") {
             g_dataset_path = "data/SF-10/";
+            g_scale_factor = 10;
+            g_sf100_mode = false;
+            continue;
+        }
+        if (arg == "sf100") {
+            g_dataset_path = "data/SF-100/";
+            g_scale_factor = 100;
+            g_sf100_mode = true;
             continue;
         }
         // Otherwise treat as the query selector.
@@ -1529,6 +3062,16 @@ int main(int argc, const char * argv[]) {
     if (device) {
         device->setShouldMaximizeConcurrentCompilation(true);
     }
+
+    // Print GPU info for SF100 mode
+    if (g_sf100_mode) {
+        std::cout << "=== SF100 Chunked Streaming Mode ===" << std::endl;
+        std::cout << "GPU: " << device->name()->utf8String() << std::endl;
+        printf("Max Working Set: %zu MB\n", device->recommendedMaxWorkingSetSize() / (1024*1024));
+        printf("Current Allocated: %zu MB\n", device->currentAllocatedSize() / (1024*1024));
+        std::cout << "Data path: " << g_dataset_path << std::endl;
+    }
+
     MTL::CommandQueue* commandQueue = device->newCommandQueue();
     
     NS::Error* error = nullptr;
@@ -1549,48 +3092,61 @@ int main(int argc, const char * argv[]) {
         }
     }
 
-    // Run benchmarks based on command line argument
-    if (query == "all") {
-        // Run all benchmarks
-        runSelectionBenchmark(device, commandQueue, library);
-        runAggregationBenchmark(device, commandQueue, library);
-        runJoinBenchmark(device, commandQueue, library);
-        runQ1Benchmark(device, commandQueue, library);
-        runQ3Benchmark(device, commandQueue, library);
-        runQ6Benchmark(device, commandQueue, library);
-        runQ9Benchmark(device, commandQueue, library);
-        runQ13Benchmark(device, commandQueue, library);
-    } else if (query == "selection") {
-        runSelectionBenchmark(device, commandQueue, library);
-    } else if (query == "aggregation") {
-        runAggregationBenchmark(device, commandQueue, library);
-    } else if (query == "join") {
-        runJoinBenchmark(device, commandQueue, library);
-    } else if (query == "q1") {
-        runQ1Benchmark(device, commandQueue, library);
-    } else if (query == "q3") {
-        runQ3Benchmark(device, commandQueue, library);
-    } else if (query == "q6") {
-        runQ6Benchmark(device, commandQueue, library);
-    } else if (query == "q9") {
-        runQ9Benchmark(device, commandQueue, library);
-    } else if (query == "q13") {
-        runQ13Benchmark(device, commandQueue, library);
+    // SF100 mode: use chunked execution paths
+    if (g_sf100_mode) {
+        if (query == "all") {
+            runQ1BenchmarkSF100(device, commandQueue, library);
+            runQ6BenchmarkSF100(device, commandQueue, library);
+            runQ3BenchmarkSF100(device, commandQueue, library);
+            runQ9BenchmarkSF100(device, commandQueue, library);
+            runQ13BenchmarkSF100(device, commandQueue, library);
+        } else if (query == "q1") {
+            runQ1BenchmarkSF100(device, commandQueue, library);
+        } else if (query == "q3") {
+            runQ3BenchmarkSF100(device, commandQueue, library);
+        } else if (query == "q6") {
+            runQ6BenchmarkSF100(device, commandQueue, library);
+        } else if (query == "q9") {
+            runQ9BenchmarkSF100(device, commandQueue, library);
+        } else if (query == "q13") {
+            runQ13BenchmarkSF100(device, commandQueue, library);
+        } else {
+            std::cerr << "SF100 mode supports: q1, q3, q6, q9, q13, all" << std::endl;
+            return 1;
+        }
     } else {
-        std::cerr << "Unknown query: " << query << std::endl;
-        std::cerr << "Use 'help' to see available options." << std::endl;
-        // Cleanup and exit (skip explicit releases to avoid rare teardown crashes; OS will reclaim)
-        // library->release();
-        // commandQueue->release();
-        // device->release();
-        // pAutoreleasePool->release();
-        return 1;
+        // Standard SF1/SF10 mode
+        if (query == "all") {
+            runSelectionBenchmark(device, commandQueue, library);
+            runAggregationBenchmark(device, commandQueue, library);
+            runJoinBenchmark(device, commandQueue, library);
+            runQ1Benchmark(device, commandQueue, library);
+            runQ3Benchmark(device, commandQueue, library);
+            runQ6Benchmark(device, commandQueue, library);
+            runQ9Benchmark(device, commandQueue, library);
+            runQ13Benchmark(device, commandQueue, library);
+        } else if (query == "selection") {
+            runSelectionBenchmark(device, commandQueue, library);
+        } else if (query == "aggregation") {
+            runAggregationBenchmark(device, commandQueue, library);
+        } else if (query == "join") {
+            runJoinBenchmark(device, commandQueue, library);
+        } else if (query == "q1") {
+            runQ1Benchmark(device, commandQueue, library);
+        } else if (query == "q3") {
+            runQ3Benchmark(device, commandQueue, library);
+        } else if (query == "q6") {
+            runQ6Benchmark(device, commandQueue, library);
+        } else if (query == "q9") {
+            runQ9Benchmark(device, commandQueue, library);
+        } else if (query == "q13") {
+            runQ13Benchmark(device, commandQueue, library);
+        } else {
+            std::cerr << "Unknown query: " << query << std::endl;
+            std::cerr << "Use 'help' to see available options." << std::endl;
+            return 1;
+        }
     }
     
-    // Cleanup (skip explicit releases to avoid teardown crash; process exit will free resources)
-    // library->release();
-    // commandQueue->release();
-    // device->release();
-    // pAutoreleasePool->release();
     return 0;
 }

@@ -111,6 +111,25 @@ run-sf10: $(TARGET) $(KERNEL_METALLIB)
 	@echo "Running $(PROJECT_NAME) with SF-10 dataset..."
 	@cd GPUDBMetalBenchmark && ../$(TARGET) sf10
 
+.PHONY: run-sf100
+run-sf100: $(TARGET) $(KERNEL_METALLIB)
+	@echo "Running $(PROJECT_NAME) with SF-100 dataset (chunked execution)..."
+	@test -d data/SF-100 || (echo "ERROR: data/SF-100 not found. Run: scripts/create_tpch_data.sh 100" && exit 1)
+	@cd GPUDBMetalBenchmark && ../$(TARGET) sf100
+
+# Run SF100 individual queries
+.PHONY: run-sf100-q1 run-sf100-q3 run-sf100-q6 run-sf100-q9 run-sf100-q13
+run-sf100-q1: $(TARGET) $(KERNEL_METALLIB)
+	@cd GPUDBMetalBenchmark && ../$(TARGET) sf100 q1
+run-sf100-q3: $(TARGET) $(KERNEL_METALLIB)
+	@cd GPUDBMetalBenchmark && ../$(TARGET) sf100 q3
+run-sf100-q6: $(TARGET) $(KERNEL_METALLIB)
+	@cd GPUDBMetalBenchmark && ../$(TARGET) sf100 q6
+run-sf100-q9: $(TARGET) $(KERNEL_METALLIB)
+	@cd GPUDBMetalBenchmark && ../$(TARGET) sf100 q9
+run-sf100-q13: $(TARGET) $(KERNEL_METALLIB)
+	@cd GPUDBMetalBenchmark && ../$(TARGET) sf100 q13
+
 # Run TPC-H Query benchmarks individually
 .PHONY: run-q1
 run-q1: $(TARGET) $(KERNEL_METALLIB)
@@ -176,6 +195,8 @@ help:
 	@echo "Available targets:"
 	@echo "  run-sf1           - Build and run with SF-1 dataset"
 	@echo "  run-sf10          - Build and run with SF-10 dataset"
+	@echo "  run-sf100         - Build and run with SF-100 dataset (chunked)"
+	@echo "  run-sf100-q{N}    - Run individual SF-100 query (q1,q3,q6,q9,q13)"
 	@echo "  run-q1            - Run TPC-H Query 1 benchmark only"
 	@echo "  run-q3            - Run TPC-H Query 3 benchmark only"
 	@echo "  run-q6            - Run TPC-H Query 6 benchmark only"
@@ -211,7 +232,7 @@ info:
 	@echo "  Q9  - Product Type Profit Measure Query"
 	@echo "  Q13 - Customer Distribution Query"
 	@echo ""
-	@echo "Available datasets: SF-1, SF-10"
+	@echo "Available datasets: SF-1, SF-10, SF-100"
 
 # Print variables (for debugging the Makefile)
 .PHONY: print-vars

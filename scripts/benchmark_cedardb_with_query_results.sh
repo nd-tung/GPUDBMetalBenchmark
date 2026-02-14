@@ -142,10 +142,12 @@ else
     LINEITEM_COUNT=$(docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb psql -h localhost -p 5432 -U "${CEDAR_USER}" -d "${CEDAR_DB}" -t -c "SELECT COUNT(*) FROM lineitem;" 2>/dev/null || echo "0")
     LINEITEM_COUNT=$(echo "$LINEITEM_COUNT" | tr -d ' ')
     
-    # SF-1 has ~6M rows, SF-10 has ~60M rows
+    # SF-1 has ~6M rows, SF-10 has ~60M rows, SF-100 has ~600M rows
     if [ "${SCALE_FACTOR}" == "SF-1" ] && [ "$LINEITEM_COUNT" -ne 6001215 ]; then
         NEED_RELOAD=1
     elif [ "${SCALE_FACTOR}" == "SF-10" ] && [ "$LINEITEM_COUNT" -ne 59986052 ]; then
+        NEED_RELOAD=1
+    elif [ "${SCALE_FACTOR}" == "SF-100" ] && [ "$LINEITEM_COUNT" -ne 600037902 ]; then
         NEED_RELOAD=1
     fi
 fi
