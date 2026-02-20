@@ -1,0 +1,193 @@
+=== SF100 Chunked Streaming Mode ===
+GPU: Apple M3 Ultra
+Max Working Set: 79626 MB
+Current Allocated: 0 MB
+Data path: data/SF-100/
+
+=== Running TPC-H Q1 Benchmark (SF100 Chunked) ===
+Building line index for lineitem.tbl (75893 MB)...
+Indexed 600037902 rows in 43206.4 ms
+Chunk size: 52428800 rows, total: 600037902 rows
+
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+| l_return | l_linest |    sum_qty | sum_base_price | sum_disc_price |     sum_charge |    avg_qty |  avg_price |   avg_disc | count    |
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+|        A |        F | 3775127758.00 | 5660776146130.29 | 5377736469474.95 | 5592847514569.52 |      25.50 |   38236.12 |       0.05 | 148047881 |
+|        N |        F | 98553062.00 | 147771099662.31 | 140384967826.19 | 145999795256.05 |      25.50 |   38237.20 |       0.05 |  3864590 |
+|        N |        O | 7436302976.00 | 11150725777751.50 | 10593195448707.70 | 11016932415714.96 |      25.50 |   38237.23 |       0.05 | 291619617 |
+|        R |        F | 3775724970.00 | 5661603081674.74 | 5378513635297.42 | 5593662337808.63 |      25.50 |   38236.70 |       0.05 | 148067261 |
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+
+SF100 Q1 | 12 chunks | 600037902 rows
+  CPU Parsing:         149203.63 ms
+  GPU Execution:          148.18 ms
+  CPU Post Process:         0.11 ms
+  Sync Time:              387.32 ms
+  Total Execution:        148.29 ms  (GPU + CPU post)
+  Wall Clock:          192799.44 ms
+
+=== Running TPC-H Q6 Benchmark (SF100 Chunked) ===
+Q6 SF100: 600037902 rows, chunk size: 52428800
+TPC-H Q6 Result: Revenue = $12330426880.00
+
+SF100 Q6 | 12 chunks | 600037902 rows
+  CPU Parsing:          77558.03 ms
+  GPU Execution:           10.84 ms
+  CPU Post Process:         0.01 ms
+  Sync Time:              209.56 ms
+  Total Execution:         10.85 ms  (GPU + CPU post)
+  Wall Clock:           77769.08 ms
+
+=== Running TPC-H Q3 Benchmark (SF100 Chunked) ===
+GPU max working set: 79626 MB
+Q3 SF100: customer=15000000, orders=150000000, lineitem=600037902 rows
+Orders map: 600000001 entries (2288.8 MB)
+Build phase done (GPU: 8.60 ms)
+Lineitem chunk size: 52428800 rows
+
+TPC-H Q3 Results (Top 10):
++----------+------------+------------+--------------+
+| orderkey |   revenue  | orderdate  | shippriority |
++----------+------------+------------+--------------+
+| 249739810 | $ 492136.88 |   19950228 |            0 |
+| 165214338 | $ 485645.53 |   19950309 |            0 |
+| 507274210 | $ 485256.28 |   19950310 |            0 |
+| 202071367 | $ 474746.38 |   19950312 |            0 |
+| 37307463 | $ 474325.19 |   19950206 |            0 |
+| 461984355 | $ 468002.50 |   19950313 |            0 |
+| 100810368 | $ 467932.78 |   19950228 |            0 |
+| 74015523 | $ 467786.81 |   19950314 |            0 |
+| 402772582 | $ 463367.06 |   19950310 |            0 |
+| 367111712 | $ 462559.41 |   19950301 |            0 |
++----------+------------+------------+--------------+
+
+SF100 Q3 | 12 chunks | 600037902 rows
+  CPU Parsing:         183054.49 ms
+  GPU Execution:           10.54 ms
+  CPU Post Process:       222.48 ms
+  Sync Time:             2221.48 ms
+  Total Execution:        233.02 ms  (GPU + CPU post)
+  Wall Clock:          185406.64 ms
+
+=== Running TPC-H Q9 Benchmark (SF100 Hybrid Streaming) ===
+GPU max working set: 79626 MB
+Q9 SF100: part=20000000, supplier=1000000, partsupp=80000000, orders=150000000, lineitem=600037902
+
+--- Phase 1: Build Hash Tables (sequential, memory-conscious) ---
+  Part bitmap built (625001 ints, max_partkey=20000000)
+  Supplier direct map built (size=1000001)
+  Orders HT built (ht_size=300000000)
+  PartSupp HT built (ht_size=320000000)
+Phase 1 complete. GPU HTs resident: bitmap(2.4 MB) + suppmap(3.8 MB) + orders_ht(2288.8 MB) + partsupp_ht(4882.8 MB)
+
+--- Phase 2: Stream lineitem (600037902 rows) ---
+Chunk size: 52428800 rows, 12 chunks
+  Chunk 10/12 done
+  Chunk 12/12 done
+
+TPC-H Query 9 Results (Top 15):
++------------+------+---------------+
+| Nation     | Year |        Profit |
++------------+------+---------------+
+| ALGERIA    | 1998 | $2255550208.00 |
+| ALGERIA    | 1997 | $4140234752.00 |
+| ALGERIA    | 1996 | $4139351040.00 |
+| ALGERIA    | 1995 | $4138830848.00 |
+| ALGERIA    | 1994 | $4126112512.00 |
+| ALGERIA    | 1993 | $4133148416.00 |
+| ALGERIA    | 1992 | $4155000320.00 |
+| ARGENTINA  | 1998 | $2226783744.00 |
+| ARGENTINA  | 1997 | $4088310272.00 |
+| ARGENTINA  | 1996 | $4107099392.00 |
+| ARGENTINA  | 1995 | $4102679296.00 |
+| ARGENTINA  | 1994 | $4107505408.00 |
+| ARGENTINA  | 1993 | $4099953664.00 |
+| ARGENTINA  | 1992 | $4076356864.00 |
+| BRAZIL     | 1998 | $2242287872.00 |
++------------+------+---------------+
+Total results found: 175
+
+Comparable TPC-H Q9 (yearly sum_profit):
++--------+---------------+
+| o_year |   sum_profit  |
++--------+---------------+
+|   1992 | 103297534976.0000 |
+|   1993 | 103012974336.0000 |
+|   1994 | 102955236352.0000 |
+|   1995 | 103010353152.0000 |
+|   1996 | 103270994688.0000 |
+|   1997 | 102807042304.0000 |
+|   1998 | 56174975232.0000 |
++--------+---------------+
+
+SF100 Q9 | 12 chunks | 600037902 rows
+  CPU Parsing:         210623.85 ms
+  GPU Execution:          662.80 ms
+  CPU Post Process:         0.08 ms
+  Sync Time:             6646.59 ms
+  Total Execution:        662.87 ms  (GPU + CPU post)
+  Wall Clock:          510329.28 ms
+
+=== Running TPC-H Q13 Benchmark (SF100 Chunked) ===
+Q13 SF100: customer=15000000, orders=150000000
+Q13 chunk size: 52428800 rows, 3 chunks
+  Chunk 3/3 done
+
+TPC-H Query 13 Results (Comparable histogram):
++---------+----------+
+| c_count | custdist |
++---------+----------+
+|       0 |  5000185 |
+|      10 |   676811 |
+|       9 |   663489 |
+|      11 |   633470 |
+|       8 |   590552 |
+|      12 |   563242 |
+|      13 |   494378 |
+|      19 |   476929 |
+|      18 |   468507 |
+|      20 |   465530 |
+|       7 |   463825 |
+|      17 |   450719 |
+|      14 |   444778 |
+|      21 |   434624 |
+|      16 |   430428 |
+|      15 |   424384 |
+|      22 |   389107 |
+|      23 |   331186 |
+|       6 |   318714 |
+|      24 |   270082 |
+|      25 |   210336 |
+|       5 |   185787 |
+|      26 |   156657 |
+|      27 |   112110 |
+|       4 |    89797 |
+|      28 |    77640 |
+|      29 |    51391 |
+|       3 |    34680 |
+|      30 |    32763 |
+|      31 |    19910 |
+|      32 |    11819 |
+|       2 |     9980 |
+|      33 |     6616 |
+|      34 |     3651 |
+|      35 |     1985 |
+|       1 |     1853 |
+|      36 |     1057 |
+|      37 |      534 |
+|      38 |      261 |
+|      39 |      119 |
+|      40 |       66 |
+|      41 |       26 |
+|      42 |       14 |
+|      43 |        7 |
+|      44 |        1 |
++---------+----------+
+
+SF100 Q13 | 3 chunks | 150000000 rows
+  CPU Parsing:          15424.20 ms
+  GPU Execution:           44.76 ms
+  CPU Post Process:       121.78 ms
+  Sync Time:              362.99 ms
+  Total Execution:        166.55 ms  (GPU + CPU post)
+  Wall Clock:           48863.97 ms

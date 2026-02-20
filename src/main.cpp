@@ -88,7 +88,7 @@ static size_t countLines(const MappedFile& mf) {
 // Build line offset index for random access by row number
 static std::vector<size_t> buildLineIndex(const MappedFile& mf) {
     std::vector<size_t> offsets;
-    offsets.reserve(1024 * 1024);
+    offsets.reserve(countLines(mf) + 1); // pre-size to avoid repeated reallocations
     offsets.push_back(0);
     const char* p = (const char*)mf.data;
     const char* end = p + mf.size;
@@ -102,6 +102,7 @@ static std::vector<size_t> buildLineIndex(const MappedFile& mf) {
 static size_t parseIntColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
                                    size_t startRow, size_t rowCount, int columnIndex, int* output) {
     const char* base = (const char*)mf.data;
+    const char* fileEnd = base + mf.size;
     size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
     size_t parsed = 0;
     for (size_t r = startRow; r < maxRow; r++) {
@@ -110,12 +111,13 @@ static size_t parseIntColumnChunk(const MappedFile& mf, const std::vector<size_t
         const char* start = line;
         while (col <= columnIndex) {
             const char* end = start;
-            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            while (end < fileEnd && *end != '|' && *end != '\n') end++;
             if (col == columnIndex) {
                 output[parsed++] = atoi(start);
                 break;
             }
             col++;
+            if (end >= fileEnd) break;
             start = end + 1;
         }
     }
@@ -126,6 +128,7 @@ static size_t parseIntColumnChunk(const MappedFile& mf, const std::vector<size_t
 static size_t parseFloatColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
                                      size_t startRow, size_t rowCount, int columnIndex, float* output) {
     const char* base = (const char*)mf.data;
+    const char* fileEnd = base + mf.size;
     size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
     size_t parsed = 0;
     for (size_t r = startRow; r < maxRow; r++) {
@@ -134,12 +137,13 @@ static size_t parseFloatColumnChunk(const MappedFile& mf, const std::vector<size
         const char* start = line;
         while (col <= columnIndex) {
             const char* end = start;
-            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            while (end < fileEnd && *end != '|' && *end != '\n') end++;
             if (col == columnIndex) {
                 output[parsed++] = strtof(start, nullptr);
                 break;
             }
             col++;
+            if (end >= fileEnd) break;
             start = end + 1;
         }
     }
@@ -150,6 +154,7 @@ static size_t parseFloatColumnChunk(const MappedFile& mf, const std::vector<size
 static size_t parseDateColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
                                     size_t startRow, size_t rowCount, int columnIndex, int* output) {
     const char* base = (const char*)mf.data;
+    const char* fileEnd = base + mf.size;
     size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
     size_t parsed = 0;
     for (size_t r = startRow; r < maxRow; r++) {
@@ -158,7 +163,7 @@ static size_t parseDateColumnChunk(const MappedFile& mf, const std::vector<size_
         const char* start = line;
         while (col <= columnIndex) {
             const char* end = start;
-            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            while (end < fileEnd && *end != '|' && *end != '\n') end++;
             if (col == columnIndex) {
                 // Parse YYYY-MM-DD removing dashes
                 int year = 0, month = 0, day = 0;
@@ -172,6 +177,7 @@ static size_t parseDateColumnChunk(const MappedFile& mf, const std::vector<size_
                 break;
             }
             col++;
+            if (end >= fileEnd) break;
             start = end + 1;
         }
     }
@@ -182,6 +188,7 @@ static size_t parseDateColumnChunk(const MappedFile& mf, const std::vector<size_
 static size_t parseCharColumnChunk(const MappedFile& mf, const std::vector<size_t>& lineIndex,
                                     size_t startRow, size_t rowCount, int columnIndex, char* output) {
     const char* base = (const char*)mf.data;
+    const char* fileEnd = base + mf.size;
     size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
     size_t parsed = 0;
     for (size_t r = startRow; r < maxRow; r++) {
@@ -190,12 +197,16 @@ static size_t parseCharColumnChunk(const MappedFile& mf, const std::vector<size_
         const char* start = line;
         while (col <= columnIndex) {
             const char* end = start;
-            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            while (end < fileEnd && *end != '|' && *end != '\n') end++;
             if (col == columnIndex) {
-                output[parsed++] = *start;
+                if (start < fileEnd)
+                    output[parsed++] = *start;
+                else
+                    output[parsed++] = '\0';
                 break;
             }
             col++;
+            if (end >= fileEnd) break;
             start = end + 1;
         }
     }
@@ -207,6 +218,7 @@ static size_t parseCharColumnChunkFixed(const MappedFile& mf, const std::vector<
                                         size_t startRow, size_t rowCount, int columnIndex,
                                         int fixedWidth, char* output) {
     const char* base = (const char*)mf.data;
+    const char* fileEnd = base + mf.size;
     size_t maxRow = std::min(startRow + rowCount, lineIndex.size());
     size_t parsed = 0;
     for (size_t r = startRow; r < maxRow; r++) {
@@ -215,7 +227,7 @@ static size_t parseCharColumnChunkFixed(const MappedFile& mf, const std::vector<
         const char* start = line;
         while (col <= columnIndex) {
             const char* end = start;
-            while (*end != '|' && *end != '\n' && *end != '\0') end++;
+            while (end < fileEnd && *end != '|' && *end != '\n') end++;
             if (col == columnIndex) {
                 int len = (int)(end - start);
                 int copy = len < fixedWidth ? len : fixedWidth;
@@ -226,6 +238,7 @@ static size_t parseCharColumnChunkFixed(const MappedFile& mf, const std::vector<
                 break;
             }
             col++;
+            if (end >= fileEnd) break;
             start = end + 1;
         }
     }
@@ -606,6 +619,7 @@ void runQ6BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->setBytes(&max_discount, sizeof(max_discount), 9);
         enc->setBytes(&max_quantity, sizeof(max_quantity), 10);
         NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
+        if (tgSize > 1024) tgSize = 1024; // cap to match threadgroup shared arrays in kernel
         enc->dispatchThreadgroups(MTL::Size::Make(num_tg, 1, 1), MTL::Size::Make(tgSize, 1, 1));
 
         enc->setComputePipelineState(s2PSO);
@@ -881,6 +895,7 @@ void runAggregationBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueu
     enc->setBytes(&dataSize, sizeof(dataSize), 2);
 
     NS::UInteger stage1ThreadGroupSize = stage1Pipeline->maxTotalThreadsPerThreadgroup();
+    if (stage1ThreadGroupSize > 1024) stage1ThreadGroupSize = 1024; // cap to match shared_memory[1024] in kernel
     MTL::Size stage1GridSize = MTL::Size::Make(numThreadgroups, 1, 1);
     MTL::Size stage1GroupSize = MTL::Size::Make(stage1ThreadGroupSize, 1, 1);
     enc->dispatchThreadgroups(stage1GridSize, stage1GroupSize);
@@ -1631,6 +1646,7 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
         enc->setBytes(&max_quantity, sizeof(max_quantity), 10);
 
         NS::UInteger stage1ThreadGroupSize = stage1Pipeline->maxTotalThreadsPerThreadgroup();
+        if (stage1ThreadGroupSize > 1024) stage1ThreadGroupSize = 1024; // cap to match shared_memory[1024] in kernel
         MTL::Size stage1GridSize = MTL::Size::Make(numThreadgroups, 1, 1);
         MTL::Size stage1GroupSize = MTL::Size::Make(stage1ThreadGroupSize, 1, 1);
         enc->dispatchThreadgroups(stage1GridSize, stage1GroupSize);

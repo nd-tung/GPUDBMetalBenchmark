@@ -1,0 +1,8 @@
+=== SF100 Chunked Streaming Mode ===
+GPU: Apple M3 Ultra
+Max Working Set: 79626 MB
+Current Allocated: 0 MB
+Data path: data/SF-100/
+
+=== Running TPC-H Q1 Benchmark (SF100 Chunked) ===
+Building line index for lineitem.tbl (75893 MB)...

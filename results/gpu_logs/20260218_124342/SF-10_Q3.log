@@ -1,0 +1,31 @@
+=== GPU Metal Q3 Results ===
+Timestamp: 20260218_124342
+Scale Factor: SF-10
+
+--- Running TPC-H Query 3 Benchmark ---
+Error: Could not open file data/SF-10/customer.tbl
+Error: Could not open file data/SF-10/customer.tbl
+Error: Could not open file data/SF-10/orders.tbl
+Error: Could not open file data/SF-10/orders.tbl
+Error: Could not open file data/SF-10/orders.tbl
+Error: Could not open file data/SF-10/orders.tbl
+Error: Could not open file data/SF-10/lineitem.tbl
+Error: Could not open file data/SF-10/lineitem.tbl
+Error: Could not open file data/SF-10/lineitem.tbl
+Error: Could not open file data/SF-10/lineitem.tbl
+Loaded 0 customers, 0 orders, 0 lineitem rows.
+
+TPC-H Query 3 Results (Top 10):
++----------+------------+------------+--------------+
+| orderkey |   revenue  | orderdate  | shippriority |
++----------+------------+------------+--------------+
++----------+------------+------------+--------------+
+Total results found: 0
+
+Q3 | 0 rows (lineitem)
+  CPU Parsing:              0.02 ms
+  GPU Execution:            0.02 ms
+  CPU Post Process:         0.00 ms
+  Sync Time:                0.21 ms
+  Total Execution:          0.02 ms  (GPU + CPU post)
+  Wall Clock:               0.28 ms
