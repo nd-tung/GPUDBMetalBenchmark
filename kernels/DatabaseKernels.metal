@@ -1444,6 +1444,29 @@ kernel void q3_probe_and_aggregate_direct_kernel(
     }
 }
 
+// Non-atomic struct matching Q3Aggregates layout for post-aggregation compaction
+struct Q3CompactResult {
+    int key;
+    float revenue;
+    uint orderdate;
+    uint shippriority;
+};
+
+// GPU compaction: extract non-empty entries from sparse hash table into dense output
+kernel void q3_compact_results_kernel(
+    device Q3CompactResult* hash_table [[buffer(0)]],
+    device Q3CompactResult* output     [[buffer(1)]],
+    device atomic_uint& result_count   [[buffer(2)]],
+    constant uint& ht_size             [[buffer(3)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= ht_size) return;
+    if (hash_table[index].key > 0) {
+        uint pos = atomic_fetch_add_explicit(&result_count, 1, memory_order_relaxed);
+        output[pos] = hash_table[index];
+    }
+}
+
 
 // =============================================================
 // Q13 GPU Histogram Kernel

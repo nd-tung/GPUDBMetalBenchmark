@@ -1269,14 +1269,7 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
 
 
-// C++ structs for reading final results
-struct Q3Result {
-    int orderkey;
-    float revenue;
-    int orderdate;
-    int shippriority;
-};
-
+// C++ struct for reading GPU hash table results (matches Q3Aggregates/Q3CompactResult layout)
 struct Q3Aggregates_CPU {
     int key;
     float revenue;
@@ -1323,6 +1316,9 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     MTL::Function* pFusedProbeAggFn = pLibrary->newFunction(NS::String::string("q3_probe_and_aggregate_direct_kernel", NS::UTF8StringEncoding));
     MTL::ComputePipelineState* pFusedProbeAggPipe = pDevice->newComputePipelineState(pFusedProbeAggFn, &pError);
 
+    MTL::Function* pCompactFn = pLibrary->newFunction(NS::String::string("q3_compact_results_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pCompactPipe = pDevice->newComputePipelineState(pCompactFn, &pError);
+
     // 3. Create Buffers
     // Optimization 1: Bitmap for Customer (filter 'BUILDING')
     int max_custkey = 0;
@@ -1356,6 +1352,10 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     const uint final_ht_size = orders_size * 2;
     MTL::Buffer* pFinalHTBuffer = pDevice->newBuffer(final_ht_size * sizeof(Q3Aggregates_CPU), MTL::ResourceStorageModeShared);
     std::memset(pFinalHTBuffer->contents(), 0, final_ht_size * sizeof(Q3Aggregates_CPU));
+
+    // Dense output buffer for GPU compaction
+    MTL::Buffer* pDenseBuffer = pDevice->newBuffer(final_ht_size * sizeof(Q3Aggregates_CPU), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCountBuffer = pDevice->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
 
     const int cutoff_date = 19950315;
 
@@ -1424,19 +1424,32 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         }
     }
     
-    // 6. Read back from GPU HT + CPU sort
+    // 6. GPU compaction: extract non-empty HT entries into dense buffer
+    *(uint*)pCountBuffer->contents() = 0;
+    MTL::CommandBuffer* compactCB = pCommandQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* compactEnc = compactCB->computeCommandEncoder();
+    compactEnc->setComputePipelineState(pCompactPipe);
+    compactEnc->setBuffer(pFinalHTBuffer, 0, 0);
+    compactEnc->setBuffer(pDenseBuffer, 0, 1);
+    compactEnc->setBuffer(pCountBuffer, 0, 2);
+    compactEnc->setBytes(&final_ht_size, sizeof(final_ht_size), 3);
+    compactEnc->dispatchThreadgroups(MTL::Size((final_ht_size + 255) / 256, 1, 1), MTL::Size(256, 1, 1));
+    compactEnc->endEncoding();
+    compactCB->commit();
+    compactCB->waitUntilCompleted();
+    double compactGpuMs = (compactCB->GPUEndTime() - compactCB->GPUStartTime()) * 1000.0;
+
+    uint resultCount = *(uint*)pCountBuffer->contents();
+    Q3Aggregates_CPU* dense = (Q3Aggregates_CPU*)pDenseBuffer->contents();
+
+    // CPU: partial_sort for top 10 only (O(N) instead of O(N log N))
     auto cpuMergeStart = std::chrono::high_resolution_clock::now();
-    Q3Aggregates_CPU* ht = (Q3Aggregates_CPU*)pFinalHTBuffer->contents();
-    std::vector<Q3Result> final_results;
-    for (uint i = 0; i < final_ht_size; i++) {
-        if (ht[i].key > 0) {
-            final_results.push_back({ht[i].key, ht[i].revenue, (int)ht[i].orderdate, (int)ht[i].shippriority});
-        }
-    }
-    std::sort(final_results.begin(), final_results.end(), [](const Q3Result& a, const Q3Result& b) {
-        if (a.revenue != b.revenue) return a.revenue > b.revenue;
-        return a.orderdate < b.orderdate;
-    });
+    size_t topK = std::min((size_t)10, (size_t)resultCount);
+    std::partial_sort(dense, dense + topK, dense + resultCount,
+        [](const Q3Aggregates_CPU& a, const Q3Aggregates_CPU& b) {
+            if (a.revenue != b.revenue) return a.revenue > b.revenue;
+            return a.orderdate < b.orderdate;
+        });
     auto cpuMergeEnd = std::chrono::high_resolution_clock::now();
     double cpuMergeMs = std::chrono::duration<double, std::milli>(cpuMergeEnd - cpuMergeStart).count();
 
@@ -1444,14 +1457,14 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printf("+----------+------------+------------+--------------+\n");
     printf("| orderkey |   revenue  | orderdate  | shippriority |\n");
     printf("+----------+------------+------------+--------------+\n");
-    for (size_t i = 0; i < 10 && i < final_results.size(); ++i) {
-        printf("| %8d | $%10.2f | %10d | %12d |\n",
-               final_results[i].orderkey, final_results[i].revenue, final_results[i].orderdate, final_results[i].shippriority);
+    for (size_t i = 0; i < topK; ++i) {
+        printf("| %8d | $%10.2f | %10u | %12u |\n",
+               dense[i].key, dense[i].revenue, dense[i].orderdate, dense[i].shippriority);
     }
     printf("+----------+------------+------------+--------------+\n");
-    printf("Total results found: %lu\n", final_results.size());
+    printf("Total results found: %u\n", resultCount);
 
-    double q3GpuMs = gpuExecutionTime * 1000.0;
+    double q3GpuMs = gpuExecutionTime * 1000.0 + compactGpuMs;
     double q3TotalExecMs = q3GpuMs + cpuMergeMs;
     printf("\nQ3 | %u rows (lineitem)\n", lineitem_size);
     printf("  CPU Parsing (.tbl): %10.2f ms\n", q3CpuParseMs);
@@ -1466,6 +1479,8 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     pOrdersBuildPipe->release();
     pFusedProbeAggFn->release();
     pFusedProbeAggPipe->release();
+    pCompactFn->release();
+    pCompactPipe->release();
 
     pCustKeyBuffer->release();
     pCustMktBuffer->release();
@@ -1480,6 +1495,8 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     pLinePriceBuffer->release();
     pLineDiscBuffer->release();
     pFinalHTBuffer->release();
+    pDenseBuffer->release();
+    pCountBuffer->release();
 }
 
 
@@ -2191,8 +2208,10 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     MTL::ComputePipelineState* pOrdersBuildPipe = device->newComputePipelineState(pOrdersBuildFn, &pError);
     MTL::Function* pFusedProbeAggFn = library->newFunction(NS::String::string("q3_probe_and_aggregate_direct_kernel", NS::UTF8StringEncoding));
     MTL::ComputePipelineState* pFusedProbeAggPipe = device->newComputePipelineState(pFusedProbeAggFn, &pError);
+    MTL::Function* pCompactFn = library->newFunction(NS::String::string("q3_compact_results_kernel", NS::UTF8StringEncoding));
+    MTL::ComputePipelineState* pCompactPipe = device->newComputePipelineState(pCompactFn, &pError);
 
-    if (!pCustBuildPipe || !pOrdersBuildPipe || !pFusedProbeAggPipe) {
+    if (!pCustBuildPipe || !pOrdersBuildPipe || !pFusedProbeAggPipe || !pCompactPipe) {
         std::cerr << "Q3 SF100: Failed to create pipeline states" << std::endl;
         return;
     }
@@ -2277,6 +2296,10 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     MTL::Buffer* pFinalHTBuf = device->newBuffer((size_t)q3_final_ht_size * sizeof(Q3Aggregates_CPU), MTL::ResourceStorageModeShared);
     std::memset(pFinalHTBuf->contents(), 0, (size_t)q3_final_ht_size * sizeof(Q3Aggregates_CPU));
 
+    // Dense output buffer for GPU compaction
+    MTL::Buffer* pDenseBuf = device->newBuffer((size_t)q3_final_ht_size * sizeof(Q3Aggregates_CPU), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCountBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
+
     double totalGpuMs = 0.0, totalCpuParseMs = 0.0;
     size_t offset = 0, chunkNum = 0;
 
@@ -2341,31 +2364,47 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         offset += rowsThisChunk;
     }
 
-    // Read back from GPU HT + sort
-    auto sortStart = std::chrono::high_resolution_clock::now();
-    Q3Aggregates_CPU* ht = (Q3Aggregates_CPU*)pFinalHTBuf->contents();
-    std::vector<Q3Result> finalRes;
-    for (uint i = 0; i < q3_final_ht_size; i++) {
-        if (ht[i].key > 0) {
-            finalRes.push_back({ht[i].key, ht[i].revenue, (int)ht[i].orderdate, (int)ht[i].shippriority});
-        }
+    // GPU compaction: extract non-empty HT entries into dense buffer
+    *(uint*)pCountBuf->contents() = 0;
+    {
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pCompactPipe);
+        enc->setBuffer(pFinalHTBuf, 0, 0);
+        enc->setBuffer(pDenseBuf, 0, 1);
+        enc->setBuffer(pCountBuf, 0, 2);
+        enc->setBytes(&q3_final_ht_size, sizeof(q3_final_ht_size), 3);
+        enc->dispatchThreadgroups(MTL::Size((q3_final_ht_size + 255) / 256, 1, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
     }
-    std::sort(finalRes.begin(), finalRes.end(), [](const Q3Result& a, const Q3Result& b) {
-        if (a.revenue != b.revenue) return a.revenue > b.revenue;
-        return a.orderdate < b.orderdate;
-    });
+
+    uint resultCount = *(uint*)pCountBuf->contents();
+    Q3Aggregates_CPU* dense = (Q3Aggregates_CPU*)pDenseBuf->contents();
+
+    // CPU: partial_sort for top 10 only
+    auto sortStart = std::chrono::high_resolution_clock::now();
+    size_t topK = std::min((size_t)10, (size_t)resultCount);
+    std::partial_sort(dense, dense + topK, dense + resultCount,
+        [](const Q3Aggregates_CPU& a, const Q3Aggregates_CPU& b) {
+            if (a.revenue != b.revenue) return a.revenue > b.revenue;
+            return a.orderdate < b.orderdate;
+        });
+    auto sortEnd = std::chrono::high_resolution_clock::now();
+    double sortMs = std::chrono::duration<double, std::milli>(sortEnd - sortStart).count();
 
     printf("\nTPC-H Q3 Results (Top 10):\n");
     printf("+----------+------------+------------+--------------+\n");
     printf("| orderkey |   revenue  | orderdate  | shippriority |\n");
     printf("+----------+------------+------------+--------------+\n");
-    for (size_t i = 0; i < 10 && i < finalRes.size(); i++) {
-        printf("| %8d | $%10.2f | %10d | %12d |\n",
-               finalRes[i].orderkey, finalRes[i].revenue, finalRes[i].orderdate, finalRes[i].shippriority);
+    for (size_t i = 0; i < topK; i++) {
+        printf("| %8d | $%10.2f | %10u | %12u |\n",
+               dense[i].key, dense[i].revenue, dense[i].orderdate, dense[i].shippriority);
     }
     printf("+----------+------------+------------+--------------+\n");
-    auto sortEnd = std::chrono::high_resolution_clock::now();
-    double sortMs = std::chrono::duration<double, std::milli>(sortEnd - sortStart).count();
+
     double totalCpuPostAllMs = sortMs;
     double allGpuMs = totalGpuMs + buildGpuMs;
     double allCpuParseMs = indexBuildMs + buildParseCpuMs + totalCpuParseMs;
@@ -2381,6 +2420,7 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     pCustBuildFn->release(); pCustBuildPipe->release();
     pOrdersBuildFn->release(); pOrdersBuildPipe->release();
     pFusedProbeAggFn->release(); pFusedProbeAggPipe->release();
+    pCompactFn->release(); pCompactPipe->release();
     pCustKeyBuf->release(); pCustMktBuf->release(); pCustBitmapBuf->release();
     pOrdersMapBuf->release();
     pOrdKeyBuf->release(); pOrdCustBuf->release(); pOrdDateBuf->release(); pOrdPrioBuf->release();
@@ -2389,6 +2429,8 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         liSlots[s].extprice->release(); liSlots[s].discount->release();
     }
     pFinalHTBuf->release();
+    pDenseBuf->release();
+    pCountBuf->release();
 }
 
 
