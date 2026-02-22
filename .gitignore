@@ -2,17 +2,22 @@
 # Git ignore for GPUDBMetalBenchmark
 # =========================
 
-# Ignore all datasets and large files
-GPUDBMetalBenchmark/Data/SF-1/
-*.tbl
+# Build artifacts
+build/
+default.metallib
+kernels/*.air
+kernels/*.metallib
 
-GPUDBMetalBenchmark/Data/SF-10/
-*.tbl
+# TPC-H data files
+data/**/*.tbl
 
-
-# macOS + Xcode temp files
+# macOS system files
 .DS_Store
 */xcuserdata/
 DerivedData/
+
+# IDE / editor
 .vscode/
+
+# Tooling
 temp_tpch/tpch-dbgen/
