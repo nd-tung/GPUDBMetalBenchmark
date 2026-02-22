@@ -1,0 +1,51 @@
+=== GPU Metal Q9 Results ===
+Timestamp: 20260221_122308
+Scale Factor: SF-10
+
+--- Running TPC-H Query 9 Benchmark ---
+Loaded data for all tables.
+Part size: 2000000, Supplier size: 100000, Lineitem size: 59986052
+Found 108782 parts with 'green' in name (CPU check).
+Max PartKey: 2000000
+Max SuppKey: 100000
+
+TPC-H Query 9 Results (Top 15):
++------------+------+---------------+
+| Nation     | Year |        Profit |
++------------+------+---------------+
+| ALGERIA    | 1998 | $ 214603968.00 |
+| ALGERIA    | 1997 | $ 396634848.00 |
+| ALGERIA    | 1996 | $ 395262112.00 |
+| ALGERIA    | 1995 | $ 398428384.00 |
+| ALGERIA    | 1994 | $ 394966784.00 |
+| ALGERIA    | 1993 | $ 395635776.00 |
+| ALGERIA    | 1992 | $ 401159520.00 |
+| ARGENTINA  | 1998 | $ 223554544.00 |
+| ARGENTINA  | 1997 | $ 404916480.00 |
+| ARGENTINA  | 1996 | $ 412995712.00 |
+| ARGENTINA  | 1995 | $ 407317888.00 |
+| ARGENTINA  | 1994 | $ 406951360.00 |
+| ARGENTINA  | 1993 | $ 408337664.00 |
+| ARGENTINA  | 1992 | $ 411066432.00 |
+| BRAZIL     | 1998 | $ 221814336.00 |
++------------+------+---------------+
+Total results found: 175
+
+Comparable TPC-H Q9 (yearly sum_profit):
++--------+---------------+
+| o_year |   sum_profit  |
++--------+---------------+
+|   1992 | 10189707360.0000 |
+|   1993 | 10150340192.0000 |
+|   1994 | 10190943424.0000 |
+|   1995 | 10131186880.0000 |
+|   1996 | 10174320992.0000 |
+|   1997 | 10093506112.0000 |
+|   1998 | 5488331648.0000 |
++--------+---------------+
+
+Q9 | 59986052 rows (lineitem)
+  CPU Parsing (.tbl):  138994.37 ms
+  GPU Execution:           55.17 ms
+  CPU Post Process:         0.05 ms
+  Total Execution:         55.22 ms  (GPU + CPU post)

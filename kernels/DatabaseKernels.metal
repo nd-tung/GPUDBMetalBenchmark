@@ -2305,3 +2305,140 @@ kernel void q13_merge_counts_kernel(
         }
     }
 }
+
+
+// =============================================================
+// Q3 Fused Probe + Direct Aggregation Kernel
+// Eliminates intermediate append buffer; aggregates directly
+// into a global hash table with atomic CAS + fetch_add.
+// =============================================================
+kernel void q3_probe_and_aggregate_direct_kernel(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device int* l_shipdate        [[buffer(1)]],
+    const device float* l_extendedprice [[buffer(2)]],
+    const device float* l_discount      [[buffer(3)]],
+    const device uint* customer_bitmap  [[buffer(4)]],
+    const device int* orders_map        [[buffer(5)]],
+    const device int* o_custkey         [[buffer(6)]],
+    const device int* o_orderdate       [[buffer(7)]],
+    const device int* o_shippriority    [[buffer(8)]],
+    device Q3Aggregates* final_ht       [[buffer(9)]],
+    constant uint& lineitem_size        [[buffer(10)]],
+    constant int& cutoff_date           [[buffer(11)]],
+    constant uint& final_ht_size        [[buffer(12)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    const int BATCH_SIZE = 4;
+
+    for (uint i = global_id; i < lineitem_size; i += grid_size * BATCH_SIZE) {
+        uint idx[BATCH_SIZE];
+        bool active[BATCH_SIZE];
+
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            idx[k] = i + k * grid_size;
+            active[k] = (idx[k] < lineitem_size);
+        }
+
+        int l_shipdate_val[BATCH_SIZE];
+        int l_orderkey_val[BATCH_SIZE];
+
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            if (active[k]) {
+                l_shipdate_val[k] = l_shipdate[idx[k]];
+                l_orderkey_val[k] = l_orderkey[idx[k]];
+            }
+        }
+
+        // Filter 1: l_shipdate > cutoff_date
+        bool pass_date[BATCH_SIZE];
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            pass_date[k] = active[k] && (l_shipdate_val[k] > cutoff_date);
+        }
+
+        // Probe Orders Direct Map
+        int orders_idx[BATCH_SIZE];
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            orders_idx[k] = pass_date[k] ? orders_map[l_orderkey_val[k]] : -1;
+        }
+
+        bool pass_order[BATCH_SIZE];
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            pass_order[k] = pass_date[k] && (orders_idx[k] != -1);
+        }
+
+        // Probe Customer Bitmap
+        int custkey[BATCH_SIZE];
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            if (pass_order[k]) custkey[k] = o_custkey[orders_idx[k]];
+        }
+
+        bool pass_customer[BATCH_SIZE];
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            if (pass_order[k]) {
+                uint word_idx = custkey[k] / 32;
+                uint bit_idx = custkey[k] % 32;
+                pass_customer[k] = (customer_bitmap[word_idx] & (1u << bit_idx)) != 0;
+            } else {
+                pass_customer[k] = false;
+            }
+        }
+
+        // Direct aggregation into final hash table
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            if (pass_customer[k]) {
+                float revenue = l_extendedprice[idx[k]] * (1.0f - l_discount[idx[k]]);
+                int key = l_orderkey_val[k];
+                uint hash = (uint)key % final_ht_size;
+
+                for (uint p = 0; p < final_ht_size; p++) {
+                    uint probe_idx = (hash + p) % final_ht_size;
+                    int expected = 0;
+                    if (atomic_compare_exchange_weak_explicit(
+                            &final_ht[probe_idx].key, &expected, key,
+                            memory_order_relaxed, memory_order_relaxed)) {
+                        // Claimed new slot — set metadata (same for all lineitems of this order)
+                        atomic_store_explicit(&final_ht[probe_idx].orderdate,
+                                             (uint)o_orderdate[orders_idx[k]], memory_order_relaxed);
+                        atomic_store_explicit(&final_ht[probe_idx].shippriority,
+                                             (uint)o_shippriority[orders_idx[k]], memory_order_relaxed);
+                    }
+                    int current_key = atomic_load_explicit(&final_ht[probe_idx].key, memory_order_relaxed);
+                    if (current_key == key) {
+                        atomic_fetch_add_explicit(&final_ht[probe_idx].revenue, revenue, memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// =============================================================
+// Q13 GPU Histogram Kernel
+// Scans per-customer order counts and builds histogram on GPU.
+// Eliminates CPU scan of all customers.
+// =============================================================
+kernel void q13_build_histogram_kernel(
+    const device uint* customer_order_counts [[buffer(0)]],
+    device atomic_uint* histogram            [[buffer(1)]],
+    constant uint& customer_size             [[buffer(2)]],
+    constant uint& max_bins                  [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+
+    for (uint i = global_id; i < customer_size; i += grid_size) {
+        uint count = customer_order_counts[i];
+        if (count < max_bins) {
+            atomic_fetch_add_explicit(&histogram[count], 1u, memory_order_relaxed);
+        }
+    }
+}

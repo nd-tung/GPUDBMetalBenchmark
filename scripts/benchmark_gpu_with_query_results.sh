@@ -57,7 +57,7 @@ parse_and_record() {
     [[ -z "$header_line" ]] && continue
 
     local block
-    block=$(awk "/^(SF100 )?${q} \|/,/Wall Clock:/" "$out_file")
+    block=$(awk "/^(SF100 )?${q} \|/,/Total Execution:/" "$out_file")
 
     local gpu_exec cpu_post total_exec
     gpu_exec=$(extract_metric "$block" "GPU Execution")
@@ -78,8 +78,8 @@ parse_and_record() {
       echo "Timestamp: ${TIMESTAMP}"
       echo "Scale Factor: ${sf_label}"
       echo ""
-      awk "/Running.*Query ${q_num}/,/Wall Clock:/" "$out_file" 2>/dev/null ||
-        awk "/Running.*${q}/,/Wall Clock:/" "$out_file" 2>/dev/null || true
+      awk "/Running.*Query ${q_num}/,/Total Execution:/" "$out_file" 2>/dev/null ||
+        awk "/Running.*${q}/,/Total Execution:/" "$out_file" 2>/dev/null || true
     } > "$q_log"
     [[ -s "$q_log" ]] && echo "    → ${q_log}"
   done
