@@ -91,7 +91,6 @@ static std::vector<size_t> buildLineIndex(const MappedFile& mf) {
     offsets.reserve(countLines(mf) + 1); // pre-size to avoid repeated reallocations
     offsets.push_back(0);
     const char* p = (const char*)mf.data;
-    const char* end = p + mf.size;
     for (size_t i = 0; i < mf.size; i++) {
         if (p[i] == '\n' && i + 1 < mf.size) offsets.push_back(i + 1);
     }
@@ -245,51 +244,6 @@ static size_t parseCharColumnChunkFixed(const MappedFile& mf, const std::vector<
     return parsed;
 }
 
-// --- GPU Heap Allocator ---
-struct GPUHeapAllocator {
-    MTL::Device* device;
-    std::vector<MTL::Heap*> heaps;
-    size_t maxWorkingSet;
-
-    GPUHeapAllocator(MTL::Device* dev) : device(dev) {
-        maxWorkingSet = dev->recommendedMaxWorkingSetSize();
-    }
-
-    ~GPUHeapAllocator() {
-        for (auto* h : heaps) if (h) h->release();
-    }
-
-    bool createHeap(size_t heapSize) {
-        auto* desc = MTL::HeapDescriptor::alloc()->init();
-        desc->setSize(heapSize);
-        desc->setStorageMode(MTL::StorageModeShared);
-        desc->setHazardTrackingMode(MTL::HazardTrackingModeTracked);
-        MTL::Heap* heap = device->newHeap(desc);
-        desc->release();
-        if (!heap) return false;
-        heaps.push_back(heap);
-        return true;
-    }
-
-    MTL::Buffer* allocateBuffer(size_t size) {
-        for (auto* heap : heaps) {
-            MTL::Buffer* buf = heap->newBuffer(size, MTL::ResourceStorageModeShared);
-            if (buf) return buf;
-        }
-        return nullptr;
-    }
-
-    bool isUnderMemoryPressure() const {
-        return device->currentAllocatedSize() > static_cast<size_t>(maxWorkingSet * 0.85);
-    }
-
-    void printStats() const {
-        printf("[GPU Memory] Allocated: %zu MB / Max: %zu MB (%.1f%%)\n",
-               device->currentAllocatedSize() / (1024*1024),
-               maxWorkingSet / (1024*1024),
-               100.0 * device->currentAllocatedSize() / (double)maxWorkingSet);
-    }
-};
 
 // ===================================================================
 // SF100 CHUNKED Q1 EXECUTION
@@ -502,7 +456,7 @@ void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     // CPU post-processing: compute averages from accumulators
     auto cpuPostFinalStart = std::chrono::high_resolution_clock::now();
     struct Q1R { double sum_qty, sum_base, sum_disc, sum_charge, avg_qty, avg_price, avg_disc; uint cnt; };
-    auto emit = [&](int rfi, int lsi, int bin) -> Q1R {
+    auto emit = [&]([[maybe_unused]] int rfi, [[maybe_unused]] int lsi, int bin) -> Q1R {
         Q1R r = {};
         if (g_count[bin] == 0) return r;
         r.sum_qty = (double)g_sum_qty[bin] / 100.0;
@@ -762,7 +716,7 @@ std::vector<char> loadCharColumn(const std::string& filePath, int columnIndex, i
     }
     std::string line; while (std::getline(file, line)) { std::string token; int currentCol = 0; size_t start = 0; size_t end = line.find('|');
         while (end != std::string::npos) { if (currentCol == columnIndex) { token = line.substr(start, end - start);
-            if (fixed_width > 0) { for(int i=0; i < fixed_width; ++i) data.push_back(i < token.length() ? token[i] : '\0'); }
+            if (fixed_width > 0) { for(size_t i=0; i < (size_t)fixed_width; ++i) data.push_back(i < token.length() ? token[i] : '\0'); }
             else { data.push_back(token[0]);
             }
             break;
@@ -796,7 +750,7 @@ std::vector<int> loadDateColumn(const std::string& filePath, int columnIndex) {
 
 
 // --- Selection Benchmark Test Function ---
-void runSingleSelectionTest(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::ComputePipelineState* pipelineState,
+void runSingleSelectionTest([[maybe_unused]] MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::ComputePipelineState* pipelineState,
                             MTL::Buffer* inBuffer, MTL::Buffer* resultBuffer,
                             const std::vector<int>& cpuData, int filterValue) {
     
@@ -931,9 +885,11 @@ void runAggregationBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueu
     enc->dispatchThreadgroups(stage1GridSize, stage1GroupSize);
 
     // Switch to stage 2 on the same encoder
+    const uint numTGs = numThreadgroups;
     enc->setComputePipelineState(stage2Pipeline);
     enc->setBuffer(partialSumsBuffer, 0, 0);
     enc->setBuffer(resultBuffer, 0, 1);
+    enc->setBytes(&numTGs, sizeof(numTGs), 2);
     enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
     enc->endEncoding();
 
@@ -1109,17 +1065,6 @@ void runJoinBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL:
 }
 
 
-// C++ equivalent of the Metal struct for reading results.
-// Note: no atomics here, as we are just reading the final values.
-struct Q1Aggregates_CPU {
-    int   key;
-    float sum_qty;
-    float sum_base_price;
-    float sum_disc_price;
-    float sum_charge;
-    float sum_discount;
-    unsigned int  count;
-};
 
 // --- Main Function for TPC-H Q1 Benchmark ---
 void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
@@ -1499,7 +1444,7 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printf("+----------+------------+------------+--------------+\n");
     printf("| orderkey |   revenue  | orderdate  | shippriority |\n");
     printf("+----------+------------+------------+--------------+\n");
-    for (int i = 0; i < 10 && i < final_results.size(); ++i) {
+    for (size_t i = 0; i < 10 && i < final_results.size(); ++i) {
         printf("| %8d | $%10.2f | %10d | %12d |\n",
                final_results[i].orderkey, final_results[i].revenue, final_results[i].orderdate, final_results[i].shippriority);
     }
@@ -1637,9 +1582,11 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
         enc->dispatchThreadgroups(stage1GridSize, stage1GroupSize);
 
         // Stage 2: Final sum reduction on the same encoder
+        const uint numTGs = numThreadgroups;
         enc->setComputePipelineState(stage2Pipeline);
         enc->setBuffer(partialRevenuesBuffer, 0, 0);
         enc->setBuffer(finalRevenueBuffer, 0, 1);
+        enc->setBytes(&numTGs, sizeof(numTGs), 2);
         MTL::Size stage2GridSize = MTL::Size::Make(1, 1, 1);
         MTL::Size stage2GroupSize = MTL::Size::Make(1, 1, 1);
         enc->dispatchThreads(stage2GridSize, stage2GroupSize);
@@ -1983,13 +1930,11 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         if (a.nationkey != b.nationkey) return a.nationkey < b.nationkey;
         return a.year > b.year;
     });
-    auto q9_cpu_post_mid = std::chrono::high_resolution_clock::now();
-
     printf("\nTPC-H Query 9 Results (Top 15):\n");
     printf("+------------+------+---------------+\n");
     printf("| Nation     | Year |        Profit |\n");
     printf("+------------+------+---------------+\n");
-    for (int i = 0; i < 15 && i < final_results.size(); ++i) {
+    for (size_t i = 0; i < 15 && i < final_results.size(); ++i) {
         printf("| %-10s | %4d | $%13.2f |\n",
                nation_names[final_results[i].nationkey].c_str(), final_results[i].year, final_results[i].profit);
     }
@@ -2058,22 +2003,10 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 }
 
 
-// C++ structs for reading final Q13 results
-struct Q13_OrderCount_CPU {
-    int custkey;
-    uint order_count;
-};
-
-struct Q13_CustDist_CPU {
-    int c_count;
-    uint custdist;
-};
-
 struct Q13Result {
     uint c_count;
     uint custdist;
 };
-
 
 // --- Main Function for TPC-H Q13 Benchmark ---
 void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL::Library* pLibrary) {
@@ -3126,8 +3059,8 @@ int main(int argc, const char * argv[]) {
     if (g_sf100_mode) {
         std::cout << "=== SF100 Chunked Streaming Mode ===" << std::endl;
         std::cout << "GPU: " << device->name()->utf8String() << std::endl;
-        printf("Max Working Set: %zu MB\n", device->recommendedMaxWorkingSetSize() / (1024*1024));
-        printf("Current Allocated: %zu MB\n", device->currentAllocatedSize() / (1024*1024));
+        printf("Max Working Set: %llu MB\n", (unsigned long long)(device->recommendedMaxWorkingSetSize() / (1024*1024)));
+        printf("Current Allocated: %llu MB\n", (unsigned long long)(device->currentAllocatedSize() / (1024*1024)));
         std::cout << "Data path: " << g_dataset_path << std::endl;
     }
 
