@@ -1,0 +1,13 @@
+=== DuckDB Q6 Results ===
+Timestamp: 20260214_121729
+Scale Factor: SF-1
+Query: Q6
+
+┌────────────────┐
+│    revenue     │
+│ decimal(38,4)  │
+├────────────────┤
+│ 123141078.2283 │
+└────────────────┘
+
+Execution time: 15 ms

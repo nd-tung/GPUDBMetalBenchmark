@@ -1,0 +1,53 @@
+--- Running Selection Benchmark ---
+--- Running Aggregation Benchmark ---
+--- Running Join Benchmark ---
+--- Running TPC-H Query 1 Benchmark ---
+
+--- Running TPC-H Query 3 Benchmark ---
+Loaded 0 customers, 0 orders, 0 lineitem rows.
+
+TPC-H Query 3 Results (Top 10):
++----------+------------+------------+--------------+
+| orderkey |   revenue  | orderdate  | shippriority |
++----------+------------+------------+--------------+
++----------+------------+------------+--------------+
+Total results found: 0
+Total TPC-H Q3 GPU time: 0.03 ms
+Q3 CPU time: 0.00 ms
+Total TPC-H Q3 wall-clock: 0.03 ms
+--- Running TPC-H Query 6 Benchmark ---
+
+--- Running TPC-H Query 9 Benchmark ---
+Loaded data for all tables.
+Part size: 0, Supplier size: 0, Lineitem size: 0
+Found 0 parts with 'green' in name (CPU check).
+Max PartKey: 0
+Max SuppKey: 0
+
+TPC-H Query 9 Results (Top 15):
++------------+------+---------------+
+| Nation     | Year |        Profit |
++------------+------+---------------+
++------------+------+---------------+
+Total results found: 0
+
+Comparable TPC-H Q9 (yearly sum_profit):
++--------+---------------+
+| o_year |   sum_profit  |
++--------+---------------+
++--------+---------------+
+Total TPC-H Q9 GPU time: 0.84 ms
+Q9 CPU time: 0.01 ms
+Total TPC-H Q9 wall-clock: 0.85 ms
+
+--- Running TPC-H Query 13 Benchmark ---
+Loaded 0 orders and 0 customers.
+
+TPC-H Query 13 Results (Comparable histogram):
++---------+----------+
+| c_count | custdist |
++---------+----------+
++---------+----------+
+Total TPC-H Q13 GPU time: 0.02 ms
+Q13 CPU time: 0.00 ms
+Total TPC-H Q13 wall-clock: 0.02 ms

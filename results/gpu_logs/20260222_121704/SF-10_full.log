@@ -1,0 +1,194 @@
+Metal library compiled from source at runtime
+--- Running Selection Benchmark ---
+Loaded 59986052 rows for selection.
+--- Filter Value: < 1000 ---
+Selectivity: 0.0500083% (29998 rows matched)
+GPU execution time: 0.744 ms
+Effective Bandwidth: 300.357 GB/s
+
+--- Filter Value: < 10000 ---
+Selectivity: 0.500381% (300159 rows matched)
+GPU execution time: 0.734083 ms
+Effective Bandwidth: 304.414 GB/s
+
+--- Filter Value: < 50000 ---
+Selectivity: 2.50079% (1500128 rows matched)
+GPU execution time: 0.72875 ms
+Effective Bandwidth: 306.642 GB/s
+
+--- Running Aggregation Benchmark ---
+Loaded 59986052 rows for aggregation.
+Final SUM(l_quantity): 1.52974e+09
+GPU execution time: 0.6365 ms
+Effective Bandwidth: 351.085 GB/s
+
+--- Running Join Benchmark ---
+Loaded 15000000 rows from orders.tbl for build phase.
+Loaded 59986052 rows from lineitem.tbl for probe phase.
+Join complete. Found 59986052 total matches.
+Build Phase GPU time: 3.8805 ms
+Probe Phase GPU time: 5.15975 ms
+Total Join GPU time: 9.04025 ms
+
+--- Running TPC-H Query 1 Benchmark ---
+
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+| l_return | l_linest |    sum_qty | sum_base_price | sum_disc_price |     sum_charge |    avg_qty |  avg_price |   avg_disc | count    |
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+|        A |        F | 377518399.00 | 566065732718.08 | 537759111439.15 | 559276679431.47 |      25.50 |   38237.15 |       0.05 | 14804077 |
+|        N |        F | 9851614.00 | 14767438527.06 | 14028805977.04 | 14590491218.77 |      25.52 |   38257.81 |       0.05 |   385998 |
+|        N |        O | 743124873.00 | 1114302296600.68 | 1058580936254.71 | 1100937016982.74 |      25.50 |   38233.90 |       0.05 | 29144351 |
+|        R |        F | 377732830.00 | 566431059914.70 | 538110929831.45 | 559634789413.51 |      25.51 |   38251.22 |       0.05 | 14808183 |
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+
+Q1 | 59986052 rows
+  CPU Parsing (.tbl):  148642.46 ms
+  GPU Execution:           10.77 ms
+  CPU Post Process:         0.02 ms
+  Total Execution:         10.79 ms  (GPU + CPU post)
+
+--- Running TPC-H Query 3 Benchmark ---
+Loaded 1500000 customers, 15000000 orders, 59986052 lineitem rows.
+
+TPC-H Query 3 Results (Top 10):
++----------+------------+------------+--------------+
+| orderkey |   revenue  | orderdate  | shippriority |
++----------+------------+------------+--------------+
+|  4791171 | $ 440715.19 |   19950223 |            0 |
+| 46678469 | $ 439855.34 |   19950127 |            0 |
+| 23906758 | $ 432728.56 |   19950314 |            0 |
+| 23861382 | $ 428739.16 |   19950309 |            0 |
+| 59393639 | $ 426036.06 |   19950212 |            0 |
+|  3355202 | $ 425100.69 |   19950304 |            0 |
+|  9806272 | $ 425088.06 |   19950313 |            0 |
+| 22810436 | $ 423232.00 |   19950102 |            0 |
+| 16384100 | $ 421478.75 |   19950302 |            0 |
+| 52974151 | $ 415367.12 |   19950205 |            0 |
++----------+------------+------------+--------------+
+Total results found: 114003
+
+Q3 | 59986052 rows (lineitem)
+  CPU Parsing (.tbl):  103780.62 ms
+  GPU Execution:            1.88 ms
+  CPU Post Process:        14.92 ms
+  Total Execution:         16.81 ms  (GPU + CPU post)
+--- Running TPC-H Query 6 Benchmark ---
+Loaded 59986052 rows for TPC-H Query 6.
+TPC-H Query 6 Result:
+Total Revenue: $1230114048.00
+
+Q6 | 59986052 rows
+  CPU Parsing (.tbl):   85275.33 ms
+  GPU Execution:            0.82 ms
+  CPU Post Process:         0.00 ms
+  Total Execution:          0.82 ms  (GPU + CPU post)
+  Bandwidth:             1094.41 GB/s
+
+--- Running TPC-H Query 9 Benchmark ---
+Loaded data for all tables.
+Part size: 2000000, Supplier size: 100000, Lineitem size: 59986052
+Found 108782 parts with 'green' in name (CPU check).
+Max PartKey: 2000000
+Max SuppKey: 100000
+
+TPC-H Query 9 Results (Top 15):
++------------+------+---------------+
+| Nation     | Year |        Profit |
++------------+------+---------------+
+| ALGERIA    | 1998 | $ 216403648.00 |
+| ALGERIA    | 1997 | $ 394756096.00 |
+| ALGERIA    | 1996 | $ 396295296.00 |
+| ALGERIA    | 1995 | $ 399799200.00 |
+| ALGERIA    | 1994 | $ 392491968.00 |
+| ALGERIA    | 1993 | $ 395175008.00 |
+| ALGERIA    | 1992 | $ 398020896.00 |
+| ARGENTINA  | 1998 | $ 224336496.00 |
+| ARGENTINA  | 1997 | $ 406059840.00 |
+| ARGENTINA  | 1996 | $ 413584160.00 |
+| ARGENTINA  | 1995 | $ 404723680.00 |
+| ARGENTINA  | 1994 | $ 406080448.00 |
+| ARGENTINA  | 1993 | $ 414255264.00 |
+| ARGENTINA  | 1992 | $ 411127072.00 |
+| BRAZIL     | 1998 | $ 222094224.00 |
++------------+------+---------------+
+Total results found: 175
+
+Comparable TPC-H Q9 (yearly sum_profit):
++--------+---------------+
+| o_year |   sum_profit  |
++--------+---------------+
+|   1992 | 10169179712.0000 |
+|   1993 | 10162661344.0000 |
+|   1994 | 10190150176.0000 |
+|   1995 | 10130065536.0000 |
+|   1996 | 10145454592.0000 |
+|   1997 | 10075867776.0000 |
+|   1998 | 5474264016.0000 |
++--------+---------------+
+
+Q9 | 59986052 rows (lineitem)
+  CPU Parsing (.tbl):  138757.72 ms
+  GPU Execution:           53.00 ms
+  CPU Post Process:         0.06 ms
+  Total Execution:         53.05 ms  (GPU + CPU post)
+
+--- Running TPC-H Query 13 Benchmark ---
+Loaded 15000000 orders and 1500000 customers.
+
+TPC-H Query 13 Results (Comparable histogram):
++---------+----------+
+| c_count | custdist |
++---------+----------+
+|       0 |   500021 |
+|      10 |    66157 |
+|       9 |    65243 |
+|      11 |    62072 |
+|       8 |    58350 |
+|      12 |    55821 |
+|      13 |    49811 |
+|       7 |    46847 |
+|      19 |    46641 |
+|      18 |    46259 |
+|      14 |    45226 |
+|      17 |    45186 |
+|      20 |    45154 |
+|      16 |    43908 |
+|      15 |    43818 |
+|      21 |    42360 |
+|      22 |    37945 |
+|       6 |    32771 |
+|      23 |    32679 |
+|      24 |    26658 |
+|      25 |    21098 |
+|       5 |    19709 |
+|      26 |    15895 |
+|      27 |    11695 |
+|       4 |     9922 |
+|      28 |     8221 |
+|      29 |     5599 |
+|       3 |     4063 |
+|      30 |     3679 |
+|      31 |     2327 |
+|      32 |     1500 |
+|       2 |     1206 |
+|      33 |      854 |
+|      34 |      506 |
+|      35 |      248 |
+|       1 |      233 |
+|      36 |      155 |
+|      37 |       73 |
+|      38 |       47 |
+|      39 |       19 |
+|      40 |       12 |
+|      42 |        4 |
+|      41 |        4 |
+|      44 |        2 |
+|      45 |        1 |
+|      43 |        1 |
++---------+----------+
+
+Q13 | 15000000 orders | 1500000 customers
+  CPU Parsing (.tbl):   11282.01 ms
+  GPU Execution:            4.49 ms
+  CPU Post Process:         0.01 ms
+  Total Execution:          4.50 ms  (GPU + CPU post)

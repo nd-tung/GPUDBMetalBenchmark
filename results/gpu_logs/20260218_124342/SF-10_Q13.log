@@ -1,0 +1,23 @@
+=== GPU Metal Q13 Results ===
+Timestamp: 20260218_124342
+Scale Factor: SF-10
+
+--- Running TPC-H Query 13 Benchmark ---
+Error: Could not open file data/SF-10/orders.tbl
+Error: Could not open file data/SF-10/orders.tbl
+Error: Could not open file data/SF-10/customer.tbl
+Loaded 0 orders and 0 customers.
+
+TPC-H Query 13 Results (Comparable histogram):
++---------+----------+
+| c_count | custdist |
++---------+----------+
++---------+----------+
+
+Q13 | 0 orders | 0 customers
+  CPU Parsing:              0.02 ms
+  GPU Execution:            0.02 ms
+  CPU Post Process:         0.00 ms
+  Sync Time:                0.20 ms
+  Total Execution:          0.02 ms  (GPU + CPU post)
+  Wall Clock:               0.24 ms

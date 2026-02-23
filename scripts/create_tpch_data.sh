@@ -78,6 +78,7 @@ create_directories() {
     
     mkdir -p "$DATA_DIR/SF-1"
     mkdir -p "$DATA_DIR/SF-10"
+    mkdir -p "$DATA_DIR/SF-100"
     mkdir -p "$TEMP_DIR"
     
     log_success "Directory structure created"
