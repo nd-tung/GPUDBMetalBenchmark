@@ -21,6 +21,10 @@ RESULTS_DIR="$PROJECT_ROOT/results"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 DB_FILE="/tmp/benchmark_${TIMESTAMP}.duckdb"
 
+# Detect GPU name and system memory
+GPU_NAME=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2}' | head -1 | xargs)
+MEMORY_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+
 echo -e "${BLUE}============================================${NC}"
 echo -e "${BLUE}   DuckDB vs GPU Database Benchmark${NC}"
 echo -e "${BLUE}============================================${NC}"
@@ -76,7 +80,7 @@ PY
     echo "  ✓ Execution time: ${exec_ms} ms"
 
     # Log results: timestamp,scale_factor,benchmark,exec_ms
-    echo "$TIMESTAMP,$scale_factor,$description,$exec_ms" >> "$RESULTS_DIR/duckdb_results.csv"
+    echo "$TIMESTAMP,$scale_factor,$description,$exec_ms,$GPU_NAME,$MEMORY_GB" >> "$RESULTS_DIR/duckdb_results.csv"
 }
 
 # Check if DuckDB is installed
@@ -133,7 +137,7 @@ check_data_files() {
 setup_results() {
     mkdir -p "$RESULTS_DIR"
     if [[ ! -f "$RESULTS_DIR/duckdb_results.csv" ]]; then
-        echo "timestamp,scale_factor,benchmark,exec_ms,result" > "$RESULTS_DIR/duckdb_results.csv"
+        echo "timestamp,scale_factor,benchmark,exec_ms,gpu_name,memory_gb" > "$RESULTS_DIR/duckdb_results.csv"
     fi
 }
 

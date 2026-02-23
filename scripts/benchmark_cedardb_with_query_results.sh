@@ -14,6 +14,10 @@ RESULTS_FILE="$PROJECT_ROOT/results/cedardb_results.csv"
 LOG_DIR="$PROJECT_ROOT/results/cedardb_logs"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
+# Detect GPU name and system memory
+GPU_NAME=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2}' | head -1 | xargs)
+MEMORY_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+
 # CedarDB connection details
 CEDAR_HOST="localhost"
 CEDAR_PORT="5432"
@@ -35,7 +39,7 @@ mkdir -p "${LOG_DIR}/${TIMESTAMP}"
 
 # Initialize CSV file with header if it doesn't exist
 if [ ! -f "${RESULTS_FILE}" ]; then
-    echo "timestamp,scale_factor,query,execution_time_ms" > "${RESULTS_FILE}"
+    echo "timestamp,scale_factor,query,execution_time_ms,gpu_name,memory_gb" > "${RESULTS_FILE}"
 fi
 
 round_ms() {
@@ -120,7 +124,7 @@ run_query_with_results() {
     fi
     
     # Append timing to CSV
-    echo "${TIMESTAMP},${SCALE_FACTOR},${query_name},${exec_time}" >> "${RESULTS_FILE}"
+    echo "${TIMESTAMP},${SCALE_FACTOR},${query_name},${exec_time},${GPU_NAME},${MEMORY_GB}" >> "${RESULTS_FILE}"
 }
 
 # Check if CedarDB is accessible

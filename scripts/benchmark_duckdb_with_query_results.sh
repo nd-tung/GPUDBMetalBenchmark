@@ -14,6 +14,10 @@ LOG_DIR="$PROJECT_ROOT/results/duckdb_logs"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 DB_FILE="/tmp/duckdb_benchmark_${TIMESTAMP}.duckdb"
 
+# Detect GPU name and system memory
+GPU_NAME=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2}' | head -1 | xargs)
+MEMORY_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+
 echo "=== DuckDB TPC-H Benchmark with Results Export ==="
 echo "Scale Factor: ${SCALE_FACTOR}"
 echo "Data Directory: ${DATA_DIR}"
@@ -29,7 +33,7 @@ mkdir -p "${LOG_DIR}/${TIMESTAMP}"
 
 # Initialize CSV file with header if it doesn't exist
 if [ ! -f "${RESULTS_FILE}" ]; then
-    echo "timestamp,scale_factor,query,execution_time_ms" > "${RESULTS_FILE}"
+    echo "timestamp,scale_factor,query,execution_time_ms,gpu_name,memory_gb" > "${RESULTS_FILE}"
 fi
 
 # Check if DuckDB is installed
@@ -99,7 +103,7 @@ EOF
     echo "  ✓ Results saved to: ${log_file}"
     
     # Append timing to CSV
-    echo "${TIMESTAMP},${SCALE_FACTOR},${query_name},${exec_time}" >> "${RESULTS_FILE}"
+    echo "${TIMESTAMP},${SCALE_FACTOR},${query_name},${exec_time},${GPU_NAME},${MEMORY_GB}" >> "${RESULTS_FILE}"
 }
 
 # Load data into DuckDB

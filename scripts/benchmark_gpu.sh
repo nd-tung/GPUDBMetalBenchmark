@@ -15,10 +15,14 @@ GPU_CSV="$RESULTS_DIR/gpu_results.csv"
 
 QUERIES="Q1 Q3 Q6 Q9 Q13"
 
+# Detect GPU name and system memory
+GPU_NAME=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2}' | head -1 | xargs)
+MEMORY_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+
 mkdir -p "$RESULTS_DIR" "${LOG_DIR}/${TIMESTAMP}"
 
 # CSV header
-CSV_HEADER="timestamp,scale_factor,query,gpu_exec_ms,cpu_post_ms,total_exec_ms"
+CSV_HEADER="timestamp,scale_factor,query,gpu_exec_ms,cpu_post_ms,total_exec_ms,gpu_name,memory_gb"
 if [[ ! -f "$GPU_CSV" ]]; then
   echo "$CSV_HEADER" > "$GPU_CSV"
 fi
@@ -56,7 +60,7 @@ parse_and_record() {
     total_exec=$(extract_metric "$block" "Total Execution")
 
     if [[ -n "$gpu_exec" ]]; then
-      echo "$TIMESTAMP,$sf_label,$q,${gpu_exec},${cpu_post:-0},${total_exec:-0}" >> "$GPU_CSV"
+      echo "$TIMESTAMP,$sf_label,$q,${gpu_exec},${cpu_post:-0},${total_exec:-0},${GPU_NAME},${MEMORY_GB}" >> "$GPU_CSV"
       printf "  %-4s gpu=%-10s cpu_post=%-10s total=%s ms\n" \
         "$q" "${gpu_exec} ms" "${cpu_post:-0} ms" "${total_exec:-0}"
     fi
