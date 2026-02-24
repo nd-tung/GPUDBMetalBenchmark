@@ -37,7 +37,7 @@ struct ChunkConfig {
     static constexpr size_t DEFAULT_CHUNK_ROWS = 10 * 1024 * 1024; // 10M rows
     static constexpr size_t MIN_CHUNK_ROWS = 1 * 1024 * 1024;      // 1M
     static constexpr size_t MAX_CHUNK_ROWS = 50 * 1024 * 1024;     // 50M
-    static constexpr size_t NUM_BUFFERS = 2;                         // double-buffer
+    static constexpr size_t NUM_BUFFERS = 1;                         // single-buffer (double-buffer disabled for benchmarking)
 
     static size_t adaptiveChunkSize(MTL::Device* device, size_t bytesPerRow, size_t totalRows) {
         size_t availableBytes = static_cast<size_t>(device->recommendedMaxWorkingSetSize() * 0.25);
@@ -280,8 +280,9 @@ void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     MTL::ComputePipelineState* s2PSO = device->newComputePipelineState(s2Fn, &error);
     if (!s2PSO) { std::cerr << "Failed to create q1_chunked_stage2 PSO" << std::endl; return; }
 
-    // Allocate double-buffered column buffers (2 slots)
-    const int NUM_SLOTS = 2;
+    // Double-buffering disabled: using single slot for benchmarking
+    // (was: const int NUM_SLOTS = 2; // double-buffer)
+    const int NUM_SLOTS = 1;
     struct ChunkSlot {
         MTL::Buffer* shipdate; MTL::Buffer* returnflag; MTL::Buffer* linestatus;
         MTL::Buffer* quantity; MTL::Buffer* extprice; MTL::Buffer* discount; MTL::Buffer* tax;
@@ -322,12 +323,12 @@ void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     double totalGpuMs = 0.0, totalCpuParseMs = 0.0;
     double totalCpuPostMs = 0.0;
     size_t offset = 0;
-    int slotIdx = 0;
+    // int slotIdx = 0; // disabled: single-buffer mode
     size_t chunkNum = 0;
 
-    // --- Double-buffered pipeline: overlap CPU parse of chunk N+1 with GPU exec of chunk N ---
+    // --- Single-buffer pipeline: parse then execute sequentially (double-buffering disabled) ---
 
-    // Pre-parse first chunk into slot 0
+    /* DOUBLE-BUFFER DISABLED: Pre-parse was here
     size_t rowsThisChunk = std::min(chunkRows, totalRows);
     {
         ChunkSlot& slot = slots[0];
@@ -342,12 +343,28 @@ void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         auto loadEnd = std::chrono::high_resolution_clock::now();
         totalCpuParseMs += std::chrono::duration<double, std::milli>(loadEnd - loadStart).count();
     }
+    */
+    size_t rowsThisChunk;
 
     while (offset < totalRows) {
         rowsThisChunk = std::min(chunkRows, totalRows - offset);
-        ChunkSlot& slot = slots[slotIdx % NUM_SLOTS];
+        ChunkSlot& slot = slots[0]; // Always use slot 0 (single-buffer)
 
-        // Zero partials (safe: GPU from previous iteration already waited on)
+        // Parse current chunk into slot 0 (sequential, no overlap)
+        {
+            auto loadStart = std::chrono::high_resolution_clock::now();
+            parseDateColumnChunk(mf, lineIndex, offset, rowsThisChunk, 10, (int*)slot.shipdate->contents());
+            parseCharColumnChunk(mf, lineIndex, offset, rowsThisChunk, 8,  (char*)slot.returnflag->contents());
+            parseCharColumnChunk(mf, lineIndex, offset, rowsThisChunk, 9,  (char*)slot.linestatus->contents());
+            parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 4, (float*)slot.quantity->contents());
+            parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 5, (float*)slot.extprice->contents());
+            parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 6, (float*)slot.discount->contents());
+            parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 7, (float*)slot.tax->contents());
+            auto loadEnd = std::chrono::high_resolution_clock::now();
+            totalCpuParseMs += std::chrono::duration<double, std::milli>(loadEnd - loadStart).count();
+        }
+
+        // Zero partials
         memset(p_qtyCents->contents(), 0, num_tg * bins * sizeof(long));
         memset(p_baseCents->contents(), 0, num_tg * bins * sizeof(long));
         memset(p_discCents->contents(), 0, num_tg * bins * sizeof(long));
@@ -408,7 +425,7 @@ void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
 
         cmdBuf->commit();
 
-        // --- Double-buffer: parse NEXT chunk into alternate slot while GPU runs ---
+        /* DOUBLE-BUFFER DISABLED: overlapped parsing was here
         size_t nextOffset = offset + rowsThisChunk;
         if (nextOffset < totalRows) {
             size_t nextRows = std::min(chunkRows, totalRows - nextOffset);
@@ -424,8 +441,9 @@ void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             auto loadEnd = std::chrono::high_resolution_clock::now();
             totalCpuParseMs += std::chrono::duration<double, std::milli>(loadEnd - loadStart).count();
         }
+        */
 
-        // Wait for GPU to finish this chunk
+        // Wait for GPU to finish this chunk (sequential)
         cmdBuf->waitUntilCompleted();
         double gpuMs = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
         totalGpuMs += gpuMs;
@@ -450,7 +468,7 @@ void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
 
         chunkNum++;
         offset += rowsThisChunk;
-        slotIdx++;
+        // slotIdx++; // disabled: single-buffer mode
     }
 
     // CPU post-processing: compute averages from accumulators
@@ -538,8 +556,9 @@ void runQ6BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     MTL::ComputePipelineState* s2PSO = device->newComputePipelineState(s2Fn, &error);
     if (!s2PSO) { std::cerr << "Failed q6_chunked_stage2 PSO" << std::endl; return; }
 
-    // Double-buffered column buffers
-    const int NUM_SLOTS = 2;
+    // Double-buffering disabled: using single slot for benchmarking
+    // (was: const int NUM_SLOTS = 2; // double-buffer)
+    const int NUM_SLOTS = 1;
     struct Q6Slot { MTL::Buffer* shipdate; MTL::Buffer* discount; MTL::Buffer* quantity; MTL::Buffer* extprice; };
     Q6Slot slots[NUM_SLOTS];
     for (int s = 0; s < NUM_SLOTS; s++) {
@@ -559,9 +578,9 @@ void runQ6BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     double totalCpuPostMs = 0.0;
     size_t offset = 0, chunkNum = 0;
 
-    // --- Double-buffered pipeline: overlap CPU parse of chunk N+1 with GPU exec of chunk N ---
+    // --- Single-buffer pipeline: parse then execute sequentially (double-buffering disabled) ---
 
-    // Pre-parse first chunk into slot 0
+    /* DOUBLE-BUFFER DISABLED: Pre-parse was here
     size_t rowsThisChunk = std::min(chunkRows, totalRows);
     {
         Q6Slot& slot = slots[0];
@@ -573,10 +592,23 @@ void runQ6BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         auto parseEnd = std::chrono::high_resolution_clock::now();
         totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
     }
+    */
+    size_t rowsThisChunk;
 
     while (offset < totalRows) {
         rowsThisChunk = std::min(chunkRows, totalRows - offset);
-        Q6Slot& slot = slots[chunkNum % NUM_SLOTS];
+        Q6Slot& slot = slots[0]; // Always use slot 0 (single-buffer)
+
+        // Parse current chunk into slot 0 (sequential, no overlap)
+        {
+            auto parseStart = std::chrono::high_resolution_clock::now();
+            parseDateColumnChunk(mf, lineIndex, offset, rowsThisChunk, 10, (int*)slot.shipdate->contents());
+            parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 6, (float*)slot.discount->contents());
+            parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 4, (float*)slot.quantity->contents());
+            parseFloatColumnChunk(mf, lineIndex, offset, rowsThisChunk, 5, (float*)slot.extprice->contents());
+            auto parseEnd = std::chrono::high_resolution_clock::now();
+            totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+        }
 
         // Dispatch GPU on current slot (data already parsed)
         uint chunkSize = (uint)rowsThisChunk;
@@ -605,7 +637,7 @@ void runQ6BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
 
         cmdBuf->commit();
 
-        // --- Double-buffer: parse NEXT chunk into alternate slot while GPU runs ---
+        /* DOUBLE-BUFFER DISABLED: overlapped parsing was here
         size_t nextOffset = offset + rowsThisChunk;
         if (nextOffset < totalRows) {
             size_t nextRows = std::min(chunkRows, totalRows - nextOffset);
@@ -618,8 +650,9 @@ void runQ6BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             auto parseEnd = std::chrono::high_resolution_clock::now();
             totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
         }
+        */
 
-        // Wait for GPU to finish this chunk
+        // Wait for GPU to finish this chunk (sequential)
         cmdBuf->waitUntilCompleted();
         double gpuMs = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
         totalGpuMs += gpuMs;
@@ -2283,8 +2316,10 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     struct Q3ChunkSlot {
         MTL::Buffer* orderkey; MTL::Buffer* shipdate; MTL::Buffer* extprice; MTL::Buffer* discount;
     };
-    Q3ChunkSlot liSlots[2];
-    for (int s = 0; s < 2; s++) {
+    // Double-buffering disabled: using single slot for benchmarking
+    // (was: Q3ChunkSlot liSlots[2]; with 2 slots)
+    Q3ChunkSlot liSlots[1];
+    for (int s = 0; s < 1; s++) {
         liSlots[s].orderkey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
         liSlots[s].shipdate = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
         liSlots[s].extprice = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
@@ -2303,9 +2338,9 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     double totalGpuMs = 0.0, totalCpuParseMs = 0.0;
     size_t offset = 0, chunkNum = 0;
 
-    // --- Double-buffered pipeline: overlap CPU parse of chunk N+1 with GPU exec of chunk N ---
+    // --- Single-buffer pipeline: parse then execute sequentially (double-buffering disabled) ---
 
-    // Pre-parse first chunk into slot 0
+    /* DOUBLE-BUFFER DISABLED: Pre-parse was here
     size_t rowsThisChunk = std::min(chunkRows, liRows);
     {
         Q3ChunkSlot& slot = liSlots[0];
@@ -2317,10 +2352,23 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         auto parseEnd = std::chrono::high_resolution_clock::now();
         totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
     }
+    */
+    size_t rowsThisChunk;
 
     while (offset < liRows) {
         rowsThisChunk = std::min(chunkRows, liRows - offset);
-        Q3ChunkSlot& slot = liSlots[chunkNum % 2];
+        Q3ChunkSlot& slot = liSlots[0]; // Always use slot 0 (single-buffer)
+
+        // Parse current chunk into slot 0 (sequential, no overlap)
+        {
+            auto parseStart = std::chrono::high_resolution_clock::now();
+            parseIntColumnChunk(liFile, liIndex, offset, rowsThisChunk, 0, (int*)slot.orderkey->contents());
+            parseDateColumnChunk(liFile, liIndex, offset, rowsThisChunk, 10, (int*)slot.shipdate->contents());
+            parseFloatColumnChunk(liFile, liIndex, offset, rowsThisChunk, 5, (float*)slot.extprice->contents());
+            parseFloatColumnChunk(liFile, liIndex, offset, rowsThisChunk, 6, (float*)slot.discount->contents());
+            auto parseEnd = std::chrono::high_resolution_clock::now();
+            totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+        }
 
         // Dispatch fused probe+aggregate on current slot
         uint lineitem_size = (uint)rowsThisChunk;
@@ -2341,7 +2389,7 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->endEncoding();
         cb->commit();
 
-        // --- Double-buffer: parse NEXT chunk into alternate slot while GPU runs ---
+        /* DOUBLE-BUFFER DISABLED: overlapped parsing was here
         size_t nextOffset = offset + rowsThisChunk;
         if (nextOffset < liRows) {
             size_t nextRows = std::min(chunkRows, liRows - nextOffset);
@@ -2354,8 +2402,9 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             auto parseEnd = std::chrono::high_resolution_clock::now();
             totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
         }
+        */
 
-        // Wait for GPU to finish this chunk
+        // Wait for GPU to finish this chunk (sequential)
         cb->waitUntilCompleted();
         double gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
         totalGpuMs += gpuMs;
@@ -2424,7 +2473,7 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     pCustKeyBuf->release(); pCustMktBuf->release(); pCustBitmapBuf->release();
     pOrdersMapBuf->release();
     pOrdKeyBuf->release(); pOrdCustBuf->release(); pOrdDateBuf->release(); pOrdPrioBuf->release();
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < 1; s++) { // was 2, now single-buffer
         liSlots[s].orderkey->release(); liSlots[s].shipdate->release();
         liSlots[s].extprice->release(); liSlots[s].discount->release();
     }
@@ -2673,8 +2722,9 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     size_t numChunks = (liRows + chunkRows - 1) / chunkRows;
     printf("Chunk size: %zu rows, %zu chunks\n", chunkRows, numChunks);
 
-    // Allocate double-buffered lineitem chunk GPU buffers
-    const int Q9_NUM_SLOTS = 2;
+    // Double-buffering disabled: using single slot for benchmarking
+    // (was: const int Q9_NUM_SLOTS = 2; // double-buffer)
+    const int Q9_NUM_SLOTS = 1;
     struct Q9LiSlot {
         MTL::Buffer* partKey; MTL::Buffer* suppKey; MTL::Buffer* ordKey;
         MTL::Buffer* qty; MTL::Buffer* price; MTL::Buffer* disc;
@@ -2697,9 +2747,9 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     MTL::Buffer* pFinalHTBuf = device->newBuffer(final_ht_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
     memset(pFinalHTBuf->contents(), 0, final_ht_size * sizeof(Q9Aggregates_CPU));
 
-    // --- Double-buffered pipeline: overlap CPU parse of chunk N+1 with GPU exec of chunk N ---
+    // --- Single-buffer pipeline: parse then execute sequentially (double-buffering disabled) ---
 
-    // Pre-parse first chunk into slot 0
+    /* DOUBLE-BUFFER DISABLED: Pre-parse was here
     {
         uint firstChunk = (uint)std::min(chunkRows, liRows);
         Q9LiSlot& slot = liSlots[0];
@@ -2713,6 +2763,7 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         t1 = std::chrono::high_resolution_clock::now();
         totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
+    */
 
     for (size_t c = 0; c < numChunks; c++) {
         size_t start = c * chunkRows;
@@ -2721,18 +2772,32 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         // Reset intermediate buffer for this chunk
         memset(pIntermediateBuf->contents(), 0, intermediate_size * sizeof(Q9Aggregates_CPU));
 
+        // Parse current chunk into slot 0 (sequential, no overlap)
+        {
+            Q9LiSlot& slot = liSlots[0];
+            t0 = std::chrono::high_resolution_clock::now();
+            parseIntColumnChunk(liFile, liIdx, start, thisChunk, 1, (int*)slot.partKey->contents());
+            parseIntColumnChunk(liFile, liIdx, start, thisChunk, 2, (int*)slot.suppKey->contents());
+            parseIntColumnChunk(liFile, liIdx, start, thisChunk, 0, (int*)slot.ordKey->contents());
+            parseFloatColumnChunk(liFile, liIdx, start, thisChunk, 4, (float*)slot.qty->contents());
+            parseFloatColumnChunk(liFile, liIdx, start, thisChunk, 5, (float*)slot.price->contents());
+            parseFloatColumnChunk(liFile, liIdx, start, thisChunk, 6, (float*)slot.disc->contents());
+            t1 = std::chrono::high_resolution_clock::now();
+            totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+
         // Dispatch probe + merge on current slot (data already parsed)
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
 
         // Probe + local agg
         enc->setComputePipelineState(pProbeAggPipe);
-        enc->setBuffer(liSlots[c % Q9_NUM_SLOTS].suppKey, 0, 0);
-        enc->setBuffer(liSlots[c % Q9_NUM_SLOTS].partKey, 0, 1);
-        enc->setBuffer(liSlots[c % Q9_NUM_SLOTS].ordKey, 0, 2);
-        enc->setBuffer(liSlots[c % Q9_NUM_SLOTS].price, 0, 3);
-        enc->setBuffer(liSlots[c % Q9_NUM_SLOTS].disc, 0, 4);
-        enc->setBuffer(liSlots[c % Q9_NUM_SLOTS].qty, 0, 5);
+        enc->setBuffer(liSlots[0].suppKey, 0, 0); // Always slot 0 (single-buffer)
+        enc->setBuffer(liSlots[0].partKey, 0, 1);
+        enc->setBuffer(liSlots[0].ordKey, 0, 2);
+        enc->setBuffer(liSlots[0].price, 0, 3);
+        enc->setBuffer(liSlots[0].disc, 0, 4);
+        enc->setBuffer(liSlots[0].qty, 0, 5);
         enc->setBuffer(pPsSupplyCostBuf, 0, 6);
         enc->setBuffer(pPartBitmapBuf, 0, 7);
         enc->setBuffer(pSuppMapBuf, 0, 8);
@@ -2757,7 +2822,7 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
 
         cb->commit();
 
-        // --- Double-buffer: parse NEXT chunk into alternate slot while GPU runs ---
+        /* DOUBLE-BUFFER DISABLED: overlapped parsing was here
         if (c + 1 < numChunks) {
             size_t nextStart = (c + 1) * chunkRows;
             size_t nextEnd = std::min(nextStart + chunkRows, liRows);
@@ -2773,8 +2838,9 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             t1 = std::chrono::high_resolution_clock::now();
             totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
+        */
 
-        // Wait for GPU
+        // Wait for GPU (sequential)
         cb->waitUntilCompleted();
         totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
 
@@ -2896,8 +2962,9 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     size_t numChunks = (ordRows + chunkRows - 1) / chunkRows;
     printf("Q13 chunk size: %zu rows, %zu chunks\n", chunkRows, numChunks);
 
-    // Allocate double-buffered chunk buffers for custkey + comment
-    const int Q13_NUM_SLOTS = 2;
+    // Double-buffering disabled: using single slot for benchmarking
+    // (was: const int Q13_NUM_SLOTS = 2; // double-buffer)
+    const int Q13_NUM_SLOTS = 1;
     struct Q13ChunkSlot { MTL::Buffer* custKey; MTL::Buffer* comment; };
     Q13ChunkSlot q13Slots[Q13_NUM_SLOTS];
     for (int s = 0; s < Q13_NUM_SLOTS; s++) {
@@ -2908,9 +2975,9 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     const uint num_threadgroups = 2048;
     uint cs = (uint)custRows;
 
-    // --- Double-buffered pipeline: overlap CPU parse of chunk N+1 with GPU exec of chunk N ---
+    // --- Single-buffer pipeline: parse then execute sequentially (double-buffering disabled) ---
 
-    // Pre-parse first chunk into slot 0
+    /* DOUBLE-BUFFER DISABLED: Pre-parse was here
     {
         uint firstChunk = (uint)std::min(chunkRows, ordRows);
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -2919,12 +2986,22 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
         auto t1 = std::chrono::high_resolution_clock::now();
         totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
+    */
 
     for (size_t c = 0; c < numChunks; c++) {
         size_t start = c * chunkRows;
         size_t end = std::min(start + chunkRows, ordRows);
         uint thisChunk = (uint)(end - start);
-        Q13ChunkSlot& slot = q13Slots[c % Q13_NUM_SLOTS];
+        Q13ChunkSlot& slot = q13Slots[0]; // Always use slot 0 (single-buffer)
+
+        // Parse current chunk into slot 0 (sequential, no overlap)
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            parseIntColumnChunk(ordFile, ordIdx, start, thisChunk, 1, (int*)slot.custKey->contents());
+            parseCharColumnChunkFixed(ordFile, ordIdx, start, thisChunk, 8, 100, (char*)slot.comment->contents());
+            auto t1 = std::chrono::high_resolution_clock::now();
+            totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
 
         // Dispatch kernel on current slot (data already parsed)
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
@@ -2940,7 +3017,7 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
 
         cb->commit();
 
-        // --- Double-buffer: parse NEXT chunk into alternate slot while GPU runs ---
+        /* DOUBLE-BUFFER DISABLED: overlapped parsing was here
         if (c + 1 < numChunks) {
             size_t nextStart = (c + 1) * chunkRows;
             size_t nextEnd = std::min(nextStart + chunkRows, ordRows);
@@ -2952,8 +3029,9 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
             auto t1 = std::chrono::high_resolution_clock::now();
             totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
+        */
 
-        // Wait for GPU
+        // Wait for GPU (sequential)
         cb->waitUntilCompleted();
         totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
 

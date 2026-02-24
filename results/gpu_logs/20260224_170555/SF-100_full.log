@@ -1,0 +1,67 @@
+=== SF100 Chunked Streaming Mode ===
+GPU: Apple M3 Ultra
+Max Working Set: 79626 MB
+Current Allocated: 0 MB
+Data path: data/SF-100/
+Metal library compiled from source at runtime
+
+=== Running TPC-H Q1 Benchmark (SF100 Chunked) ===
+Building line index for lineitem.tbl (75893 MB)...
+Indexed 600037902 rows in 99920.8 ms
+Chunk size: 52428800 rows, total: 600037902 rows
+
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+| l_return | l_linest |    sum_qty | sum_base_price | sum_disc_price |     sum_charge |    avg_qty |  avg_price |   avg_disc | count    |
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+|        A |        F | 3775127758.00 | 5660776146130.29 | 5377736469474.95 | 5592847514569.52 |      25.50 |   38236.12 |       0.05 | 148047881 |
+|        N |        F | 98553062.00 | 147771099662.31 | 140384967826.19 | 145999795256.05 |      25.50 |   38237.20 |       0.05 |  3864590 |
+|        N |        O | 7436302976.00 | 11150725777751.50 | 10593195448707.70 | 11016932415714.96 |      25.50 |   38237.23 |       0.05 | 291619617 |
+|        R |        F | 3775724970.00 | 5661603081674.74 | 5378513635297.42 | 5593662337808.63 |      25.50 |   38236.70 |       0.05 | 148067261 |
++----------+----------+------------+----------------+----------------+----------------+------------+------------+------------+----------+
+
+SF100 Q1 | 12 chunks | 600037902 rows
+  CPU Parsing (.tbl):  250383.59 ms
+  GPU Execution:          139.51 ms
+  CPU Post Process:         0.01 ms
+  Total Execution:        139.52 ms  (GPU + CPU post)
+
+=== Running TPC-H Q6 Benchmark (SF100 Chunked) ===
+Q6 SF100: 600037902 rows, chunk size: 52428800 (index 43734.5 ms)
+TPC-H Q6 Result: Revenue = $12330426880.00
+
+SF100 Q6 | 12 chunks | 600037902 rows
+  CPU Parsing (.tbl):  121252.30 ms
+  GPU Execution:           10.94 ms
+  CPU Post Process:         0.01 ms
+  Total Execution:         10.95 ms  (GPU + CPU post)
+
+=== Running TPC-H Q3 Benchmark (SF100 Chunked) ===
+GPU max working set: 79626 MB
+Q3 SF100: customer=15000000, orders=150000000, lineitem=600037902 rows (index 226664.3 ms)
+Orders map: 600000001 entries (2288.8 MB)
+Build phase done (GPU: 6.87 ms)
+Lineitem chunk size: 52428800 rows
+
+TPC-H Q3 Results (Top 10):
++----------+------------+------------+--------------+
+| orderkey |   revenue  | orderdate  | shippriority |
++----------+------------+------------+--------------+
+| 249739810 | $ 492136.88 |   19950228 |            0 |
+| 165214338 | $ 485645.53 |   19950309 |            0 |
+| 507274210 | $ 485256.28 |   19950310 |            0 |
+| 202071367 | $ 474746.38 |   19950312 |            0 |
+| 37307463 | $ 474325.19 |   19950206 |            0 |
+| 461984355 | $ 468002.50 |   19950313 |            0 |
+| 100810368 | $ 467932.78 |   19950228 |            0 |
+| 74015523 | $ 467786.84 |   19950314 |            0 |
+| 402772582 | $ 463367.06 |   19950310 |            0 |
+| 367111712 | $ 462559.41 |   19950301 |            0 |
++----------+------------+------------+--------------+
+
+SF100 Q3 | 12 chunks | 600037902 rows
+  CPU Parsing (.tbl):  431600.82 ms
+  GPU Execution:           17.38 ms
+  CPU Post Process:         1.23 ms
+  Total Execution:         18.62 ms  (GPU + CPU post)
+
+=== Running TPC-H Q9 Benchmark (SF100 Hybrid Streaming) ===
