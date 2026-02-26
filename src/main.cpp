@@ -2230,16 +2230,252 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     for (auto k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
     const uint orders_map_size = max_orderkey + 1;
     
-    // Check if orders map fits in memory
+    // Check if orders map fits in memory — if not, use hash table join path
     size_t ordersMapBytes = (size_t)orders_map_size * sizeof(int);
     printf("Orders map: %u entries (%.1f MB)\n", orders_map_size, ordersMapBytes / (1024.0*1024.0));
     if (ordersMapBytes > maxMem * 0.3) {
-        std::cerr << "Q3 SF100: Orders direct map too large (" << ordersMapBytes/(1024*1024) << " MB). Need radix-partitioned join." << std::endl;
-        std::cerr << "  This is expected for SF100. Radix join path coming soon." << std::endl;
+        // ============================================================
+        // HASH TABLE JOIN PATH — compact open-addressing hash table
+        // instead of direct-map array when max_orderkey is too large.
+        // ============================================================
+        printf("Using hash table join (direct map too large: %zu MB, limit: %zu MB)\n",
+               ordersMapBytes/(1024*1024), (size_t)(maxMem * 0.3)/(1024*1024));
+
+        const int cutoff_date = 19950315;
+
+        // Count qualifying orders on CPU to size the hash table
+        uint qualifyingOrders = 0;
+        for (size_t i = 0; i < ordRows; i++) {
+            if (o_orderdate[i] < cutoff_date) qualifyingOrders++;
+        }
+
+        // Hash table capacity: next power of 2 >= qualifying * 1.5 (~67% max load)
+        uint ht_capacity = 1;
+        uint target = (uint)((double)qualifyingOrders * 1.5);
+        if (target < 1024) target = 1024;
+        while (ht_capacity < target) ht_capacity <<= 1;
+        size_t htBytes = (size_t)ht_capacity * 16; // sizeof(Q3OrdersHTEntry) = 16 bytes
+        printf("Orders HT: %u qualifying orders, capacity=%u (%.1f MB, %.1f%% load)\n",
+               qualifyingOrders, ht_capacity, htBytes / (1024.0*1024.0),
+               100.0 * qualifyingOrders / ht_capacity);
+
+        // Create hash-table-specific pipeline states
+        MTL::Function* pBuildHTFn = library->newFunction(NS::String::string("q3_build_orders_ht_kernel", NS::UTF8StringEncoding));
+        MTL::ComputePipelineState* pBuildHTPipe = device->newComputePipelineState(pBuildHTFn, &pError);
+        MTL::Function* pProbeHTFn = library->newFunction(NS::String::string("q3_probe_and_aggregate_ht_kernel", NS::UTF8StringEncoding));
+        MTL::ComputePipelineState* pProbeHTPipe = device->newComputePipelineState(pProbeHTFn, &pError);
+
+        if (!pBuildHTPipe || !pProbeHTPipe) {
+            std::cerr << "Q3 SF100: Failed to create HT pipeline states" << std::endl;
+            pCustBuildFn->release(); pCustBuildPipe->release();
+            pOrdersBuildFn->release(); pOrdersBuildPipe->release();
+            pFusedProbeAggFn->release(); pFusedProbeAggPipe->release();
+            pCompactFn->release(); pCompactPipe->release();
+            pCustKeyBuf->release(); pCustMktBuf->release(); pCustBitmapBuf->release();
+            if (pBuildHTFn) pBuildHTFn->release();
+            if (pProbeHTFn) pProbeHTFn->release();
+            if (pBuildHTPipe) pBuildHTPipe->release();
+            if (pProbeHTPipe) pProbeHTPipe->release();
+            return;
+        }
+
+        // Allocate orders hash table buffer (0xFF fills key=-1 = empty)
+        MTL::Buffer* pHTBuf = device->newBuffer(htBytes, MTL::ResourceStorageModeShared);
+        memset(pHTBuf->contents(), 0xFF, htBytes);
+
+        // Upload orders columns for GPU build
+        MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+        MTL::Buffer* pOrdCustBuf = device->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+        MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+        MTL::Buffer* pOrdPrioBuf = device->newBuffer(o_shippriority.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+
+        // Build phase: customer bitmap + orders hash table
+        double buildGpuMs = 0;
+        {
+            MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+            MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+
+            // Customer bitmap build
+            enc->setComputePipelineState(pCustBuildPipe);
+            enc->setBuffer(pCustKeyBuf, 0, 0); enc->setBuffer(pCustMktBuf, 0, 1);
+            enc->setBuffer(pCustBitmapBuf, 0, 2); enc->setBytes(&customer_size, sizeof(customer_size), 3);
+            enc->dispatchThreadgroups(MTL::Size((customer_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
+
+            // Orders hash table build
+            enc->setComputePipelineState(pBuildHTPipe);
+            enc->setBuffer(pOrdKeyBuf, 0, 0); enc->setBuffer(pOrdCustBuf, 0, 1);
+            enc->setBuffer(pOrdDateBuf, 0, 2); enc->setBuffer(pOrdPrioBuf, 0, 3);
+            enc->setBuffer(pHTBuf, 0, 4);
+            enc->setBytes(&orders_size, sizeof(orders_size), 5);
+            enc->setBytes(&cutoff_date, sizeof(cutoff_date), 6);
+            enc->setBytes(&ht_capacity, sizeof(ht_capacity), 7);
+            enc->dispatchThreadgroups(MTL::Size((orders_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
+
+            enc->endEncoding();
+            cb->commit(); cb->waitUntilCompleted();
+            buildGpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+            printf("Build phase done (GPU: %.2f ms)\n", buildGpuMs);
+        }
+
+        // Release build-side column buffers (data now embedded in HT)
+        pCustKeyBuf->release(); pCustMktBuf->release();
+        pOrdKeyBuf->release(); pOrdCustBuf->release();
+        pOrdDateBuf->release(); pOrdPrioBuf->release();
+
+        // Stream lineitem in chunks: probe HT + aggregate directly into final HT
+        size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 20, liRows);
+        printf("Lineitem chunk size: %zu rows\n", chunkRows);
+
+        struct Q3ChunkSlot {
+            MTL::Buffer* orderkey; MTL::Buffer* shipdate; MTL::Buffer* extprice; MTL::Buffer* discount;
+        };
+        Q3ChunkSlot liSlots[2];
+        for (int s = 0; s < 2; s++) {
+            liSlots[s].orderkey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+            liSlots[s].shipdate = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
+            liSlots[s].extprice = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+            liSlots[s].discount = device->newBuffer(chunkRows * sizeof(float), MTL::ResourceStorageModeShared);
+        }
+
+        // Final hash table for GPU aggregation (persists across chunks)
+        const uint q3_final_ht_size = (uint)std::max((size_t)(ordRows / 64), (size_t)(1 << 20));
+        MTL::Buffer* pFinalHTBuf = device->newBuffer((size_t)q3_final_ht_size * sizeof(Q3Aggregates_CPU), MTL::ResourceStorageModeShared);
+        std::memset(pFinalHTBuf->contents(), 0, (size_t)q3_final_ht_size * sizeof(Q3Aggregates_CPU));
+
+        // Dense output buffer for GPU compaction
+        MTL::Buffer* pDenseBuf = device->newBuffer((size_t)q3_final_ht_size * sizeof(Q3Aggregates_CPU), MTL::ResourceStorageModeShared);
+        MTL::Buffer* pCountBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
+
+        double totalGpuMs = 0.0, totalCpuParseMs = 0.0;
+        size_t offset = 0, chunkNum = 0;
+
+        // Pre-parse first chunk into slot 0
+        size_t rowsThisChunk = std::min(chunkRows, liRows);
+        {
+            Q3ChunkSlot& slot = liSlots[0];
+            auto parseStart = std::chrono::high_resolution_clock::now();
+            parseIntColumnChunk(liFile, liIndex, 0, rowsThisChunk, 0, (int*)slot.orderkey->contents());
+            parseDateColumnChunk(liFile, liIndex, 0, rowsThisChunk, 10, (int*)slot.shipdate->contents());
+            parseFloatColumnChunk(liFile, liIndex, 0, rowsThisChunk, 5, (float*)slot.extprice->contents());
+            parseFloatColumnChunk(liFile, liIndex, 0, rowsThisChunk, 6, (float*)slot.discount->contents());
+            auto parseEnd = std::chrono::high_resolution_clock::now();
+            totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+        }
+
+        while (offset < liRows) {
+            rowsThisChunk = std::min(chunkRows, liRows - offset);
+            Q3ChunkSlot& slot = liSlots[chunkNum % 2];
+
+            // Dispatch fused probe+aggregate on current slot (using HT probe kernel)
+            uint lineitem_size = (uint)rowsThisChunk;
+            MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+            MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+
+            enc->setComputePipelineState(pProbeHTPipe);
+            enc->setBuffer(slot.orderkey, 0, 0); enc->setBuffer(slot.shipdate, 0, 1);
+            enc->setBuffer(slot.extprice, 0, 2); enc->setBuffer(slot.discount, 0, 3);
+            enc->setBuffer(pCustBitmapBuf, 0, 4);
+            enc->setBuffer(pHTBuf, 0, 5);
+            enc->setBuffer(pFinalHTBuf, 0, 6);
+            enc->setBytes(&lineitem_size, sizeof(lineitem_size), 7);
+            enc->setBytes(&cutoff_date, sizeof(cutoff_date), 8);
+            enc->setBytes(&ht_capacity, sizeof(ht_capacity), 9);
+            enc->setBytes(&q3_final_ht_size, sizeof(q3_final_ht_size), 10);
+            enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+            cb->commit();
+
+            // Double-buffer: parse NEXT chunk into alternate slot while GPU runs
+            size_t nextOffset = offset + rowsThisChunk;
+            if (nextOffset < liRows) {
+                size_t nextRows = std::min(chunkRows, liRows - nextOffset);
+                Q3ChunkSlot& nextSlot = liSlots[(chunkNum + 1) % 2];
+                auto parseStart = std::chrono::high_resolution_clock::now();
+                parseIntColumnChunk(liFile, liIndex, nextOffset, nextRows, 0, (int*)nextSlot.orderkey->contents());
+                parseDateColumnChunk(liFile, liIndex, nextOffset, nextRows, 10, (int*)nextSlot.shipdate->contents());
+                parseFloatColumnChunk(liFile, liIndex, nextOffset, nextRows, 5, (float*)nextSlot.extprice->contents());
+                parseFloatColumnChunk(liFile, liIndex, nextOffset, nextRows, 6, (float*)nextSlot.discount->contents());
+                auto parseEnd = std::chrono::high_resolution_clock::now();
+                totalCpuParseMs += std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+            }
+
+            // Wait for GPU to finish this chunk
+            cb->waitUntilCompleted();
+            double gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+            totalGpuMs += gpuMs;
+
+            chunkNum++;
+            offset += rowsThisChunk;
+        }
+
+        // GPU compaction: extract non-empty HT entries into dense buffer
+        *(uint*)pCountBuf->contents() = 0;
+        {
+            MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+            MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+            enc->setComputePipelineState(pCompactPipe);
+            enc->setBuffer(pFinalHTBuf, 0, 0);
+            enc->setBuffer(pDenseBuf, 0, 1);
+            enc->setBuffer(pCountBuf, 0, 2);
+            enc->setBytes(&q3_final_ht_size, sizeof(q3_final_ht_size), 3);
+            enc->dispatchThreadgroups(MTL::Size((q3_final_ht_size + 255) / 256, 1, 1), MTL::Size(256, 1, 1));
+            enc->endEncoding();
+            cb->commit();
+            cb->waitUntilCompleted();
+            totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        }
+
+        uint resultCount = *(uint*)pCountBuf->contents();
+        Q3Aggregates_CPU* dense = (Q3Aggregates_CPU*)pDenseBuf->contents();
+
+        // CPU: partial_sort for top 10 only
+        auto sortStart = std::chrono::high_resolution_clock::now();
+        size_t topK = std::min((size_t)10, (size_t)resultCount);
+        std::partial_sort(dense, dense + topK, dense + resultCount,
+            [](const Q3Aggregates_CPU& a, const Q3Aggregates_CPU& b) {
+                if (a.revenue != b.revenue) return a.revenue > b.revenue;
+                return a.orderdate < b.orderdate;
+            });
+        auto sortEnd = std::chrono::high_resolution_clock::now();
+        double sortMs = std::chrono::duration<double, std::milli>(sortEnd - sortStart).count();
+
+        printf("\nTPC-H Q3 Results (Top 10):\n");
+        printf("+----------+------------+------------+--------------+\n");
+        printf("| orderkey |   revenue  | orderdate  | shippriority |\n");
+        printf("+----------+------------+------------+--------------+\n");
+        for (size_t i = 0; i < topK; i++) {
+            printf("| %8d | $%10.2f | %10u | %12u |\n",
+                   dense[i].key, dense[i].revenue, dense[i].orderdate, dense[i].shippriority);
+        }
+        printf("+----------+------------+------------+--------------+\n");
+
+        double totalCpuPostAllMs = sortMs;
+        double allGpuMs = totalGpuMs + buildGpuMs;
+        double allCpuParseMs = indexBuildMs + buildParseCpuMs + totalCpuParseMs;
+        double totalExecMs = totalCpuPostAllMs + allGpuMs;
+
+        printf("\nSF100 Q3 (HT Join) | %zu chunks | %zu rows\n", chunkNum, liRows);
+        printf("  CPU Parsing (.tbl): %10.2f ms\n", allCpuParseMs);
+        printf("  GPU Execution:      %10.2f ms\n", allGpuMs);
+        printf("  CPU Post Process:   %10.2f ms\n", totalCpuPostAllMs);
+        printf("  Total Execution:    %10.2f ms  (GPU + CPU post)\n", totalExecMs);
+
+        // Cleanup
+        pBuildHTFn->release(); pBuildHTPipe->release();
+        pProbeHTFn->release(); pProbeHTPipe->release();
         pCustBuildFn->release(); pCustBuildPipe->release();
         pOrdersBuildFn->release(); pOrdersBuildPipe->release();
         pFusedProbeAggFn->release(); pFusedProbeAggPipe->release();
-        pCustKeyBuf->release(); pCustMktBuf->release(); pCustBitmapBuf->release();
+        pCompactFn->release(); pCompactPipe->release();
+        pCustBitmapBuf->release();
+        pHTBuf->release();
+        for (int s = 0; s < 2; s++) {
+            liSlots[s].orderkey->release(); liSlots[s].shipdate->release();
+            liSlots[s].extprice->release(); liSlots[s].discount->release();
+        }
+        pFinalHTBuf->release();
+        pDenseBuf->release();
+        pCountBuf->release();
         return;
     }
 

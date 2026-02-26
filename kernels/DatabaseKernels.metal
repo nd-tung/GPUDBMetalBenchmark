@@ -824,6 +824,15 @@ struct Q3Aggregates {
     atomic_uint shippriority;
 };
 
+// Packed hash table entry for orders join (used when direct map too large).
+// key == -1 indicates an empty slot.
+struct Q3OrdersHTEntry {
+    int key;          // orderkey, -1 = empty
+    int custkey;
+    uint orderdate;
+    uint shippriority;
+};
+
 
 // KERNEL 1: Build a BITMAP on the CUSTOMER table.
 // Replaces hash table with a simple bitmap for 'BUILDING' segment.
@@ -861,6 +870,40 @@ kernel void q3_build_orders_map_kernel(
         int key = o_orderkey[index];
         // Direct map: index by orderkey
         orders_map[key] = (int)index;
+    }
+}
+
+// KERNEL 2b: Build a HASH TABLE on the ORDERS table.
+// Used when direct-map array is too large (e.g. SF100 where max_orderkey ~600M).
+// Open-addressing with linear probing. Power-of-2 capacity.
+kernel void q3_build_orders_ht_kernel(
+    const device int* o_orderkey       [[buffer(0)]],
+    const device int* o_custkey        [[buffer(1)]],
+    const device int* o_orderdate      [[buffer(2)]],
+    const device int* o_shippriority   [[buffer(3)]],
+    device Q3OrdersHTEntry* ht         [[buffer(4)]],
+    constant uint& orders_size         [[buffer(5)]],
+    constant int& cutoff_date          [[buffer(6)]],
+    constant uint& ht_capacity         [[buffer(7)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= orders_size) return;
+    if (o_orderdate[index] >= cutoff_date) return;
+
+    int key = o_orderkey[index];
+    uint h = sf100_hash_key(key);
+
+    for (uint i = 0; i < ht_capacity; i++) {
+        uint slot = (h + i) & (ht_capacity - 1);
+        int expected = -1;
+        if (atomic_compare_exchange_weak_explicit(
+                (device atomic_int*)&ht[slot].key, &expected, key,
+                memory_order_relaxed, memory_order_relaxed)) {
+            ht[slot].custkey = o_custkey[index];
+            ht[slot].orderdate = (uint)o_orderdate[index];
+            ht[slot].shippriority = (uint)o_shippriority[index];
+            return;
+        }
     }
 }
 
@@ -1432,6 +1475,123 @@ kernel void q3_probe_and_aggregate_direct_kernel(
                                              (uint)o_orderdate[orders_idx[k]], memory_order_relaxed);
                         atomic_store_explicit(&final_ht[probe_idx].shippriority,
                                              (uint)o_shippriority[orders_idx[k]], memory_order_relaxed);
+                    }
+                    int current_key = atomic_load_explicit(&final_ht[probe_idx].key, memory_order_relaxed);
+                    if (current_key == key) {
+                        atomic_fetch_add_explicit(&final_ht[probe_idx].revenue, revenue, memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================
+// Fused probe + aggregate kernel using HASH TABLE for orders lookup.
+// Used when direct-map array is too large. Same batched aggregation
+// logic as q3_probe_and_aggregate_direct_kernel but probes a compact
+// open-addressing hash table instead of dense orders_map[].
+// =============================================================
+kernel void q3_probe_and_aggregate_ht_kernel(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device int* l_shipdate        [[buffer(1)]],
+    const device float* l_extendedprice [[buffer(2)]],
+    const device float* l_discount      [[buffer(3)]],
+    const device uint* customer_bitmap  [[buffer(4)]],
+    const device Q3OrdersHTEntry* orders_ht [[buffer(5)]],
+    device Q3Aggregates* final_ht       [[buffer(6)]],
+    constant uint& lineitem_size        [[buffer(7)]],
+    constant int& cutoff_date           [[buffer(8)]],
+    constant uint& ht_capacity          [[buffer(9)]],
+    constant uint& final_ht_size        [[buffer(10)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    const int BATCH_SIZE = 4;
+
+    for (uint i = global_id; i < lineitem_size; i += grid_size * BATCH_SIZE) {
+        uint idx[BATCH_SIZE];
+        bool active[BATCH_SIZE];
+
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            idx[k] = i + k * grid_size;
+            active[k] = (idx[k] < lineitem_size);
+        }
+
+        int l_shipdate_val[BATCH_SIZE];
+        int l_orderkey_val[BATCH_SIZE];
+
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            if (active[k]) {
+                l_shipdate_val[k] = l_shipdate[idx[k]];
+                l_orderkey_val[k] = l_orderkey[idx[k]];
+            }
+        }
+
+        // Filter 1: l_shipdate > cutoff_date
+        bool pass_date[BATCH_SIZE];
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            pass_date[k] = active[k] && (l_shipdate_val[k] > cutoff_date);
+        }
+
+        // Probe Orders Hash Table
+        int custkey[BATCH_SIZE];
+        uint orderdate_val[BATCH_SIZE];
+        uint shippriority_val[BATCH_SIZE];
+        bool pass_order[BATCH_SIZE];
+
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            pass_order[k] = false;
+            if (pass_date[k]) {
+                uint h = sf100_hash_key(l_orderkey_val[k]);
+                for (uint j = 0; j < ht_capacity; j++) {
+                    uint slot = (h + j) & (ht_capacity - 1);
+                    int sk = orders_ht[slot].key;
+                    if (sk == -1) break;
+                    if (sk == l_orderkey_val[k]) {
+                        custkey[k] = orders_ht[slot].custkey;
+                        orderdate_val[k] = orders_ht[slot].orderdate;
+                        shippriority_val[k] = orders_ht[slot].shippriority;
+                        pass_order[k] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Probe Customer Bitmap
+        bool pass_customer[BATCH_SIZE];
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            if (pass_order[k]) {
+                uint word_idx = custkey[k] / 32;
+                uint bit_idx = custkey[k] % 32;
+                pass_customer[k] = (customer_bitmap[word_idx] & (1u << bit_idx)) != 0;
+            } else {
+                pass_customer[k] = false;
+            }
+        }
+
+        // Direct aggregation into final hash table
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            if (pass_customer[k]) {
+                float revenue = l_extendedprice[idx[k]] * (1.0f - l_discount[idx[k]]);
+                int key = l_orderkey_val[k];
+                uint hash = (uint)key % final_ht_size;
+
+                for (uint p = 0; p < final_ht_size; p++) {
+                    uint probe_idx = (hash + p) % final_ht_size;
+                    int expected = 0;
+                    if (atomic_compare_exchange_weak_explicit(
+                            &final_ht[probe_idx].key, &expected, key,
+                            memory_order_relaxed, memory_order_relaxed)) {
+                        atomic_store_explicit(&final_ht[probe_idx].orderdate,
+                                             orderdate_val[k], memory_order_relaxed);
+                        atomic_store_explicit(&final_ht[probe_idx].shippriority,
+                                             shippriority_val[k], memory_order_relaxed);
                     }
                     int current_key = atomic_load_explicit(&final_ht[probe_idx].key, memory_order_relaxed);
                     if (current_key == key) {
