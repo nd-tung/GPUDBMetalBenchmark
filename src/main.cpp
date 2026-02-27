@@ -25,7 +25,6 @@
 
 // Global dataset configuration
 std::string g_dataset_path = "data/SF-1/"; // Default to SF-1
-int g_scale_factor = 1; // 1, 10, or 100
 bool g_sf100_mode = false; // true when running SF100 chunked execution
 
 // ===================================================================
@@ -1383,13 +1382,16 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
             enc->dispatchThreadgroups(threadgroups, threadgroupSize);
         }
 
-        // Orders HT build (Direct Map)
+        // Orders HT build (Direct Map) — filtered by customer bitmap
+        enc->memoryBarrier(MTL::BarrierScopeBuffers); // ensure customer bitmap writes are visible
         enc->setComputePipelineState(pOrdersBuildPipe);
         enc->setBuffer(pOrdKeyBuffer, 0, 0);
         enc->setBuffer(pOrdDateBuffer, 0, 1);
         enc->setBuffer(pOrdersMapBuffer, 0, 2);
         enc->setBytes(&orders_size, sizeof(orders_size), 3);
         enc->setBytes(&cutoff_date, sizeof(cutoff_date), 4);
+        enc->setBuffer(pOrdCustKeyBuffer, 0, 5);
+        enc->setBuffer(pCustomerBitmapBuffer, 0, 6);
         {
             NS::UInteger threadGroupSize = pOrdersBuildPipe->maxTotalThreadsPerThreadgroup();
             if (threadGroupSize > 256) threadGroupSize = 256;
@@ -1404,15 +1406,14 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         enc->setBuffer(pLineShipDateBuffer, 0, 1);
         enc->setBuffer(pLinePriceBuffer, 0, 2);
         enc->setBuffer(pLineDiscBuffer, 0, 3);
-        enc->setBuffer(pCustomerBitmapBuffer, 0, 4);
-        enc->setBuffer(pOrdersMapBuffer, 0, 5);
-        enc->setBuffer(pOrdCustKeyBuffer, 0, 6);
-        enc->setBuffer(pOrdDateBuffer, 0, 7);
-        enc->setBuffer(pOrdPrioBuffer, 0, 8);
-        enc->setBuffer(pFinalHTBuffer, 0, 9);
-        enc->setBytes(&lineitem_size, sizeof(lineitem_size), 10);
-        enc->setBytes(&cutoff_date, sizeof(cutoff_date), 11);
-        enc->setBytes(&final_ht_size, sizeof(final_ht_size), 12);
+        enc->setBuffer(pOrdersMapBuffer, 0, 4);
+        enc->setBuffer(pOrdCustKeyBuffer, 0, 5);
+        enc->setBuffer(pOrdDateBuffer, 0, 6);
+        enc->setBuffer(pOrdPrioBuffer, 0, 7);
+        enc->setBuffer(pFinalHTBuffer, 0, 8);
+        enc->setBytes(&lineitem_size, sizeof(lineitem_size), 9);
+        enc->setBytes(&cutoff_date, sizeof(cutoff_date), 10);
+        enc->setBytes(&final_ht_size, sizeof(final_ht_size), 11);
         enc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
         enc->endEncoding();
         
@@ -1833,7 +1834,6 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         pBuildEnc->setComputePipelineState(pPartBuildPipe);
         pBuildEnc->setBuffer(pPartKeyBuffer, 0, 0); pBuildEnc->setBuffer(pPartNameBuffer, 0, 1);
         pBuildEnc->setBuffer(pPartBitmapBuffer, 0, 2); pBuildEnc->setBytes(&part_size, sizeof(part_size), 3);
-        pBuildEnc->setBytes(&part_ht_size, sizeof(part_ht_size), 4);
         {
             NS::UInteger threadGroupSize = pPartBuildPipe->maxTotalThreadsPerThreadgroup();
             if (threadGroupSize > 256) threadGroupSize = 256;
@@ -1846,7 +1846,6 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         pBuildEnc->setComputePipelineState(pSuppBuildPipe);
         pBuildEnc->setBuffer(pSuppKeyBuffer, 0, 0); pBuildEnc->setBuffer(pSuppNationKeyBuffer, 0, 1);
         pBuildEnc->setBuffer(pSuppMapBuffer, 0, 2); pBuildEnc->setBytes(&supplier_size, sizeof(supplier_size), 3);
-        pBuildEnc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 4);
         {
             NS::UInteger threadGroupSize = pSuppBuildPipe->maxTotalThreadsPerThreadgroup();
             if (threadGroupSize > 256) threadGroupSize = 256;
@@ -1860,6 +1859,9 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         pBuildEnc->setBuffer(pPsPartKeyBuffer, 0, 0); pBuildEnc->setBuffer(pPsSuppKeyBuffer, 0, 1);
         pBuildEnc->setBuffer(pPartSuppHTBuffer, 0, 2); pBuildEnc->setBytes(&partsupp_size, sizeof(partsupp_size), 3);
         pBuildEnc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 4);
+        pBuildEnc->setBuffer(pPartBitmapBuffer, 0, 5); // bitmap pre-filter for green parts
+        // Barrier: ensure part bitmap writes from Stage 1 are visible
+        pBuildEnc->memoryBarrier(MTL::BarrierScopeBuffers);
         {
             NS::UInteger threadGroupSize = pPartSuppBuildPipe->maxTotalThreadsPerThreadgroup();
             if (threadGroupSize > 256) threadGroupSize = 256;
@@ -2301,7 +2303,8 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             enc->setBuffer(pCustBitmapBuf, 0, 2); enc->setBytes(&customer_size, sizeof(customer_size), 3);
             enc->dispatchThreadgroups(MTL::Size((customer_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
 
-            // Orders hash table build
+            // Orders hash table build — filtered by customer bitmap
+            enc->memoryBarrier(MTL::BarrierScopeBuffers); // ensure customer bitmap writes are visible
             enc->setComputePipelineState(pBuildHTPipe);
             enc->setBuffer(pOrdKeyBuf, 0, 0); enc->setBuffer(pOrdCustBuf, 0, 1);
             enc->setBuffer(pOrdDateBuf, 0, 2); enc->setBuffer(pOrdPrioBuf, 0, 3);
@@ -2309,6 +2312,7 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             enc->setBytes(&orders_size, sizeof(orders_size), 5);
             enc->setBytes(&cutoff_date, sizeof(cutoff_date), 6);
             enc->setBytes(&ht_capacity, sizeof(ht_capacity), 7);
+            enc->setBuffer(pCustBitmapBuf, 0, 8);
             enc->dispatchThreadgroups(MTL::Size((orders_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
 
             enc->endEncoding();
@@ -2374,13 +2378,12 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             enc->setComputePipelineState(pProbeHTPipe);
             enc->setBuffer(slot.orderkey, 0, 0); enc->setBuffer(slot.shipdate, 0, 1);
             enc->setBuffer(slot.extprice, 0, 2); enc->setBuffer(slot.discount, 0, 3);
-            enc->setBuffer(pCustBitmapBuf, 0, 4);
-            enc->setBuffer(pHTBuf, 0, 5);
-            enc->setBuffer(pFinalHTBuf, 0, 6);
-            enc->setBytes(&lineitem_size, sizeof(lineitem_size), 7);
-            enc->setBytes(&cutoff_date, sizeof(cutoff_date), 8);
-            enc->setBytes(&ht_capacity, sizeof(ht_capacity), 9);
-            enc->setBytes(&q3_final_ht_size, sizeof(q3_final_ht_size), 10);
+            enc->setBuffer(pHTBuf, 0, 4);
+            enc->setBuffer(pFinalHTBuf, 0, 5);
+            enc->setBytes(&lineitem_size, sizeof(lineitem_size), 6);
+            enc->setBytes(&cutoff_date, sizeof(cutoff_date), 7);
+            enc->setBytes(&ht_capacity, sizeof(ht_capacity), 8);
+            enc->setBytes(&q3_final_ht_size, sizeof(q3_final_ht_size), 9);
             enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
             enc->endEncoding();
             cb->commit();
@@ -2454,7 +2457,7 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         double allCpuParseMs = indexBuildMs + buildParseCpuMs + totalCpuParseMs;
         double totalExecMs = totalCpuPostAllMs + allGpuMs;
 
-        printf("\nSF100 Q3 (HT Join) | %zu chunks | %zu rows\n", chunkNum, liRows);
+        printf("\nSF100 Q3 | %zu chunks | %zu rows | HT Join\n", chunkNum, liRows);
         printf("  CPU Parsing (.tbl): %10.2f ms\n", allCpuParseMs);
         printf("  GPU Execution:      %10.2f ms\n", allGpuMs);
         printf("  CPU Post Process:   %10.2f ms\n", totalCpuPostAllMs);
@@ -2500,10 +2503,12 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->setBuffer(pCustBitmapBuf, 0, 2); enc->setBytes(&customer_size, sizeof(customer_size), 3);
         enc->dispatchThreadgroups(MTL::Size((customer_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
 
+        enc->memoryBarrier(MTL::BarrierScopeBuffers); // ensure customer bitmap writes are visible
         enc->setComputePipelineState(pOrdersBuildPipe);
         enc->setBuffer(pOrdKeyBuf, 0, 0); enc->setBuffer(pOrdDateBuf, 0, 1);
         enc->setBuffer(pOrdersMapBuf, 0, 2); enc->setBytes(&orders_size, sizeof(orders_size), 3);
         enc->setBytes(&cutoff_date, sizeof(cutoff_date), 4);
+        enc->setBuffer(pOrdCustBuf, 0, 5); enc->setBuffer(pCustBitmapBuf, 0, 6);
         enc->dispatchThreadgroups(MTL::Size((orders_size + 255)/256, 1, 1), MTL::Size(256, 1, 1));
 
         enc->endEncoding();
@@ -2566,13 +2571,13 @@ void runQ3BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->setComputePipelineState(pFusedProbeAggPipe);
         enc->setBuffer(slot.orderkey, 0, 0); enc->setBuffer(slot.shipdate, 0, 1);
         enc->setBuffer(slot.extprice, 0, 2); enc->setBuffer(slot.discount, 0, 3);
-        enc->setBuffer(pCustBitmapBuf, 0, 4); enc->setBuffer(pOrdersMapBuf, 0, 5);
-        enc->setBuffer(pOrdCustBuf, 0, 6); enc->setBuffer(pOrdDateBuf, 0, 7);
-        enc->setBuffer(pOrdPrioBuf, 0, 8);
-        enc->setBuffer(pFinalHTBuf, 0, 9);
-        enc->setBytes(&lineitem_size, sizeof(lineitem_size), 10);
-        enc->setBytes(&cutoff_date, sizeof(cutoff_date), 11);
-        enc->setBytes(&q3_final_ht_size, sizeof(q3_final_ht_size), 12);
+        enc->setBuffer(pOrdersMapBuf, 0, 4);
+        enc->setBuffer(pOrdCustBuf, 0, 5); enc->setBuffer(pOrdDateBuf, 0, 6);
+        enc->setBuffer(pOrdPrioBuf, 0, 7);
+        enc->setBuffer(pFinalHTBuf, 0, 8);
+        enc->setBytes(&lineitem_size, sizeof(lineitem_size), 9);
+        enc->setBytes(&cutoff_date, sizeof(cutoff_date), 10);
+        enc->setBytes(&q3_final_ht_size, sizeof(q3_final_ht_size), 11);
         enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
         enc->endEncoding();
         cb->commit();
@@ -2702,7 +2707,7 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
            partRows, suppRows, psRows, ordRows, liRows, indexBuildMs);
 
     // ── Load nation data (tiny — always fits) ──
-    std::vector<int> n_nationkey(natIdx.size()), n_name_raw(natIdx.size());
+    std::vector<int> n_nationkey(natIdx.size());
     parseIntColumnChunk(natFile, natIdx, 0, natIdx.size(), 0, n_nationkey.data());
     // Load nation names as char column for mapping later
     std::vector<char> n_name_chars(natIdx.size() * 25, ' ');
@@ -2772,7 +2777,6 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->setBuffer(pPartNameBuf, 0, 1);
         enc->setBuffer(pPartBitmapBuf, 0, 2);
         enc->setBytes(&ps, sizeof(ps), 3);
-        enc->setBytes(&part_ht_size, sizeof(part_ht_size), 4);
         NS::UInteger tgs = std::min((NS::UInteger)256, pPartBuildPipe->maxTotalThreadsPerThreadgroup());
         enc->dispatchThreadgroups(MTL::Size((partRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
         enc->endEncoding();
@@ -2811,7 +2815,6 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->setBuffer(pSuppNatBuf, 0, 1);
         enc->setBuffer(pSuppMapBuf, 0, 2);
         enc->setBytes(&ss, sizeof(ss), 3);
-        enc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 4);
         NS::UInteger tgs = std::min((NS::UInteger)256, pSuppBuildPipe->maxTotalThreadsPerThreadgroup());
         enc->dispatchThreadgroups(MTL::Size((suppRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
         enc->endEncoding();
@@ -2883,6 +2886,7 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->setBuffer(pPartSuppHTBuf, 0, 2);
         enc->setBytes(&pss, sizeof(pss), 3);
         enc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 4);
+        enc->setBuffer(pPartBitmapBuf, 0, 5); // bitmap pre-filter for green parts
         NS::UInteger tgs = std::min((NS::UInteger)256, pPartSuppBuildPipe->maxTotalThreadsPerThreadgroup());
         enc->dispatchThreadgroups(MTL::Size((psRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
         enc->endEncoding();
@@ -3305,19 +3309,16 @@ int main(int argc, const char * argv[]) {
         }
         if (arg == "sf1") {
             g_dataset_path = "data/SF-1/";
-            g_scale_factor = 1;
             g_sf100_mode = false;
             continue;
         }
         if (arg == "sf10") {
             g_dataset_path = "data/SF-10/";
-            g_scale_factor = 10;
             g_sf100_mode = false;
             continue;
         }
         if (arg == "sf100") {
             g_dataset_path = "data/SF-100/";
-            g_scale_factor = 100;
             g_sf100_mode = true;
             continue;
         }

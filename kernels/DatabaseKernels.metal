@@ -438,7 +438,6 @@ kernel void sum_kernel_stage1(const device float* inData,
 {
     // 1. Each thread computes a local sum
     float local_sum = 0.0f;
-    // uint grid_size = threads_per_group * 2048; // Total threads in the grid
     for (uint index = (group_id * threads_per_group) + thread_id_in_group;
               index < dataSize;
               index += grid_size) {
@@ -862,15 +861,19 @@ kernel void q3_build_orders_map_kernel(
     device int* orders_map,
     constant uint& orders_size,
     constant int& cutoff_date, // 19950315
+    const device int* o_custkey [[buffer(5)]],
+    const device uint* customer_bitmap [[buffer(6)]],
     uint index [[thread_position_in_grid]])
 {
     if (index >= orders_size) return;
+    if (o_orderdate[index] >= cutoff_date) return;
 
-    if (o_orderdate[index] < cutoff_date) {
-        int key = o_orderkey[index];
-        // Direct map: index by orderkey
-        orders_map[key] = (int)index;
-    }
+    // Bitmap pre-filter: only insert orders whose customer is in 'BUILDING' segment
+    int ck = o_custkey[index];
+    if (!((customer_bitmap[ck / 32] >> (ck % 32)) & 1u)) return;
+
+    int key = o_orderkey[index];
+    orders_map[key] = (int)index;
 }
 
 // KERNEL 2b: Build a HASH TABLE on the ORDERS table.
@@ -885,10 +888,15 @@ kernel void q3_build_orders_ht_kernel(
     constant uint& orders_size         [[buffer(5)]],
     constant int& cutoff_date          [[buffer(6)]],
     constant uint& ht_capacity         [[buffer(7)]],
+    const device uint* customer_bitmap [[buffer(8)]],
     uint index [[thread_position_in_grid]])
 {
     if (index >= orders_size) return;
     if (o_orderdate[index] >= cutoff_date) return;
+
+    // Bitmap pre-filter: skip orders whose customer is not in 'BUILDING' segment
+    int ck = o_custkey[index];
+    if (!((customer_bitmap[ck / 32] >> (ck % 32)) & 1u)) return;
 
     int key = o_orderkey[index];
     uint h = sf100_hash_key(key);
@@ -945,31 +953,51 @@ struct Q9Aggregates_Local {
 };
 
 // KERNEL 1: Build Bitmap on PART, filtering for p_name LIKE '%green%'
+// Uses SWAR to scan 4 bytes at a time for the discriminant byte 'g', then
+// verifies the remaining "reen" at candidate positions.
 kernel void q9_build_part_ht_kernel(
     const device int* p_partkey [[buffer(0)]],
-    const device char* p_name [[buffer(1)]], // Assuming p_name is a fixed-size char array
-    device atomic_uint* part_bitmap [[buffer(2)]], // Bitmap: 1 bit per partkey
+    const device char* p_name [[buffer(1)]],
+    device atomic_uint* part_bitmap [[buffer(2)]],
     constant uint& part_size [[buffer(3)]],
-    constant uint& part_ht_size [[buffer(4)]], // Unused, kept for signature compatibility if needed, or remove
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]])
 {
     uint index = group_id * threads_per_group + thread_id_in_group;
     if (index >= part_size) return;
+
+    const device uchar* name = (const device uchar*)(p_name + index * 55);
     bool match = false;
-    for(int i = 0; i < 50; ++i) { // Simplified string search
-        if (p_name[index * 55 + i] == 'g' && p_name[index * 55 + i + 1] == 'r' &&
-            p_name[index * 55 + i + 2] == 'e' && p_name[index * 55 + i + 3] == 'e' &&
-            p_name[index * 55 + i + 4] == 'n') {
-            match = true;
-            break;
+    const uint g_spread = 0x67676767u; // 'g' = 0x67 broadcast to all 4 bytes
+
+    // SWAR: process 13 words covering bytes 0-51 (positions up to 50 can start "green")
+    for (int w = 0; w < 13 && !match; ++w) {
+        // Build a uint from 4 consecutive bytes (unaligned-safe on Metal device memory)
+        uint word = (uint)name[w * 4]
+                  | ((uint)name[w * 4 + 1] << 8)
+                  | ((uint)name[w * 4 + 2] << 16)
+                  | ((uint)name[w * 4 + 3] << 24);
+        // SWAR zero-byte detection: any byte == 'g' ?
+        uint xor_val = word ^ g_spread;
+        if (((xor_val - 0x01010101u) & ~xor_val & 0x80808080u) == 0) continue;
+
+        // At least one byte matches 'g'; verify each position
+        int base = w * 4;
+        for (int b = 0; b < 4 && base + b <= 50; ++b) {
+            if (name[base + b] == 'g' &&
+                name[base + b + 1] == 'r' &&
+                name[base + b + 2] == 'e' &&
+                name[base + b + 3] == 'e' &&
+                name[base + b + 4] == 'n') {
+                match = true;
+                break;
+            }
         }
     }
-    
+
     if (match) {
         int key = p_partkey[index];
-        // Set bit in bitmap
         atomic_fetch_or_explicit(&part_bitmap[key / 32], (1u << (key % 32)), memory_order_relaxed);
     }
 }
@@ -980,7 +1008,6 @@ kernel void q9_build_supplier_ht_kernel(
     const device int* s_nationkey [[buffer(1)]],
     device int* supplier_nation_map [[buffer(2)]], // Direct map: index is suppkey
     constant uint& supplier_size [[buffer(3)]],
-    constant uint& supplier_ht_size [[buffer(4)]], // Unused
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]])
@@ -994,6 +1021,8 @@ kernel void q9_build_supplier_ht_kernel(
 }
 
 // KERNEL 3: Build HT on PARTSUPP, storing supplycost index as value
+// Uses part_bitmap as a Bloom-style pre-filter: only inserts entries whose
+// partkey passed the '%green%' filter, making the HT ~25x smaller.
 struct PartSuppEntry {
     atomic_int partkey;
     atomic_int suppkey;
@@ -1007,6 +1036,7 @@ kernel void q9_build_partsupp_ht_kernel(
     device PartSuppEntry* partsupp_ht [[buffer(2)]],
     constant uint& partsupp_size [[buffer(3)]],
     constant uint& partsupp_ht_size [[buffer(4)]],
+    const device uint* part_bitmap [[buffer(5)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]])
@@ -1014,6 +1044,10 @@ kernel void q9_build_partsupp_ht_kernel(
     uint index = group_id * threads_per_group + thread_id_in_group;
     if (index >= partsupp_size) return;
     int pk = ps_partkey[index];
+
+    // Bloom / bitmap pre-filter: skip entries whose partkey didn't pass '%green%'
+    if (!((part_bitmap[pk / 32] >> (pk % 32)) & 1u)) return;
+
     int sk = ps_suppkey[index];
     int val = (int)index;
     // Combined hash of (partkey, suppkey) to reduce probe lengths
@@ -1101,7 +1135,6 @@ kernel void q9_probe_and_local_agg_kernel(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // const uint grid_size = threads_per_group * 2048;
     const uint global_tid = (group_id * threads_per_group) + thread_id_in_group;
     const uint BATCH = 4;
     const uint stride = grid_size * BATCH;
@@ -1249,38 +1282,96 @@ ORDER BY
 
 
 
-// --- Q13 substring matching helpers ---
+// --- Q13 substring matching helpers (SWAR — SIMD Within A Register) ---
+// Process 4 bytes per iteration using classic Mycroft null-byte / byte-match
+// detection on packed uint words. Each o_comment record is 100 bytes (25 uints)
+// and starts at a 4-byte aligned offset (100 % 4 == 0).
 
-inline int q13_effective_len_fixed_100(const device uchar* s) {
-    const int max_len = 100;
-    const int min_pattern_len = 15;
-    for (int i = 0; i < max_len; i++) {
-        if (s[i] == 0) {
-            return (i < min_pattern_len) ? -1 : i;
-        }
-    }
-    return max_len;
+// Returns non-zero with the high bit set in each zero byte
+inline uint swar_has_zero(uint v) {
+    return (v - 0x01010101u) & ~v & 0x80808080u;
 }
 
-inline bool q13_has_special_requests(const device uchar* s, int comment_len) {
+// Returns non-zero with the high bit set in each byte equal to c (broadcast)
+inline uint swar_has_byte(uint v, uint c_bcast) {
+    uint x = v ^ c_bcast;
+    return (x - 0x01010101u) & ~x & 0x80808080u;
+}
+
+// SWAR: Find first null byte in 100-byte fixed-width field.
+// Returns effective length, or -1 if too short for pattern matching (< 15).
+// Processes 4 bytes per iteration (25 iterations for 100 bytes vs 100 scalar).
+inline int q13_effective_len_swar(const device uint* words) {
+    const int min_pattern_len = 15;
+    for (int i = 0; i < 25; i++) {  // 25 * 4 = 100 bytes
+        uint z = swar_has_zero(words[i]);
+        if (z) {
+            int pos = i * 4 + (ctz(z) >> 3);
+            return (pos < min_pattern_len) ? -1 : pos;
+        }
+    }
+    return 100;
+}
+
+// SWAR: Search for "%special%requests%" in comment string.
+// Scans for discriminant characters ('c' in "special", 'q' in "requests")
+// 4 bytes at a time, then verifies full pattern only at candidate positions.
+inline bool q13_has_special_requests_swar(const device uchar* s,
+                                          const device uint* words,
+                                          int comment_len) {
     const int last_special = comment_len - 15;
-    
-    for (int i = 0; i <= last_special; i++) {
-        if (s[i+3] == 'c') {
-            if (s[i] == 's' && s[i+1] == 'p' && s[i+2] == 'e' && 
+    if (last_special < 0) return false;
+
+    // SWAR scan for 'c' byte (offset 3 in "special") — 4 positions per iteration
+    const uint c_bcast = 0x63636363u; // 'c' = 0x63
+
+    // Words covering byte positions [0 .. last_special + 3]
+    int scan_words = (last_special + 3) / 4 + 1;
+    if (scan_words > 25) scan_words = 25;
+
+    for (int wi = 0; wi < scan_words; wi++) {
+        uint m = swar_has_byte(words[wi], c_bcast);
+        if (!m) continue;
+
+        // Iterate 'c' candidates in this word (up to 4)
+        while (m) {
+            int c_pos = wi * 4 + (ctz(m) >> 3);
+            m &= m - 1;                     // clear lowest set hit
+            int i = c_pos - 3;              // potential start of "special"
+            if (i < 0 || i > last_special) continue;
+
+            // Verify full "special" at position i
+            if (s[i]   == 's' && s[i+1] == 'p' && s[i+2] == 'e' &&
                 s[i+4] == 'i' && s[i+5] == 'a' && s[i+6] == 'l') {
-                
+
+                // "special" confirmed — SWAR scan for "requests" after it
                 int req_start = i + 7;
                 int req_end = comment_len - 8;
-                for (int j = req_start; j <= req_end; j++) {
-                    if (s[j+2] == 'q') {
-                        if (s[j] == 'r' && s[j+1] == 'e' && s[j+3] == 'u' &&
-                            s[j+4] == 'e' && s[j+5] == 's' && s[j+6] == 't' && s[j+7] == 's') {
+                const uint q_bcast = 0x71717171u; // 'q' = 0x71
+
+                // Words covering byte positions [req_start+2 .. req_end+2]
+                int rw_lo = (req_start + 2) / 4;
+                int rw_hi = (req_end + 2) / 4;
+                if (rw_hi >= 25) rw_hi = 24;
+
+                for (int rw = rw_lo; rw <= rw_hi; rw++) {
+                    uint rm = swar_has_byte(words[rw], q_bcast);
+                    if (!rm) continue;
+
+                    while (rm) {
+                        int q_pos = rw * 4 + (ctz(rm) >> 3);
+                        rm &= rm - 1;
+                        int j = q_pos - 2;  // potential start of "requests"
+                        if (j < req_start || j > req_end) continue;
+
+                        if (s[j]   == 'r' && s[j+1] == 'e' &&
+                            s[j+3] == 'u' && s[j+4] == 'e' &&
+                            s[j+5] == 's' && s[j+6] == 't' && s[j+7] == 's') {
                             return true;
                         }
                     }
                 }
-                return false;
+                return false; // "special" found but no "requests" after it
             }
         }
     }
@@ -1311,9 +1402,10 @@ kernel void q13_fused_direct_count_kernel(
             const uint ck = (uint)o_custkey[i];
             if (ck >= 1u && ck <= customer_size) {
                 const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_fixed_100(row);
+                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
+                int effective_len = q13_effective_len_swar(words);
                 if (effective_len > 0) {
-                    bool skip = q13_has_special_requests(row, effective_len);
+                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
                     if (!skip) {
                         atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
                     }
@@ -1327,9 +1419,10 @@ kernel void q13_fused_direct_count_kernel(
             const uint ck = (uint)o_custkey[i];
             if (ck >= 1u && ck <= customer_size) {
                 const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_fixed_100(row);
+                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
+                int effective_len = q13_effective_len_swar(words);
                 if (effective_len > 0) {
-                    bool skip = q13_has_special_requests(row, effective_len);
+                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
                     if (!skip) {
                         atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
                     }
@@ -1343,9 +1436,10 @@ kernel void q13_fused_direct_count_kernel(
             const uint ck = (uint)o_custkey[i];
             if (ck >= 1u && ck <= customer_size) {
                 const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_fixed_100(row);
+                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
+                int effective_len = q13_effective_len_swar(words);
                 if (effective_len > 0) {
-                    bool skip = q13_has_special_requests(row, effective_len);
+                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
                     if (!skip) {
                         atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
                     }
@@ -1359,9 +1453,10 @@ kernel void q13_fused_direct_count_kernel(
             const uint ck = (uint)o_custkey[i];
             if (ck >= 1u && ck <= customer_size) {
                 const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_fixed_100(row);
+                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
+                int effective_len = q13_effective_len_swar(words);
                 if (effective_len > 0) {
-                    bool skip = q13_has_special_requests(row, effective_len);
+                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
                     if (!skip) {
                         atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
                     }
@@ -1387,15 +1482,14 @@ kernel void q3_probe_and_aggregate_direct_kernel(
     const device int* l_shipdate        [[buffer(1)]],
     const device float* l_extendedprice [[buffer(2)]],
     const device float* l_discount      [[buffer(3)]],
-    const device uint* customer_bitmap  [[buffer(4)]],
-    const device int* orders_map        [[buffer(5)]],
-    const device int* o_custkey         [[buffer(6)]],
-    const device int* o_orderdate       [[buffer(7)]],
-    const device int* o_shippriority    [[buffer(8)]],
-    device Q3Aggregates* final_ht       [[buffer(9)]],
-    constant uint& lineitem_size        [[buffer(10)]],
-    constant int& cutoff_date           [[buffer(11)]],
-    constant uint& final_ht_size        [[buffer(12)]],
+    const device int* orders_map        [[buffer(4)]],
+    const device int* o_custkey         [[buffer(5)]],
+    const device int* o_orderdate       [[buffer(6)]],
+    const device int* o_shippriority    [[buffer(7)]],
+    device Q3Aggregates* final_ht       [[buffer(8)]],
+    constant uint& lineitem_size        [[buffer(9)]],
+    constant int& cutoff_date           [[buffer(10)]],
+    constant uint& final_ht_size        [[buffer(11)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]],
@@ -1440,26 +1534,11 @@ kernel void q3_probe_and_aggregate_direct_kernel(
             pass_order[k] = pass_date[k] && (orders_idx[k] != -1);
         }
 
-        // Probe Customer Bitmap
-        int custkey[BATCH_SIZE];
-        for (int k = 0; k < BATCH_SIZE; k++) {
-            if (pass_order[k]) custkey[k] = o_custkey[orders_idx[k]];
-        }
-
-        bool pass_customer[BATCH_SIZE];
-        for (int k = 0; k < BATCH_SIZE; k++) {
-            if (pass_order[k]) {
-                uint word_idx = custkey[k] / 32;
-                uint bit_idx = custkey[k] % 32;
-                pass_customer[k] = (customer_bitmap[word_idx] & (1u << bit_idx)) != 0;
-            } else {
-                pass_customer[k] = false;
-            }
-        }
+        // Customer bitmap check skipped — orders map already filtered at build time
 
         // Direct aggregation into final hash table
         for (int k = 0; k < BATCH_SIZE; k++) {
-            if (pass_customer[k]) {
+            if (pass_order[k]) {
                 float revenue = l_extendedprice[idx[k]] * (1.0f - l_discount[idx[k]]);
                 int key = l_orderkey_val[k];
                 uint hash = (uint)key % final_ht_size;
@@ -1498,13 +1577,12 @@ kernel void q3_probe_and_aggregate_ht_kernel(
     const device int* l_shipdate        [[buffer(1)]],
     const device float* l_extendedprice [[buffer(2)]],
     const device float* l_discount      [[buffer(3)]],
-    const device uint* customer_bitmap  [[buffer(4)]],
-    const device Q3OrdersHTEntry* orders_ht [[buffer(5)]],
-    device Q3Aggregates* final_ht       [[buffer(6)]],
-    constant uint& lineitem_size        [[buffer(7)]],
-    constant int& cutoff_date           [[buffer(8)]],
-    constant uint& ht_capacity          [[buffer(9)]],
-    constant uint& final_ht_size        [[buffer(10)]],
+    const device Q3OrdersHTEntry* orders_ht [[buffer(4)]],
+    device Q3Aggregates* final_ht       [[buffer(5)]],
+    constant uint& lineitem_size        [[buffer(6)]],
+    constant int& cutoff_date           [[buffer(7)]],
+    constant uint& ht_capacity          [[buffer(8)]],
+    constant uint& final_ht_size        [[buffer(9)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]],
@@ -1539,7 +1617,6 @@ kernel void q3_probe_and_aggregate_ht_kernel(
         }
 
         // Probe Orders Hash Table
-        int custkey[BATCH_SIZE];
         uint orderdate_val[BATCH_SIZE];
         uint shippriority_val[BATCH_SIZE];
         bool pass_order[BATCH_SIZE];
@@ -1553,7 +1630,6 @@ kernel void q3_probe_and_aggregate_ht_kernel(
                     int sk = orders_ht[slot].key;
                     if (sk == -1) break;
                     if (sk == l_orderkey_val[k]) {
-                        custkey[k] = orders_ht[slot].custkey;
                         orderdate_val[k] = orders_ht[slot].orderdate;
                         shippriority_val[k] = orders_ht[slot].shippriority;
                         pass_order[k] = true;
@@ -1563,21 +1639,11 @@ kernel void q3_probe_and_aggregate_ht_kernel(
             }
         }
 
-        // Probe Customer Bitmap
-        bool pass_customer[BATCH_SIZE];
-        for (int k = 0; k < BATCH_SIZE; k++) {
-            if (pass_order[k]) {
-                uint word_idx = custkey[k] / 32;
-                uint bit_idx = custkey[k] % 32;
-                pass_customer[k] = (customer_bitmap[word_idx] & (1u << bit_idx)) != 0;
-            } else {
-                pass_customer[k] = false;
-            }
-        }
+        // Customer bitmap check skipped — orders HT already filtered at build time
 
         // Direct aggregation into final hash table
         for (int k = 0; k < BATCH_SIZE; k++) {
-            if (pass_customer[k]) {
+            if (pass_order[k]) {
                 float revenue = l_extendedprice[idx[k]] * (1.0f - l_discount[idx[k]]);
                 int key = l_orderkey_val[k];
                 uint hash = (uint)key % final_ht_size;
