@@ -10,8 +10,9 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 SCHEMA_LOCAL_PATH="$PROJECT_ROOT/sql/schema.sql"
 SCALE_FACTOR=${1:-SF-1}
 DATA_DIR="$PROJECT_ROOT/data/${SCALE_FACTOR}"
-RESULTS_FILE="$PROJECT_ROOT/results/cedardb_results.csv"
-LOG_DIR="$PROJECT_ROOT/results/cedardb_logs"
+RESULTS_DIR="$PROJECT_ROOT/results"
+RESULTS_FILE="$RESULTS_DIR/cedardb_results.csv"
+LOG_DIR="$RESULTS_DIR/cedardb_logs"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
 # Detect GPU name and system memory
@@ -34,7 +35,7 @@ echo "Timestamp: ${TIMESTAMP}"
 echo ""
 
 # Create results and log directories if they don't exist
-mkdir -p benchmark_results
+mkdir -p "$RESULTS_DIR"
 mkdir -p "${LOG_DIR}/${TIMESTAMP}"
 
 # Initialize CSV file with header if it doesn't exist

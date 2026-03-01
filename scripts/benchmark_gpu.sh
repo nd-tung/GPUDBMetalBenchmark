@@ -21,6 +21,12 @@ MEMORY_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 
 mkdir -p "$RESULTS_DIR" "${LOG_DIR}/${TIMESTAMP}"
 
+if [[ ! -x "$BUILD_BIN" ]]; then
+  echo "Error: GPUDBMetalBenchmark binary not found at $BUILD_BIN" >&2
+  echo "Run 'make build' first."
+  exit 1
+fi
+
 # CSV header
 CSV_HEADER="timestamp,scale_factor,query,gpu_exec_ms,cpu_post_ms,total_exec_ms,gpu_name,memory_gb"
 if [[ ! -f "$GPU_CSV" ]]; then

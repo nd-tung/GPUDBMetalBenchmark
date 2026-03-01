@@ -137,7 +137,7 @@ check_data_files() {
 setup_results() {
     mkdir -p "$RESULTS_DIR"
     if [[ ! -f "$RESULTS_DIR/duckdb_results.csv" ]]; then
-        echo "timestamp,scale_factor,benchmark,exec_ms,gpu_name,memory_gb" > "$RESULTS_DIR/duckdb_results.csv"
+        echo "timestamp,scale_factor,query,execution_time_ms,gpu_name,memory_gb" > "$RESULTS_DIR/duckdb_results.csv"
     fi
 }
 
