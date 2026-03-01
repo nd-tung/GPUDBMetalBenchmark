@@ -83,11 +83,15 @@ PY
     echo "$TIMESTAMP,$scale_factor,$description,$exec_ms,$GPU_NAME,$MEMORY_GB" >> "$RESULTS_DIR/duckdb_results.csv"
 }
 
-# Check if DuckDB is installed
+# Ensure DuckDB is installed (auto-install via brew if missing)
 check_duckdb() {
     if ! command -v duckdb &> /dev/null; then
-        echo -e "${RED}Error: DuckDB is not installed.${NC}"
-        exit 1
+        echo -e "${YELLOW}DuckDB not found. Installing via Homebrew...${NC}"
+        if ! command -v brew &> /dev/null; then
+            echo -e "${RED}Error: Homebrew is not installed. Install from https://brew.sh${NC}"
+            exit 1
+        fi
+        brew install duckdb
     fi
     echo -e "${GREEN}DuckDB found: $(duckdb --version)${NC}"
 }
@@ -101,27 +105,31 @@ check_python() {
     echo -e "${GREEN}Python3 found for timing${NC}"
 }
 
-# Check for jq for JSON parsing (required for DuckDB profiler)
+# Ensure jq is installed (auto-install via brew if missing)
 check_jq() {
     if ! command -v jq &> /dev/null; then
-        echo -e "${RED}Error: 'jq' is required for DuckDB profiling.${NC}"
-        echo -e "${RED}Install with: brew install jq${NC}"
-        exit 1
-    else
-        echo -e "${GREEN}jq found for profiling JSON parsing${NC}"
+        echo -e "${YELLOW}jq not found. Installing via Homebrew...${NC}"
+        if ! command -v brew &> /dev/null; then
+            echo -e "${RED}Error: Homebrew is not installed. Install from https://brew.sh${NC}"
+            exit 1
+        fi
+        brew install jq
     fi
+    echo -e "${GREEN}jq found for profiling JSON parsing${NC}"
 }
 
-# Check if data files exist
+# Check if data files exist, generate if missing
 check_data_files() {
     local scale_factor="$1"
     local data_path="$DATA_DIR/$scale_factor"
-    
-    if [[ ! -d "$data_path" ]]; then
-        echo -e "${RED}Error: Data directory not found: $data_path${NC}"
-        exit 1
+
+    if [[ ! -d "$data_path" ]] || [[ ! -f "$data_path/lineitem.tbl" ]]; then
+        echo -e "${YELLOW}Data not found for $scale_factor. Generating TPC-H data...${NC}"
+        # Extract numeric scale factor (e.g. "SF-10" -> "10", "SF-1" -> "1")
+        local sf_num="${scale_factor#SF-}"
+        bash "$SCRIPT_DIR/create_tpch_data.sh" "$sf_num"
     fi
-    
+
     local required_files=("lineitem.tbl" "orders.tbl" "customer.tbl" "part.tbl" "supplier.tbl" "partsupp.tbl" "nation.tbl" "region.tbl")
     for file in "${required_files[@]}"; do
         if [[ ! -f "$data_path/$file" ]]; then

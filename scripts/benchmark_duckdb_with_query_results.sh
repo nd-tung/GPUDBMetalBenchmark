@@ -37,18 +37,24 @@ if [ ! -f "${RESULTS_FILE}" ]; then
     echo "timestamp,scale_factor,query,execution_time_ms,gpu_name,memory_gb" > "${RESULTS_FILE}"
 fi
 
-# Check if DuckDB is installed
+# Check if DuckDB is installed (auto-install via brew if missing)
 if ! command -v duckdb &> /dev/null; then
-    echo "Error: DuckDB is not installed."
-    echo "Install with: brew install duckdb"
-    exit 1
+    echo "DuckDB not found. Installing via Homebrew..."
+    if ! command -v brew &> /dev/null; then
+        echo "Error: Homebrew is not installed. Install from https://brew.sh"
+        exit 1
+    fi
+    brew install duckdb
 fi
 
-# Check if jq is installed (required for DuckDB profiler)
+# Check if jq is installed (auto-install via brew if missing)
 if ! command -v jq &> /dev/null; then
-    echo "Error: 'jq' is required for DuckDB profiling."
-    echo "Install with: brew install jq"
-    exit 1
+    echo "jq not found. Installing via Homebrew..."
+    if ! command -v brew &> /dev/null; then
+        echo "Error: Homebrew is not installed. Install from https://brew.sh"
+        exit 1
+    fi
+    brew install jq
 fi
 
 echo "DuckDB found: $(duckdb --version)"
@@ -106,6 +112,23 @@ EOF
     # Append timing to CSV
     echo "${TIMESTAMP},${SCALE_FACTOR},${query_name},${exec_time},${GPU_NAME},${MEMORY_GB}" >> "${RESULTS_FILE}"
 }
+
+# Check data files exist, generate if missing
+if [[ ! -d "$DATA_DIR" ]] || [[ ! -f "$DATA_DIR/lineitem.tbl" ]]; then
+    echo "Data not found for ${SCALE_FACTOR}. Generating TPC-H data..."
+    sf_num="${SCALE_FACTOR#SF-}"
+    bash "$SCRIPT_DIR/create_tpch_data.sh" "$sf_num"
+fi
+
+# Verify all required files exist
+for f in lineitem.tbl orders.tbl customer.tbl part.tbl supplier.tbl partsupp.tbl nation.tbl; do
+    if [[ ! -f "$DATA_DIR/$f" ]]; then
+        echo "Error: Required data file not found: $DATA_DIR/$f"
+        exit 1
+    fi
+done
+echo "Data files verified for ${SCALE_FACTOR}"
+echo ""
 
 # Load data into DuckDB
 echo "Loading TPC-H data for ${SCALE_FACTOR}..."
