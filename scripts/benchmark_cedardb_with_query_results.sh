@@ -26,6 +26,76 @@ CEDAR_USER="postgres"
 CEDAR_PASSWORD="cedar"
 CEDAR_DB="tpch"
 
+# Docker container management
+CEDAR_IMAGE="cedardb/cedardb"
+CEDAR_CONTAINER="cedardb"
+
+ensure_cedardb_running() {
+    # Check if container exists
+    local container_status
+    if docker inspect -f '{{.State.Status}}' "${CEDAR_CONTAINER}" &>/dev/null; then
+        container_status=$(docker inspect -f '{{.State.Status}}' "${CEDAR_CONTAINER}" 2>/dev/null)
+    else
+        container_status="not_found"
+    fi
+
+    if [ "$container_status" = "not_found" ]; then
+        echo "CedarDB container not found. Setting up from scratch..."
+        
+        # Pull image if not present
+        if ! docker image inspect "${CEDAR_IMAGE}" &>/dev/null; then
+            echo "  Pulling CedarDB Docker image..."
+            docker pull "${CEDAR_IMAGE}"
+        fi
+        
+        # Create and start container
+        echo "  Creating CedarDB container..."
+        docker run -d \
+            --name "${CEDAR_CONTAINER}" \
+            -p ${CEDAR_PORT}:5432 \
+            -e CEDAR_PASSWORD="${CEDAR_PASSWORD}" \
+            "${CEDAR_IMAGE}"
+        
+        echo "  Waiting for CedarDB to be ready..."
+        local retries=0
+        while ! docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" "${CEDAR_CONTAINER}" \
+            psql -h localhost -p 5432 -U "${CEDAR_USER}" -d postgres -c "SELECT 1" &>/dev/null; do
+            retries=$((retries + 1))
+            if [ $retries -gt 30 ]; then
+                echo "Error: CedarDB failed to start after 30 seconds"
+                docker logs "${CEDAR_CONTAINER}" 2>&1 | tail -20
+                exit 1
+            fi
+            sleep 1
+        done
+        echo "  CedarDB is ready."
+        
+    elif [ "$container_status" = "exited" ] || [ "$container_status" = "created" ]; then
+        echo "Starting existing CedarDB container..."
+        docker start "${CEDAR_CONTAINER}"
+        
+        echo "  Waiting for CedarDB to be ready..."
+        local retries=0
+        while ! docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" "${CEDAR_CONTAINER}" \
+            psql -h localhost -p 5432 -U "${CEDAR_USER}" -d postgres -c "SELECT 1" &>/dev/null; do
+            retries=$((retries + 1))
+            if [ $retries -gt 30 ]; then
+                echo "Error: CedarDB failed to start after 30 seconds"
+                docker logs "${CEDAR_CONTAINER}" 2>&1 | tail -20
+                exit 1
+            fi
+            sleep 1
+        done
+        echo "  CedarDB is ready."
+        
+    elif [ "$container_status" = "running" ]; then
+        echo "CedarDB container is already running."
+    else
+        echo "Error: CedarDB container is in unexpected state: ${container_status}"
+        exit 1
+    fi
+}
+
 echo "=== CedarDB TPC-H Benchmark with Results Export ==="
 echo "Scale Factor: ${SCALE_FACTOR}"
 echo "Data Directory: ${DATA_DIR}"
@@ -37,6 +107,9 @@ echo ""
 # Create results and log directories if they don't exist
 mkdir -p "$RESULTS_DIR"
 mkdir -p "${LOG_DIR}/${TIMESTAMP}"
+
+# Ensure CedarDB is running
+ensure_cedardb_running
 
 # Initialize CSV file with header if it doesn't exist
 if [ ! -f "${RESULTS_FILE}" ]; then
@@ -128,10 +201,10 @@ run_query_with_results() {
     echo "${TIMESTAMP},${SCALE_FACTOR},${query_name},${exec_time},${GPU_NAME},${MEMORY_GB}" >> "${RESULTS_FILE}"
 }
 
-# Check if CedarDB is accessible
+# Verify CedarDB is accessible (should be guaranteed by ensure_cedardb_running above)
 if ! docker exec -e PGPASSWORD="${CEDAR_PASSWORD}" cedardb psql -h localhost -p 5432 -U "${CEDAR_USER}" -d postgres -c "SELECT 1" &>/dev/null; then
     echo "Error: Cannot connect to CedarDB at ${CEDAR_HOST}:${CEDAR_PORT}"
-    echo "Make sure CedarDB is running and accessible"
+    echo "Make sure Docker is running"
     exit 1
 fi
 
