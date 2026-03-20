@@ -28,7 +28,7 @@ KERNEL_AIR      = $(BUILD_DIR)/kernels.air
 KERNEL_METALLIB = $(BUILD_DIR)/kernels.metallib
 
 # Queries and scale factors understood by the binary
-QUERIES = q1 q3 q6 q9 q13
+QUERIES = q1 q2 q3 q5 q6 q9 q13
 SCALE_FACTORS = sf1 sf10 sf100
 
 # ---------------------------------------------------------------------------
@@ -55,14 +55,13 @@ $(TARGET): $(OBJECTS) | $(BIN_DIR)
 	$(CXX) $(OBJECTS) $(FRAMEWORKS) -o $@
 	@echo "Build complete: $@"
 
-$(KERNEL_AIR): $(KERNEL_DIR)/DatabaseKernels.metal | $(BUILD_DIR)
+$(KERNEL_AIR): $(KERNEL_DIR)/DatabaseKernels.metal $(wildcard $(KERNEL_DIR)/*.metal $(KERNEL_DIR)/*.h) | $(BUILD_DIR)
 	@echo "Compiling Metal kernels (.air)..."
-	$(METAL) -c $< -o $@
+	$(METAL) -I $(KERNEL_DIR) -c $< -o $@
 
 $(KERNEL_METALLIB): $(KERNEL_AIR)
 	@echo "Linking Metal library (.metallib)..."
 	$(METALLIB) $< -o $@
-	cp $@ default.metallib
 
 $(OBJ_DIR)/%.o: $(SOURCE_DIR)/%.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
@@ -73,7 +72,7 @@ $(BIN_DIR) $(OBJ_DIR) $(BUILD_DIR):
 
 clean:
 	@echo "Cleaning build artifacts..."
-	@rm -rf $(BUILD_DIR) default.metallib
+	@rm -rf $(BUILD_DIR)
 	@echo "Clean complete"
 
 # ---------------------------------------------------------------------------
@@ -96,8 +95,8 @@ run-sf1 run-sf10 run-sf100: run-%: all
 # ---------------------------------------------------------------------------
 # Convenience per-query targets  (run-q1 … run-q13)
 # ---------------------------------------------------------------------------
-.PHONY: run-q1 run-q3 run-q6 run-q9 run-q13
-run-q1 run-q3 run-q6 run-q9 run-q13: run-%: all
+.PHONY: run-q1 run-q2 run-q3 run-q5 run-q6 run-q9 run-q13
+run-q1 run-q2 run-q3 run-q5 run-q6 run-q9 run-q13: run-%: all
 	@./$(TARGET) $*
 
 # ---------------------------------------------------------------------------

@@ -1,23 +1,27 @@
 #!/bin/bash
 # GPU Metal TPC-H Benchmark Script
 # Runs Q1, Q3, Q6, Q9, Q13 and records timing metrics to CSV
-# Usage: benchmark_gpu.sh [sf1|sf10|sf100|all]
+# Usage: benchmark_gpu.sh [--query-results] [sf1|sf10|sf100|all]
+#   --query-results: show live GPU output and save per-query logs
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+parse_common_args "$@"
+
 BUILD_BIN="$PROJECT_ROOT/build/bin/GPUDBMetalBenchmark"
-RESULTS_DIR="$PROJECT_ROOT/results"
 LOG_DIR="$RESULTS_DIR/gpu_logs"
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 GPU_CSV="$RESULTS_DIR/gpu_results.csv"
 
 QUERIES="Q1 Q3 Q6 Q9 Q13"
 
-# Detect GPU name and system memory
-GPU_NAME=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2}' | head -1 | xargs)
-MEMORY_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+if [[ "$SHOW_QUERY_RESULTS" -eq 1 ]]; then
+    echo "=== GPU Metal TPC-H Benchmark with Results Export ==="
+    echo "Binary: ${BUILD_BIN}"
+    echo "Results CSV: ${GPU_CSV}"
+    echo "Timestamp: ${TIMESTAMP}"
+    echo ""
+fi
 
 mkdir -p "$RESULTS_DIR" "${LOG_DIR}/${TIMESTAMP}"
 
@@ -28,16 +32,11 @@ if [[ ! -x "$BUILD_BIN" ]]; then
 fi
 
 # CSV header
-CSV_HEADER="timestamp,scale_factor,query,gpu_exec_ms,cpu_post_ms,total_exec_ms,gpu_name,memory_gb"
-if [[ ! -f "$GPU_CSV" ]]; then
-  echo "$CSV_HEADER" > "$GPU_CSV"
-fi
+ensure_csv "$GPU_CSV" "timestamp,scale_factor,query,gpu_exec_ms,cpu_post_ms,total_exec_ms,gpu_name,memory_gb"
 
 # ---------------------------------------------------------------------------
 # Timing extraction
 # ---------------------------------------------------------------------------
-# Extract value from "  GPU Execution:      3.61 ms" or
-# "  Total Execution:    3.61 ms  (GPU + CPU post)"
 extract_metric() {
   local block="$1"
   local label="$2"
@@ -82,6 +81,7 @@ parse_and_record() {
       awk "/Running.*Query ${q_num}/,/Total Execution:/" "$out_file" 2>/dev/null ||
         awk "/Running.*${q}/,/Total Execution:/" "$out_file" 2>/dev/null || true
     } > "$q_log"
+    [[ "$SHOW_QUERY_RESULTS" -eq 1 ]] && [[ -s "$q_log" ]] && echo "    → ${q_log}"
   done
 }
 
@@ -94,7 +94,16 @@ run_benchmark() {
 
   echo "=== GPU benchmark: ${sf_label} ==="
   local out_file="${LOG_DIR}/${TIMESTAMP}/${sf_label}_full.log"
-  (cd "$PROJECT_ROOT" && "$BUILD_BIN" "$sf_arg" all) > "$out_file" 2>&1 || true
+
+  if [[ "$SHOW_QUERY_RESULTS" -eq 1 ]]; then
+    echo "Running GPU benchmarks for ${sf_label}..."
+    (cd "$PROJECT_ROOT" && "$BUILD_BIN" "$sf_arg" all) 2>&1 | tee "$out_file"
+  else
+    (cd "$PROJECT_ROOT" && "$BUILD_BIN" "$sf_arg" all) > "$out_file" 2>&1 || true
+  fi
+
+  echo ""
+  [[ "$SHOW_QUERY_RESULTS" -eq 1 ]] && echo "Extracting results for ${sf_label}..."
   parse_and_record "$sf_label" "$out_file"
   echo ""
 }
@@ -102,19 +111,19 @@ run_benchmark() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-MODE="${1:-all}"
+MODE="${POSITIONAL_ARGS[0]:-all}"
 
 case "$MODE" in
-  sf1)    run_benchmark sf1  SF-1   ;;
-  sf10)   run_benchmark sf10 SF-10  ;;
-  sf100)  run_benchmark sf100 SF-100 ;;
+  sf1|SF-1)     run_benchmark sf1  SF-1   ;;
+  sf10|SF-10)   run_benchmark sf10 SF-10  ;;
+  sf100|SF-100) run_benchmark sf100 SF-100 ;;
   all)
     [[ -d "$PROJECT_ROOT/data/SF-1" ]]   && run_benchmark sf1  SF-1
     [[ -d "$PROJECT_ROOT/data/SF-10" ]]  && run_benchmark sf10 SF-10  || true
     [[ -d "$PROJECT_ROOT/data/SF-100" ]] && run_benchmark sf100 SF-100 || true
     ;;
   *)
-    echo "Usage: $0 [sf1|sf10|sf100|all]"
+    echo "Usage: $0 [--query-results] [sf1|sf10|sf100|all]"
     exit 1
     ;;
 esac
@@ -124,3 +133,9 @@ echo "Logs: ${LOG_DIR}/${TIMESTAMP}/"
 echo ""
 echo "Latest results (${TIMESTAMP}):"
 grep "^${TIMESTAMP}" "$GPU_CSV" | column -t -s,
+
+if [[ "$SHOW_QUERY_RESULTS" -eq 1 ]]; then
+  echo ""
+  echo "Log files:"
+  ls -lh "${LOG_DIR}/${TIMESTAMP}/"
+fi

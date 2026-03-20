@@ -10,6 +10,7 @@ kernels/*.metallib
 
 # TPC-H data files
 data/**/*.tbl
+data/**/*.duckdb
 
 # macOS system files
 .DS_Store
@@ -19,5 +20,12 @@ DerivedData/
 # IDE / editor
 .vscode/
 
+# Benchmark logs (generated, not tracked)
+results/gpu_logs/
+results/duckdb_logs/
+results/cedardb_logs/
+results/old_format/
+*.log
+
 # Tooling
-temp_tpch/tpch-dbgen/
+temp_tpch/
