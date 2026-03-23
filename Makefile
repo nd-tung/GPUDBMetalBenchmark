@@ -39,7 +39,7 @@ SCALE_FACTORS = sf1 sf10 sf100
 # Metal compiler (requires full Xcode, not just Command Line Tools).
 # If unavailable, the binary falls back to runtime compilation from
 # kernels/DatabaseKernels.metal — so the metallib is optional.
-METAL_AVAILABLE := $(shell xcrun --find metal 2>/dev/null && echo 1)
+METAL_AVAILABLE := $(shell xcrun --find metal >/dev/null 2>/dev/null && echo 1)
 
 ifeq ($(METAL_AVAILABLE),1)
   all: $(TARGET) $(KERNEL_METALLIB)
