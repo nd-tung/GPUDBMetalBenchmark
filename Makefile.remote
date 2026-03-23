@@ -1,0 +1,182 @@
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+PROJECT_NAME = GPUDBMetalBenchmark
+SOURCE_DIR   = src
+KERNEL_DIR   = kernels
+METAL_CPP_DIR = third_party/metal-cpp
+DATA_DIR     = data
+BUILD_DIR    = build
+BIN_DIR      = $(BUILD_DIR)/bin
+OBJ_DIR      = $(BUILD_DIR)/obj
+
+CXX      = clang++
+CXXFLAGS = -std=c++20 -Wall -Wextra -O3
+INCLUDES = -I$(METAL_CPP_DIR)
+FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore
+
+SOURCES = $(wildcard $(SOURCE_DIR)/*.cpp)
+OBJECTS = $(SOURCES:$(SOURCE_DIR)/%.cpp=$(OBJ_DIR)/%.o)
+TARGET  = $(BIN_DIR)/$(PROJECT_NAME)
+
+KERNEL_METALLIB = $(BUILD_DIR)/kernels.metallib
+
+# Queries and scale factors understood by the binary
+QUERIES = q1 q2 q3 q5 q6 q9 q13
+SCALE_FACTORS = sf1 sf10 sf100
+
+# ---------------------------------------------------------------------------
+# Remote host  (set via environment variables)
+#   export REMOTE_USER=... REMOTE_HOST=... REMOTE_PATH=...
+# ---------------------------------------------------------------------------
+REMOTE_USER ?= $(error REMOTE_USER is not set — export it or pass on the command line)
+REMOTE_HOST ?= $(error REMOTE_HOST is not set — export it or pass on the command line)
+REMOTE_PATH ?= $(error REMOTE_PATH is not set — export it or pass on the command line)
+REMOTE      = $(REMOTE_USER)@$(REMOTE_HOST)
+SSH         = ssh $(REMOTE)
+RSYNC       = rsync -avz --delete
+
+# ---------------------------------------------------------------------------
+# Build  (C++ only — no Metal compilation)
+# ---------------------------------------------------------------------------
+.PHONY: all rebuild clean check-metallib
+
+all: check-metallib $(TARGET)
+
+rebuild: clean all
+
+# Verify the pre-compiled metallib is present before building.
+check-metallib:
+	@if [ ! -f $(KERNEL_METALLIB) ]; then \
+	  echo "ERROR: $(KERNEL_METALLIB) not found."; \
+	  echo "       Build it locally (make) and copy it here, or pull from git."; \
+	  exit 1; \
+	fi
+	@echo "Using pre-compiled $(KERNEL_METALLIB)"
+
+$(TARGET): $(OBJECTS) | $(BIN_DIR)
+	@echo "Linking $(PROJECT_NAME)..."
+	$(CXX) $(OBJECTS) $(FRAMEWORKS) -o $@
+	@echo "Build complete: $@"
+
+$(OBJ_DIR)/%.o: $(SOURCE_DIR)/%.cpp | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BIN_DIR) $(OBJ_DIR) $(BUILD_DIR):
+	@mkdir -p $@
+
+clean:
+	@echo "Cleaning build artifacts (preserving metallib)..."
+	@rm -rf $(OBJ_DIR) $(BIN_DIR)
+	@echo "Clean complete"
+
+# ---------------------------------------------------------------------------
+# Run  —  make -f Makefile.remote run SF=sf100 Q=q1
+# ---------------------------------------------------------------------------
+.PHONY: run
+
+SF ?=
+Q  ?=
+run: all
+	@./$(TARGET) $(SF) $(Q)
+
+# ---------------------------------------------------------------------------
+# Convenience per-scale-factor targets
+# ---------------------------------------------------------------------------
+.PHONY: run-sf1 run-sf10 run-sf100
+run-sf1 run-sf10 run-sf100: run-%: all
+	@./$(TARGET) $*
+
+# ---------------------------------------------------------------------------
+# Convenience per-query targets  (run-q1 … run-q13)
+# ---------------------------------------------------------------------------
+.PHONY: run-q1 run-q2 run-q3 run-q5 run-q6 run-q9 run-q13
+run-q1 run-q2 run-q3 run-q5 run-q6 run-q9 run-q13: run-%: all
+	@./$(TARGET) $*
+
+# ---------------------------------------------------------------------------
+# Verify project structure
+# ---------------------------------------------------------------------------
+.PHONY: check
+check:
+	@echo "Checking project structure..."
+	@test -f $(SOURCE_DIR)/main.cpp              || (echo "ERROR: $(SOURCE_DIR)/main.cpp not found" && exit 1)
+	@test -f $(KERNEL_METALLIB)                  || (echo "ERROR: $(KERNEL_METALLIB) not found" && exit 1)
+	@test -d $(METAL_CPP_DIR)                    || (echo "ERROR: metal-cpp not found" && exit 1)
+	@for sf in SF-1 SF-10 SF-100; do \
+	  if [ -d $(DATA_DIR)/$$sf ]; then \
+	    echo "  $$sf: OK"; \
+	  else \
+	    echo "  $$sf: not found (run scripts/create_tpch_data.sh)"; \
+	  fi; \
+	done
+	@echo "Check complete"
+
+# ---------------------------------------------------------------------------
+# Remote deployment  (run FROM your local machine)
+# ---------------------------------------------------------------------------
+.PHONY: sync deploy remote-run remote-build remote-clean remote-check
+
+# Sync source, kernels, metallib, headers, data, and this Makefile to remote.
+sync:
+	@echo "Syncing project to $(REMOTE):$(REMOTE_PATH) ..."
+	$(RSYNC) \
+	  --include='build/'               \
+	  --include='build/kernels.metallib' \
+	  --exclude='build/**'              \
+	  --exclude='.git/'                 \
+	  --exclude='temp_tpch/'            \
+	  --exclude='results/'              \
+	  --exclude='benchmark_results/'    \
+	  --exclude='data/'                 \
+	  --exclude='*.bak'                 \
+	  --exclude='*.bak2'                \
+	  ./ $(REMOTE):$(REMOTE_PATH)/
+	@echo "Sync complete."
+
+# Sync + build on remote.
+deploy: sync
+	@echo "Building on remote..."
+	$(SSH) 'cd $(REMOTE_PATH) && make -f Makefile.remote'
+
+# Sync + build + run on remote.
+remote-run: deploy
+	@echo "Running on remote..."
+	$(SSH) 'cd $(REMOTE_PATH) && make -f Makefile.remote run SF=$(SF) Q=$(Q)'
+
+remote-build:
+	$(SSH) 'cd $(REMOTE_PATH) && make -f Makefile.remote'
+
+remote-clean:
+	$(SSH) 'cd $(REMOTE_PATH) && make -f Makefile.remote clean'
+
+remote-check:
+	$(SSH) 'cd $(REMOTE_PATH) && make -f Makefile.remote check'
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+.PHONY: help
+help:
+	@echo "GPU Database Metal Benchmark (Remote)"
+	@echo "======================================"
+	@echo ""
+	@echo "Local build (on remote machine directly):"
+	@echo "  make -f Makefile.remote              Build binary (requires pre-compiled metallib)"
+	@echo "  make -f Makefile.remote rebuild       Clean + build"
+	@echo "  make -f Makefile.remote clean         Remove obj/bin (keeps metallib)"
+	@echo "  make -f Makefile.remote run           Build + run"
+	@echo ""
+	@echo "Deploy from local to remote ($(REMOTE)):"
+	@echo "  make -f Makefile.remote sync          Sync files to remote"
+	@echo "  make -f Makefile.remote deploy        Sync + build on remote"
+	@echo "  make -f Makefile.remote remote-run    Sync + build + run on remote"
+	@echo "  make -f Makefile.remote remote-run SF=sf100 Q=q1"
+	@echo "  make -f Makefile.remote remote-build  Build on remote (no sync)"
+	@echo "  make -f Makefile.remote remote-clean  Clean on remote"
+	@echo "  make -f Makefile.remote remote-check  Check structure on remote"
+	@echo ""
+	@echo "Other:"
+	@echo "  make -f Makefile.remote check         Verify project structure"
+	@echo "  make -f Makefile.remote help          Show this message"

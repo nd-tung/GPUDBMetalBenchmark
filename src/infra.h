@@ -370,7 +370,7 @@ struct Q2Result {
 struct SuppBitmapResult {
     std::vector<uint> bitmap;
     uint bitmap_ints;
-    std::map<int, size_t> index;
+    std::vector<size_t> index;  // direct-index by suppkey, SIZE_MAX = absent
 };
 inline SuppBitmapResult buildSuppBitmapAndIndex(const int* suppkey, const int* nationkey,
                                                  size_t count, const std::vector<int>& target_keys) {
@@ -379,6 +379,7 @@ inline SuppBitmapResult buildSuppBitmapAndIndex(const int* suppkey, const int* n
     SuppBitmapResult r;
     r.bitmap_ints = (max_key + 31) / 32 + 1;
     r.bitmap.resize(r.bitmap_ints, 0);
+    r.index.assign(max_key + 1, SIZE_MAX);
     for (size_t i = 0; i < count; i++) {
         r.index[suppkey[i]] = i;
         bool match = false;
@@ -388,34 +389,76 @@ inline SuppBitmapResult buildSuppBitmapAndIndex(const int* suppkey, const int* n
     return r;
 }
 inline void postProcessQ2(Q2MatchResult_CPU* gpu_results, uint result_count,
-                           const std::map<int, size_t>& supp_index,
+                           const std::vector<size_t>& supp_index,
                            const float* s_acctbal, const int* s_nationkey,
                            const char* s_name, const char* s_address,
                            const char* s_phone, const char* s_comment,
                            std::map<int, std::string>& nation_names,
                            const int* p_partkey, size_t part_size,
                            const char* p_mfgr) {
-    std::map<int, size_t> part_index;
+    // Direct-index by partkey
+    int max_pk = 0;
+    for (size_t i = 0; i < part_size; i++) max_pk = std::max(max_pk, p_partkey[i]);
+    std::vector<size_t> part_index(max_pk + 1, SIZE_MAX);
     for (size_t i = 0; i < part_size; i++) part_index[p_partkey[i]] = i;
 
-    std::vector<Q2Result> final_results;
+    // Build nation alphabetical sort order (25 nations, cheap)
+    int max_nk = 0;
+    for (auto& [k, _] : nation_names) max_nk = std::max(max_nk, k);
+    std::vector<int> nation_order(max_nk + 1, 0);
+    {
+        std::vector<std::pair<std::string, int>> ns;
+        for (auto& [k, v] : nation_names) ns.push_back({v, k});
+        std::sort(ns.begin(), ns.end());
+        for (int i = 0; i < (int)ns.size(); i++) nation_order[ns[i].second] = i;
+    }
+
+    // Phase 1: Lightweight numeric pre-keys (no string allocation)
+    struct PreKey { uint idx; float acctbal; int nation_ord; int suppkey; int partkey; };
+    std::vector<PreKey> pre_keys;
+    pre_keys.reserve(result_count);
     for (uint i = 0; i < result_count; i++) {
-        int pk = gpu_results[i].partkey, sk = gpu_results[i].suppkey;
-        auto sit = supp_index.find(sk);
-        if (sit == supp_index.end()) continue;
-        size_t si = sit->second;
+        int sk = gpu_results[i].suppkey;
+        if (sk < 0 || (size_t)sk >= supp_index.size() || supp_index[sk] == SIZE_MAX) continue;
+        size_t si = supp_index[sk];
+        int nk = s_nationkey[si];
+        pre_keys.push_back({i, s_acctbal[si],
+                            (nk >= 0 && nk <= max_nk) ? nation_order[nk] : nk,
+                            sk, gpu_results[i].partkey});
+    }
+
+    // Phase 2: partial_sort top LIMIT by exact sort order (numeric proxies)
+    // s_name is "Supplier#XXXXXXXXX" (zero-padded), so suppkey order = s_name order
+    constexpr size_t LIMIT = 100;
+    const size_t K = std::min(pre_keys.size(), LIMIT);
+    std::partial_sort(pre_keys.begin(), pre_keys.begin() + K, pre_keys.end(),
+        [](const PreKey& a, const PreKey& b) {
+            if (a.acctbal != b.acctbal) return a.acctbal > b.acctbal;
+            if (a.nation_ord != b.nation_ord) return a.nation_ord < b.nation_ord;
+            if (a.suppkey != b.suppkey) return a.suppkey < b.suppkey;
+            return a.partkey < b.partkey;
+        });
+
+    // Phase 3: Materialize strings only for top K (100 vs ~100K)
+    std::vector<Q2Result> final_results;
+    final_results.reserve(K);
+    for (size_t i = 0; i < K; i++) {
+        auto& pk = pre_keys[i];
+        size_t si = supp_index[pk.suppkey];
         Q2Result r;
-        r.s_acctbal = s_acctbal[si];
+        r.s_acctbal = pk.acctbal;
         r.s_name = trimFixed(s_name, si, 25);
         r.n_name = nation_names[s_nationkey[si]];
-        r.p_partkey = pk;
-        auto pit = part_index.find(pk);
-        if (pit != part_index.end()) r.p_mfgr = trimFixed(p_mfgr, pit->second, 25);
+        r.p_partkey = pk.partkey;
+        if (pk.partkey >= 0 && pk.partkey <= max_pk && part_index[pk.partkey] != SIZE_MAX)
+            r.p_mfgr = trimFixed(p_mfgr, part_index[pk.partkey], 25);
         r.s_address = trimFixed(s_address, si, 40);
         r.s_phone = trimFixed(s_phone, si, 15);
         r.s_comment = trimFixed(s_comment, si, 101);
-        final_results.push_back(r);
+        final_results.push_back(std::move(r));
     }
+
+    // Phase 4: Final exact sort (100 elements, virtually free)
     std::sort(final_results.begin(), final_results.end(), [](const Q2Result& a, const Q2Result& b) {
         if (a.s_acctbal != b.s_acctbal) return a.s_acctbal > b.s_acctbal;
         if (a.n_name != b.n_name) return a.n_name < b.n_name;
