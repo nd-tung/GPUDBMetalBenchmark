@@ -28,7 +28,7 @@ KERNEL_AIR      = $(BUILD_DIR)/kernels.air
 KERNEL_METALLIB = $(BUILD_DIR)/kernels.metallib
 
 # Queries and scale factors understood by the binary
-QUERIES = q1 q2 q3 q5 q6 q9 q13
+QUERIES = q1 q2 q3 q4 q5 q6 q9 q12 q13 q14 q19
 SCALE_FACTORS = sf1 sf10 sf100
 
 # ---------------------------------------------------------------------------
@@ -93,10 +93,10 @@ run-sf1 run-sf10 run-sf100: run-%: all
 	@./$(TARGET) $*
 
 # ---------------------------------------------------------------------------
-# Convenience per-query targets  (run-q1 … run-q13)
+# Convenience per-query targets  (run-q1 … run-q19)
 # ---------------------------------------------------------------------------
-.PHONY: run-q1 run-q2 run-q3 run-q5 run-q6 run-q9 run-q13
-run-q1 run-q2 run-q3 run-q5 run-q6 run-q9 run-q13: run-%: all
+.PHONY: $(addprefix run-,$(QUERIES))
+$(addprefix run-,$(QUERIES)): run-%: all
 	@./$(TARGET) $*
 
 # ---------------------------------------------------------------------------
