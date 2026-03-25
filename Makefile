@@ -28,7 +28,7 @@ KERNEL_AIR      = $(BUILD_DIR)/kernels.air
 KERNEL_METALLIB = $(BUILD_DIR)/kernels.metallib
 
 # Queries and scale factors understood by the binary
-QUERIES = q1 q2 q3 q4 q5 q6 q9 q12 q13 q14 q19
+QUERIES = q1 q2 q3 q4 q5 q6 q9 q11 q12 q13 q14 q19
 SCALE_FACTORS = sf1 sf10 sf100
 
 # ---------------------------------------------------------------------------

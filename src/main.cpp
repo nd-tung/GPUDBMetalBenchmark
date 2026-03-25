@@ -16,6 +16,7 @@ static void showHelp() {
     std::cout << "  q5            - Run TPC-H Query 5 (Local Supplier Volume)" << std::endl;
     std::cout << "  q6            - Run TPC-H Query 6 (Forecasting Revenue Change)" << std::endl;
     std::cout << "  q9            - Run TPC-H Query 9 (Product Type Profit Measure)" << std::endl;
+    std::cout << "  q11           - Run TPC-H Query 11 (Important Stock Identification)" << std::endl;
     std::cout << "  q12           - Run TPC-H Query 12 (Shipping Modes & Order Priority)" << std::endl;
     std::cout << "  q13           - Run TPC-H Query 13 (Customer Distribution)" << std::endl;
     std::cout << "  q14           - Run TPC-H Query 14 (Promotion Effect)" << std::endl;
@@ -99,7 +100,8 @@ int main(int argc, const char * argv[]) {
             "kernels/q12.metal",
             "kernels/q13.metal",
             "kernels/q14.metal",
-            "kernels/q19.metal"
+            "kernels/q19.metal",
+            "kernels/q11.metal"
         };
         std::string metalSource;
         bool allFilesRead = true;
@@ -141,7 +143,8 @@ int main(int argc, const char * argv[]) {
         {"q5", runQ5BenchmarkSF100}, {"q6", runQ6BenchmarkSF100},
         {"q9", runQ9BenchmarkSF100}, {"q12", runQ12BenchmarkSF100},
         {"q13", runQ13BenchmarkSF100}, {"q14", runQ14BenchmarkSF100},
-        {"q19", runQ19BenchmarkSF100}
+        {"q19", runQ19BenchmarkSF100},
+        {"q11", runQ11BenchmarkSF100}
     };
     std::vector<BenchEntry> std_benchmarks = {
         {"selection", runSelectionBenchmark}, {"aggregation", runAggregationBenchmark},
@@ -149,7 +152,8 @@ int main(int argc, const char * argv[]) {
         {"q1", runQ1Benchmark}, {"q2", runQ2Benchmark}, {"q3", runQ3Benchmark},
         {"q4", runQ4Benchmark}, {"q5", runQ5Benchmark}, {"q6", runQ6Benchmark},
         {"q9", runQ9Benchmark}, {"q12", runQ12Benchmark}, {"q13", runQ13Benchmark},
-        {"q14", runQ14Benchmark}, {"q19", runQ19Benchmark}
+        {"q14", runQ14Benchmark}, {"q19", runQ19Benchmark},
+        {"q11", runQ11Benchmark}
     };
 
     auto& benchmarks = g_sf100_mode ? sf100_benchmarks : std_benchmarks;

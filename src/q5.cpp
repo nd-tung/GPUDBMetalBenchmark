@@ -57,9 +57,9 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     // 3. Setup GPU kernels
     auto pCustMapPipe = createPipeline(pDevice, pLibrary, "q5_build_customer_nation_map_kernel");
     auto pSuppMapPipe = createPipeline(pDevice, pLibrary, "q5_build_supplier_nation_map_kernel");
-    auto pOrdersHTPipe = createPipeline(pDevice, pLibrary, "q5_build_orders_ht_kernel");
+    auto pOrdersMapPipe = createPipeline(pDevice, pLibrary, "q5_build_orders_map_kernel");
     auto pProbeAggPipe = createPipeline(pDevice, pLibrary, "q5_probe_and_aggregate_kernel");
-    if (!pCustMapPipe || !pSuppMapPipe || !pOrdersHTPipe || !pProbeAggPipe) return;
+    if (!pCustMapPipe || !pSuppMapPipe || !pOrdersMapPipe || !pProbeAggPipe) return;
 
     // 4. Create GPU buffers
     int max_custkey = 0;
@@ -86,11 +86,11 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     MTL::Buffer* pOrdCustKeyBuf = pDevice->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pOrdDateBuf = pDevice->newBuffer(o_orderdate.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    // Orders HT: power-of-2 capacity
-    uint ht_capacity = 1;
-    while (ht_capacity < orders_size * 2) ht_capacity <<= 1;
-    // Q5OrdersHTEntry = 2 ints = 8 bytes
-    MTL::Buffer* pOrdersHTBuf = pDevice->newBuffer(ht_capacity * 8, MTL::ResourceStorageModeShared);
+    // Orders direct map: orderkey -> nationkey (replaces hash table)
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    const uint map_size = max_orderkey + 1;
+    MTL::Buffer* pOrdersMapBuf = pDevice->newBuffer((size_t)map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
     MTL::Buffer* pLineOrdKeyBuf = pDevice->newBuffer(l_orderkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pLineSuppKeyBuf = pDevice->newBuffer(l_suppkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
@@ -110,7 +110,7 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     for (int iter = 0; iter < 3; ++iter) {
         std::memset(pCustNationMapBuf->contents(), -1, cust_map_size * sizeof(int));
         std::memset(pSuppNationMapBuf->contents(), -1, supp_map_size * sizeof(int));
-        std::memset(pOrdersHTBuf->contents(), 0xFF, ht_capacity * 8);
+        std::memset(pOrdersMapBuf->contents(), -1, (size_t)map_size * sizeof(int));
         std::memset(pNationRevenueBuf->contents(), 0, 25 * sizeof(float));
 
         MTL::CommandBuffer* pCmdBuf = pCommandQueue->commandBuffer();
@@ -134,17 +134,17 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         pBuildEnc->setBytes(&supplier_size, sizeof(supplier_size), 4);
         pBuildEnc->dispatchThreads(MTL::Size(supplier_size, 1, 1), MTL::Size(256, 1, 1));
 
-        // Stage 3: Build orders HT
+        // Stage 3: Build orders direct map
         pBuildEnc->memoryBarrier(MTL::BarrierScopeBuffers);
-        pBuildEnc->setComputePipelineState(pOrdersHTPipe);
+        pBuildEnc->setComputePipelineState(pOrdersMapPipe);
         pBuildEnc->setBuffer(pOrdKeyBuf, 0, 0);
         pBuildEnc->setBuffer(pOrdCustKeyBuf, 0, 1);
         pBuildEnc->setBuffer(pOrdDateBuf, 0, 2);
-        pBuildEnc->setBuffer(pOrdersHTBuf, 0, 3);
+        pBuildEnc->setBuffer(pOrdersMapBuf, 0, 3);
         pBuildEnc->setBytes(&orders_size, sizeof(orders_size), 4);
         pBuildEnc->setBytes(&date_start, sizeof(date_start), 5);
         pBuildEnc->setBytes(&date_end, sizeof(date_end), 6);
-        pBuildEnc->setBytes(&ht_capacity, sizeof(ht_capacity), 7);
+        pBuildEnc->setBytes(&map_size, sizeof(map_size), 7);
         pBuildEnc->setBuffer(pCustNationMapBuf, 0, 8);
         pBuildEnc->dispatchThreads(MTL::Size(orders_size, 1, 1), MTL::Size(256, 1, 1));
 
@@ -165,11 +165,11 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         pProbeEnc->setBuffer(pLineSuppKeyBuf, 0, 1);
         pProbeEnc->setBuffer(pLinePriceBuf, 0, 2);
         pProbeEnc->setBuffer(pLineDiscBuf, 0, 3);
-        pProbeEnc->setBuffer(pOrdersHTBuf, 0, 4);
+        pProbeEnc->setBuffer(pOrdersMapBuf, 0, 4);
         pProbeEnc->setBuffer(pSuppNationMapBuf, 0, 5);
         pProbeEnc->setBuffer(pNationRevenueBuf, 0, 6);
         pProbeEnc->setBytes(&lineitem_size, sizeof(lineitem_size), 7);
-        pProbeEnc->setBytes(&ht_capacity, sizeof(ht_capacity), 8);
+        pProbeEnc->setBytes(&map_size, sizeof(map_size), 8);
         pProbeEnc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
 
         pProbeEnc->endEncoding();
@@ -192,11 +192,11 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printf("\nQ5 | %u rows (lineitem)\n", lineitem_size);
     printTimingSummary(q5CpuParseMs, q5GpuMs, q5CpuPostMs);
 
-    releaseAll(pCustMapPipe, pSuppMapPipe, pOrdersHTPipe, pProbeAggPipe,
+    releaseAll(pCustMapPipe, pSuppMapPipe, pOrdersMapPipe, pProbeAggPipe,
               pCustKeyBuf, pCustNationBuf, pCustNationMapBuf,
               pSuppKeyBuf, pSuppNationBuf, pSuppNationMapBuf,
               pNationBitmapBuf,
-              pOrdKeyBuf, pOrdCustKeyBuf, pOrdDateBuf, pOrdersHTBuf,
+              pOrdKeyBuf, pOrdCustKeyBuf, pOrdDateBuf, pOrdersMapBuf,
               pLineOrdKeyBuf, pLineSuppKeyBuf, pLinePriceBuf, pLineDiscBuf,
               pNationRevenueBuf);
 }
@@ -268,9 +268,9 @@ void runQ5BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     // Setup GPU kernels
     auto pCustMapPipe = createPipeline(device, library, "q5_build_customer_nation_map_kernel");
     auto pSuppMapPipe = createPipeline(device, library, "q5_build_supplier_nation_map_kernel");
-    auto pOrdersHTPipe = createPipeline(device, library, "q5_build_orders_ht_kernel");
+    auto pOrdersMapPipe = createPipeline(device, library, "q5_build_orders_map_kernel");
     auto pProbeAggPipe = createPipeline(device, library, "q5_probe_and_aggregate_kernel");
-    if (!pCustMapPipe || !pSuppMapPipe || !pOrdersHTPipe || !pProbeAggPipe) return;
+    if (!pCustMapPipe || !pSuppMapPipe || !pOrdersMapPipe || !pProbeAggPipe) return;
 
     // Create build-side GPU buffers
     const uint customer_size = (uint)custRows, supplier_size = (uint)suppRows, orders_size = (uint)ordRows;
@@ -294,16 +294,17 @@ void runQ5BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     MTL::Buffer* pOrdCustKeyBuf = device->newBuffer(o_custkey.data(), ordRows * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordRows * sizeof(int), MTL::ResourceStorageModeShared);
 
-    uint ht_capacity = 1;
-    while (ht_capacity < orders_size * 2) ht_capacity <<= 1;
-    MTL::Buffer* pOrdersHTBuf = device->newBuffer((size_t)ht_capacity * 8, MTL::ResourceStorageModeShared);
+    int max_orderkey = 0;
+    for (auto k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    const uint map_size = max_orderkey + 1;
+    MTL::Buffer* pOrdersMapBuf = device->newBuffer((size_t)map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
     MTL::Buffer* pNationRevenueBuf = device->newBuffer(25 * sizeof(float), MTL::ResourceStorageModeShared);
 
     const int date_start = 19940101, date_end = 19950101;
 
     // Execute build phase
-    memset(pOrdersHTBuf->contents(), 0xFF, (size_t)ht_capacity * 8);
+    memset(pOrdersMapBuf->contents(), -1, (size_t)map_size * sizeof(int));
     memset(pNationRevenueBuf->contents(), 0, 25 * sizeof(float));
 
     double buildGpuMs = 0;
@@ -324,13 +325,13 @@ void runQ5BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->dispatchThreads(MTL::Size(supplier_size, 1, 1), MTL::Size(256, 1, 1));
 
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
-        enc->setComputePipelineState(pOrdersHTPipe);
+        enc->setComputePipelineState(pOrdersMapPipe);
         enc->setBuffer(pOrdKeyBuf, 0, 0); enc->setBuffer(pOrdCustKeyBuf, 0, 1);
-        enc->setBuffer(pOrdDateBuf, 0, 2); enc->setBuffer(pOrdersHTBuf, 0, 3);
+        enc->setBuffer(pOrdDateBuf, 0, 2); enc->setBuffer(pOrdersMapBuf, 0, 3);
         enc->setBytes(&orders_size, sizeof(orders_size), 4);
         enc->setBytes(&date_start, sizeof(date_start), 5);
         enc->setBytes(&date_end, sizeof(date_end), 6);
-        enc->setBytes(&ht_capacity, sizeof(ht_capacity), 7);
+        enc->setBytes(&map_size, sizeof(map_size), 7);
         enc->setBuffer(pCustNationMapBuf, 0, 8);
         enc->dispatchThreads(MTL::Size(orders_size, 1, 1), MTL::Size(256, 1, 1));
 
@@ -370,10 +371,10 @@ void runQ5BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             enc->setComputePipelineState(pProbeAggPipe);
             enc->setBuffer(slot.orderkey, 0, 0); enc->setBuffer(slot.suppkey, 0, 1);
             enc->setBuffer(slot.extprice, 0, 2); enc->setBuffer(slot.discount, 0, 3);
-            enc->setBuffer(pOrdersHTBuf, 0, 4); enc->setBuffer(pSuppNationMapBuf, 0, 5);
+            enc->setBuffer(pOrdersMapBuf, 0, 4); enc->setBuffer(pSuppNationMapBuf, 0, 5);
             enc->setBuffer(pNationRevenueBuf, 0, 6);
             enc->setBytes(&chunkSize, sizeof(chunkSize), 7);
-            enc->setBytes(&ht_capacity, sizeof(ht_capacity), 8);
+            enc->setBytes(&map_size, sizeof(map_size), 8);
             enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
             enc->endEncoding();
             cmdBuf->commit();
@@ -393,11 +394,11 @@ void runQ5BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     printf("\nSF100 Q5 | %zu chunks | %zu rows (lineitem)\n", timing.chunkCount, liRows);
     printTimingSummary(allParseMs, allGpuMs, cpuPostMs);
 
-    releaseAll(pCustMapPipe, pSuppMapPipe, pOrdersHTPipe, pProbeAggPipe,
+    releaseAll(pCustMapPipe, pSuppMapPipe, pOrdersMapPipe, pProbeAggPipe,
               pCustKeyBuf, pCustNationBuf, pCustNationMapBuf,
               pSuppKeyBuf, pSuppNationBuf, pSuppNationMapBuf,
               pNationBitmapBuf,
-              pOrdKeyBuf, pOrdCustKeyBuf, pOrdDateBuf, pOrdersHTBuf, pNationRevenueBuf);
+              pOrdKeyBuf, pOrdCustKeyBuf, pOrdDateBuf, pOrdersMapBuf, pNationRevenueBuf);
     for (int s = 0; s < 2; s++) {
         releaseAll(liSlots[s].orderkey, liSlots[s].suppkey,
                   liSlots[s].extprice, liSlots[s].discount);

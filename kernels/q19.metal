@@ -79,6 +79,86 @@ kernel void q19_final_sum_stage2(
     }
 }
 
+// ===================================================================
+// Pre-computation: Build part group map on GPU
+// Classifies each part into group 0/1/2 or 0xFF based on brand+container+size
+// ===================================================================
+kernel void q19_build_part_group_map_kernel(
+    const device int*   p_partkey         [[buffer(0)]],
+    const device char*  p_brand           [[buffer(1)]],  // fixed-width
+    const device char*  p_container       [[buffer(2)]],  // fixed-width
+    const device int*   p_size            [[buffer(3)]],
+    device uchar*       part_group_map    [[buffer(4)]],
+    constant uint& data_size              [[buffer(5)]],
+    constant uint& brand_stride           [[buffer(6)]],
+    constant uint& container_stride       [[buffer(7)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= data_size) return;
+    int pk = p_partkey[tid];
+    int sz = p_size[tid];
+    const device char* brand = p_brand + (uint64_t)tid * brand_stride;
+    const device char* cont  = p_container + (uint64_t)tid * container_stride;
+
+    // Brand#12, SM BOX/SM CASE/SM PACK/SM PKG, size 1-5 → group 0
+    // Brand#23, MED BOX/MED BAG/MED PACK/MED PKG, size 1-10 → group 1
+    // Brand#34, LG BOX/LG CASE/LG PACK/LG PKG, size 1-15 → group 2
+
+    uchar grp = 0xFF;
+    // Check Brand#12
+    if (brand[6]=='1' && brand[7]=='2' && sz >= 1 && sz <= 5) {
+        if ((cont[0]=='S' && cont[1]=='M')) grp = 0;
+    }
+    // Check Brand#23
+    if (brand[6]=='2' && brand[7]=='3' && sz >= 1 && sz <= 10) {
+        if ((cont[0]=='M' && cont[1]=='E' && cont[2]=='D')) grp = 1;
+    }
+    // Check Brand#34
+    if (brand[6]=='3' && brand[7]=='4' && sz >= 1 && sz <= 15) {
+        if ((cont[0]=='L' && cont[1]=='G')) grp = 2;
+    }
+    part_group_map[pk] = grp;
+}
+
+// Pre-computation: Compute lineitem qualifies flag on GPU
+// AIR or REG AIR + DELIVER IN PERSON
+kernel void q19_shipmode_filter_kernel(
+    const device char*  l_shipmode        [[buffer(0)]],
+    const device char*  l_shipinstruct    [[buffer(1)]],
+    device uchar*       l_qualifies       [[buffer(2)]],
+    constant uint& data_size              [[buffer(3)]],
+    constant uint& shipmode_stride        [[buffer(4)]],
+    constant uint& shipinstruct_stride    [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= data_size) return;
+    const device char* sm = l_shipmode + (uint64_t)tid * shipmode_stride;
+    const device char* si = l_shipinstruct + (uint64_t)tid * shipinstruct_stride;
+
+    // Check shipinstruct starts with 'DELIVER IN PERSON'
+    bool instruct_ok = (si[0]=='D' && si[1]=='E' && si[2]=='L');
+    // Check shipmode is 'AIR' or 'AIR REG'
+    bool mode_ok = (sm[0]=='A' && sm[1]=='I' && sm[2]=='R');
+    l_qualifies[tid] = (instruct_ok && mode_ok) ? 1 : 0;
+}
+
+kernel void q19_chunked_shipmode_filter_kernel(
+    const device char*  l_shipmode        [[buffer(0)]],
+    const device char*  l_shipinstruct    [[buffer(1)]],
+    device uchar*       l_qualifies       [[buffer(2)]],
+    constant uint& chunk_size             [[buffer(3)]],
+    constant uint& shipmode_stride        [[buffer(4)]],
+    constant uint& shipinstruct_stride    [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= chunk_size) return;
+    const device char* sm = l_shipmode + (uint64_t)tid * shipmode_stride;
+    const device char* si = l_shipinstruct + (uint64_t)tid * shipinstruct_stride;
+    bool instruct_ok = (si[0]=='D' && si[1]=='E' && si[2]=='L');
+    bool mode_ok = (sm[0]=='A' && sm[1]=='I' && sm[2]=='R');
+    l_qualifies[tid] = (instruct_ok && mode_ok) ? 1 : 0;
+}
+
 // --- Chunked variants ---
 kernel void q19_chunked_stage1(
     const device int*   l_partkey         [[buffer(0)]],

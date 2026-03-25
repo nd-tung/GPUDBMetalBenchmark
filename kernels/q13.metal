@@ -27,187 +27,107 @@ ORDER BY
 */
 
 
-
-// --- Q13 substring matching helpers (SWAR — SIMD Within A Register) ---
-// Process 4 bytes per iteration using classic Mycroft null-byte / byte-match
-// detection on packed uint words. Each o_comment record is 100 bytes (25 uints)
-// and starts at a 4-byte aligned offset (100 % 4 == 0).
-
-// Returns non-zero with the high bit set in each zero byte
-inline uint swar_has_zero(uint v) {
-    return (v - 0x01010101u) & ~v & 0x80808080u;
-}
-
-// Returns non-zero with the high bit set in each byte equal to c (broadcast)
-inline uint swar_has_byte(uint v, uint c_bcast) {
-    uint x = v ^ c_bcast;
-    return (x - 0x01010101u) & ~x & 0x80808080u;
-}
-
-// SWAR: Find first null byte in 100-byte fixed-width field.
-// Returns effective length, or -1 if too short for pattern matching (< 15).
-// Processes 4 bytes per iteration (25 iterations for 100 bytes vs 100 scalar).
-inline int q13_effective_len_swar(const device uint* words) {
-    const int min_pattern_len = 15;
-    for (int i = 0; i < 25; i++) {  // 25 * 4 = 100 bytes
-        uint z = swar_has_zero(words[i]);
-        if (z) {
-            int pos = i * 4 + (ctz(z) >> 3);
-            return (pos < min_pattern_len) ? -1 : pos;
+// ===================================================================
+// Pre-computation: GPU-side pattern matching for '%special%requests%'
+// ===================================================================
+kernel void q13_pattern_match_kernel(
+    const device char*  o_comment         [[buffer(0)]],
+    device uchar*       o_qualifies       [[buffer(1)]],
+    constant uint& orders_size            [[buffer(2)]],
+    constant uint& comment_stride         [[buffer(3)]],  // max chars per comment (80)
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= orders_size) return;
+    // Scan for 'special' then 'requests' after it
+    const device char* s = o_comment + (uint64_t)tid * comment_stride;
+    // Find end of string
+    uint len = 0;
+    while (len < comment_stride && s[len] != '\0') len++;
+    
+    // Search for "special"
+    bool found_special = false;
+    uint after_special = 0;
+    for (uint i = 0; i + 7 <= len; i++) {
+        if (s[i]=='s' && s[i+1]=='p' && s[i+2]=='e' && s[i+3]=='c' &&
+            s[i+4]=='i' && s[i+5]=='a' && s[i+6]=='l') {
+            found_special = true;
+            after_special = i + 7;
+            break;
         }
     }
-    return 100;
-}
-
-// SWAR: Search for "%special%requests%" in comment string.
-// Scans for discriminant characters ('c' in "special", 'q' in "requests")
-// 4 bytes at a time, then verifies full pattern only at candidate positions.
-inline bool q13_has_special_requests_swar(const device uchar* s,
-                                          const device uint* words,
-                                          int comment_len) {
-    const int last_special = comment_len - 15;
-    if (last_special < 0) return false;
-
-    // SWAR scan for 'c' byte (offset 3 in "special") — 4 positions per iteration
-    const uint c_bcast = 0x63636363u; // 'c' = 0x63
-
-    // Words covering byte positions [0 .. last_special + 3]
-    int scan_words = (last_special + 3) / 4 + 1;
-    if (scan_words > 25) scan_words = 25;
-
-    for (int wi = 0; wi < scan_words; wi++) {
-        uint m = swar_has_byte(words[wi], c_bcast);
-        if (!m) continue;
-
-        // Iterate 'c' candidates in this word (up to 4)
-        while (m) {
-            int c_pos = wi * 4 + (ctz(m) >> 3);
-            m &= m - 1;                     // clear lowest set hit
-            int i = c_pos - 3;              // potential start of "special"
-            if (i < 0 || i > last_special) continue;
-
-            // Verify full "special" at position i
-            if (s[i]   == 's' && s[i+1] == 'p' && s[i+2] == 'e' &&
-                s[i+4] == 'i' && s[i+5] == 'a' && s[i+6] == 'l') {
-
-                // "special" confirmed — SWAR scan for "requests" after it
-                int req_start = i + 7;
-                int req_end = comment_len - 8;
-                const uint q_bcast = 0x71717171u; // 'q' = 0x71
-
-                // Words covering byte positions [req_start+2 .. req_end+2]
-                int rw_lo = (req_start + 2) / 4;
-                int rw_hi = (req_end + 2) / 4;
-                if (rw_hi >= 25) rw_hi = 24;
-
-                for (int rw = rw_lo; rw <= rw_hi; rw++) {
-                    uint rm = swar_has_byte(words[rw], q_bcast);
-                    if (!rm) continue;
-
-                    while (rm) {
-                        int q_pos = rw * 4 + (ctz(rm) >> 3);
-                        rm &= rm - 1;
-                        int j = q_pos - 2;  // potential start of "requests"
-                        if (j < req_start || j > req_end) continue;
-
-                        if (s[j]   == 'r' && s[j+1] == 'e' &&
-                            s[j+3] == 'u' && s[j+4] == 'e' &&
-                            s[j+5] == 's' && s[j+6] == 't' && s[j+7] == 's') {
-                            return true;
-                        }
-                    }
-                }
-                return false; // "special" found but no "requests" after it
-            }
+    if (!found_special) { o_qualifies[tid] = 1; return; }  // NOT LIKE → qualifies
+    
+    // Search for "requests" after "special"
+    bool found_requests = false;
+    for (uint i = after_special; i + 8 <= len; i++) {
+        if (s[i]=='r' && s[i+1]=='e' && s[i+2]=='q' && s[i+3]=='u' &&
+            s[i+4]=='e' && s[i+5]=='s' && s[i+6]=='t' && s[i+7]=='s') {
+            found_requests = true;
+            break;
         }
     }
-    return false;
+    // NOT LIKE '%special%requests%' → qualifies when pattern NOT found
+    o_qualifies[tid] = found_requests ? 0 : 1;
 }
 
+kernel void q13_chunked_pattern_match_kernel(
+    const device char*  o_comment         [[buffer(0)]],
+    device uchar*       o_qualifies       [[buffer(1)]],
+    constant uint& chunk_size             [[buffer(2)]],
+    constant uint& comment_stride         [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= chunk_size) return;
+    const device char* s = o_comment + (uint64_t)tid * comment_stride;
+    uint len = 0;
+    while (len < comment_stride && s[len] != '\0') len++;
+    
+    bool found_special = false;
+    uint after_special = 0;
+    for (uint i = 0; i + 7 <= len; i++) {
+        if (s[i]=='s' && s[i+1]=='p' && s[i+2]=='e' && s[i+3]=='c' &&
+            s[i+4]=='i' && s[i+5]=='a' && s[i+6]=='l') {
+            found_special = true;
+            after_special = i + 7;
+            break;
+        }
+    }
+    if (!found_special) { o_qualifies[tid] = 1; return; }
+    
+    bool found_requests = false;
+    for (uint i = after_special; i + 8 <= len; i++) {
+        if (s[i]=='r' && s[i+1]=='e' && s[i+2]=='q' && s[i+3]=='u' &&
+            s[i+4]=='e' && s[i+5]=='s' && s[i+6]=='t' && s[i+7]=='s') {
+            found_requests = true;
+            break;
+        }
+    }
+    o_qualifies[tid] = found_requests ? 0 : 1;
+}
 
-kernel void q13_fused_direct_count_kernel(
-    const device int* o_custkey,
-    const device char* o_comment,
-    device atomic_uint* customer_order_counts,
-    constant uint& orders_size,
-    constant uint& customer_size,
+// --- Q13 Pre-filtered Count Kernel ---
+// Pattern matching ("special%requests") is done on CPU during parsing.
+// GPU receives only custkey (4 bytes) + qualifies flag (1 byte) per order row.
+// This reduces GPU bandwidth from 104 bytes/row to 5 bytes/row (20x reduction).
+
+kernel void q13_count_prefiltered_kernel(
+    const device int* o_custkey          [[buffer(0)]],
+    const device uchar* o_qualifies      [[buffer(1)]],
+    device atomic_uint* customer_order_counts [[buffer(2)]],
+    constant uint& orders_size           [[buffer(3)]],
+    constant uint& customer_size         [[buffer(4)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]],
     uint grid_size [[threads_per_grid]])
 {
-    const int comment_len = 100;
-    const uint global_tid = (group_id * threads_per_group) + thread_id_in_group;
-    const uint BATCH = 4;
-    const uint stride = grid_size * BATCH;
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
 
-    for (uint base = global_tid * BATCH; base < orders_size; base += stride) {
-        if (base + 0 < orders_size) {
-            const uint i = base + 0;
-            const uint ck = (uint)o_custkey[i];
+    for (uint i = global_id; i < orders_size; i += grid_size) {
+        if (o_qualifies[i]) {
+            uint ck = (uint)o_custkey[i];
             if (ck >= 1u && ck <= customer_size) {
-                const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_swar(words);
-                if (effective_len > 0) {
-                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
-                    if (!skip) {
-                        atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                    }
-                } else {
-                    atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                }
-            }
-        }
-        if (base + 1 < orders_size) {
-            const uint i = base + 1;
-            const uint ck = (uint)o_custkey[i];
-            if (ck >= 1u && ck <= customer_size) {
-                const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_swar(words);
-                if (effective_len > 0) {
-                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
-                    if (!skip) {
-                        atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                    }
-                } else {
-                    atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                }
-            }
-        }
-        if (base + 2 < orders_size) {
-            const uint i = base + 2;
-            const uint ck = (uint)o_custkey[i];
-            if (ck >= 1u && ck <= customer_size) {
-                const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_swar(words);
-                if (effective_len > 0) {
-                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
-                    if (!skip) {
-                        atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                    }
-                } else {
-                    atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                }
-            }
-        }
-        if (base + 3 < orders_size) {
-            const uint i = base + 3;
-            const uint ck = (uint)o_custkey[i];
-            if (ck >= 1u && ck <= customer_size) {
-                const device uchar* row = (const device uchar*)(o_comment + (i * comment_len));
-                const device uint* words = (const device uint*)(o_comment + (i * comment_len));
-                int effective_len = q13_effective_len_swar(words);
-                if (effective_len > 0) {
-                    bool skip = q13_has_special_requests_swar(row, words, effective_len);
-                    if (!skip) {
-                        atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                    }
-                } else {
-                    atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
-                }
+                atomic_fetch_add_explicit(&customer_order_counts[ck - 1u], 1u, memory_order_relaxed);
             }
         }
     }

@@ -1,4 +1,5 @@
 #include "infra.h"
+#include <cstring>
 
 // ===================================================================
 // TPC-H Q13 — Customer Distribution
@@ -10,27 +11,30 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
 
     const std::string sf_path = g_dataset_path;
     
-    // 1. Load data
+    // 1. Load data (pure I/O)
     auto q13ParseStart = std::chrono::high_resolution_clock::now();
     auto o_custkey = loadIntColumn(sf_path + "orders.tbl", 1);
-    auto o_comment = loadCharColumn(sf_path + "orders.tbl", 8, 100);
+    auto o_comment = loadCharColumn(sf_path + "orders.tbl", 8, 80);  // fixed 80 chars for GPU
     auto c_custkey = loadIntColumn(sf_path + "customer.tbl", 0);
     auto q13ParseEnd = std::chrono::high_resolution_clock::now();
     double q13CpuParseMs = std::chrono::duration<double, std::milli>(q13ParseEnd - q13ParseStart).count();
 
     const uint orders_size = (uint)o_custkey.size();
     const uint customer_size = (uint)c_custkey.size();
+    const uint comment_stride = 80;
     std::cout << "Loaded " << orders_size << " orders and " << customer_size << " customers." << std::endl;
 
     // 2. Setup kernels
-    auto pFusedCountPipe = createPipeline(pDevice, pLibrary, "q13_fused_direct_count_kernel");
+    auto pPatternPipe = createPipeline(pDevice, pLibrary, "q13_pattern_match_kernel");
+    auto pCountPipe = createPipeline(pDevice, pLibrary, "q13_count_prefiltered_kernel");
     auto pHistPipe = createPipeline(pDevice, pLibrary, "q13_build_histogram_kernel");
-    if (!pFusedCountPipe || !pHistPipe) return;
+    if (!pPatternPipe || !pCountPipe || !pHistPipe) return;
 
     // 3. Create Buffers
     const uint num_threadgroups = 2048;
     MTL::Buffer* pOrdCustKeyBuffer = pDevice->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCommentBuffer = pDevice->newBuffer(o_comment.data(), o_comment.size() * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdCommentBuffer = pDevice->newBuffer(o_comment.data(), (size_t)orders_size * comment_stride * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdQualifiesBuffer = pDevice->newBuffer(orders_size * sizeof(uint8_t), MTL::ResourceStorageModeShared);
 
     // Direct mapping output: per-customer order counts (index = custkey - 1).
     std::vector<uint> cpu_counts_per_customer(customer_size, 0u);
@@ -50,11 +54,26 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
         
         MTL::CommandBuffer* pCommandBuffer = pCommandQueue->commandBuffer();
         
-        // Encoder 1: count kernel
+        // Encoder 0: pattern match kernel (GPU-side)
+        MTL::ComputeCommandEncoder* enc0 = pCommandBuffer->computeCommandEncoder();
+        enc0->setComputePipelineState(pPatternPipe);
+        enc0->setBuffer(pOrdCommentBuffer, 0, 0);
+        enc0->setBuffer(pOrdQualifiesBuffer, 0, 1);
+        enc0->setBytes(&orders_size, sizeof(orders_size), 2);
+        enc0->setBytes(&comment_stride, sizeof(comment_stride), 3);
+        {
+            NS::UInteger tgSize = pPatternPipe->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (orders_size + (uint)tgSize - 1) / (uint)tgSize;
+            enc0->dispatchThreadgroups(MTL::Size(numGroups, 1, 1), MTL::Size(tgSize, 1, 1));
+        }
+        enc0->endEncoding();
+
+        // Encoder 1: count kernel (prefiltered — no comment processing)
         MTL::ComputeCommandEncoder* enc1 = pCommandBuffer->computeCommandEncoder();
-        enc1->setComputePipelineState(pFusedCountPipe);
+        enc1->setComputePipelineState(pCountPipe);
         enc1->setBuffer(pOrdCustKeyBuffer, 0, 0);
-        enc1->setBuffer(pOrdCommentBuffer, 0, 1);
+        enc1->setBuffer(pOrdQualifiesBuffer, 0, 1);
         enc1->setBuffer(pCountsPerCustomerBuffer, 0, 2);
         enc1->setBytes(&orders_size, sizeof(orders_size), 3);
         enc1->setBytes(&customer_size, sizeof(customer_size), 4);
@@ -91,8 +110,8 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
     printf("\nQ13 | %u orders | %u customers\n", orders_size, customer_size);
     printTimingSummary(q13CpuParseMs, q13GpuMs, q13CpuPostMs);
 
-    releaseAll(pFusedCountPipe, pHistPipe,
-              pOrdCustKeyBuffer, pOrdCommentBuffer, pCountsPerCustomerBuffer, pHistogramBuf);
+    releaseAll(pPatternPipe, pCountPipe, pHistPipe,
+              pOrdCustKeyBuffer, pOrdCommentBuffer, pOrdQualifiesBuffer, pCountsPerCustomerBuffer, pHistogramBuf);
 }
 
 
@@ -118,26 +137,29 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     MTL::Buffer* pCountsBuf = device->newBuffer(custRows * sizeof(uint), MTL::ResourceStorageModeShared);
     memset(pCountsBuf->contents(), 0, custRows * sizeof(uint));
 
-    auto pPipe = createPipeline(device, library, "q13_fused_direct_count_kernel");
+    auto pPatternPipe = createPipeline(device, library, "q13_chunked_pattern_match_kernel");
+    auto pPipe = createPipeline(device, library, "q13_count_prefiltered_kernel");
     auto pHistPipe = createPipeline(device, library, "q13_build_histogram_kernel");
-    if (!pPipe || !pHistPipe) return;
+    if (!pPatternPipe || !pPipe || !pHistPipe) return;
 
     // Histogram buffer for GPU histogram kernel
     const uint hist_max_bins = 256;
     MTL::Buffer* pHistogramBuf = device->newBuffer(hist_max_bins * sizeof(uint), MTL::ResourceStorageModeShared);
 
-    // Stream orders in chunks: custkey(4 bytes) + comment(100 bytes) = 104 bytes/row
-    size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 104, ordRows);
+    // Stream orders in chunks: custkey(4) + comment(80) = 84 bytes/row for parse, GPU reduces to 5 bytes/row
+    const uint comment_stride = 80;
+    size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 84, ordRows);
     size_t numChunks = (ordRows + chunkRows - 1) / chunkRows;
     printf("Q13 chunk size: %zu rows, %zu chunks\n", chunkRows, numChunks);
 
-    // Allocate triple-buffered chunk buffers for custkey + comment
+    // Allocate triple-buffered chunk buffers for custkey + comment + qualifies
     const int Q13_NUM_SLOTS = 3;
-    struct Q13ChunkSlot { MTL::Buffer* custKey; MTL::Buffer* comment; };
+    struct Q13ChunkSlot { MTL::Buffer* custKey; MTL::Buffer* comment; MTL::Buffer* qualifies; };
     Q13ChunkSlot q13Slots[Q13_NUM_SLOTS];
     for (int s = 0; s < Q13_NUM_SLOTS; s++) {
         q13Slots[s].custKey = device->newBuffer(chunkRows * sizeof(int), MTL::ResourceStorageModeShared);
-        q13Slots[s].comment = device->newBuffer(chunkRows * 100 * sizeof(char), MTL::ResourceStorageModeShared);
+        q13Slots[s].comment = device->newBuffer(chunkRows * comment_stride * sizeof(char), MTL::ResourceStorageModeShared);
+        q13Slots[s].qualifies = device->newBuffer(chunkRows * sizeof(uint8_t), MTL::ResourceStorageModeShared);
     }
 
     const uint num_threadgroups = 2048;
@@ -145,17 +167,31 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
 
     auto timing = chunkedStreamLoop(
         commandQueue, q13Slots, Q13_NUM_SLOTS, ordRows, chunkRows,
-        // Parse
+        // Parse (pure I/O)
         [&](Q13ChunkSlot& slot, size_t startRow, size_t rowCount) {
             parseIntColumnChunk(ordFile, ordIdx, startRow, rowCount, 1, (int*)slot.custKey->contents());
-            parseCharColumnChunkFixed(ordFile, ordIdx, startRow, rowCount, 8, 100, (char*)slot.comment->contents());
+            parseCharColumnChunkFixed(ordFile, ordIdx, startRow, rowCount, 8, comment_stride, (char*)slot.comment->contents());
         },
-        // Dispatch
+        // Dispatch: pattern match on GPU then count
         [&](Q13ChunkSlot& slot, uint chunkSize, MTL::CommandBuffer* cmdBuf) {
             auto enc = cmdBuf->computeCommandEncoder();
+            // Pattern match kernel
+            enc->setComputePipelineState(pPatternPipe);
+            enc->setBuffer(slot.comment, 0, 0);
+            enc->setBuffer(slot.qualifies, 0, 1);
+            enc->setBytes(&chunkSize, sizeof(chunkSize), 2);
+            enc->setBytes(&comment_stride, sizeof(comment_stride), 3);
+            {
+                NS::UInteger tgSize = pPatternPipe->maxTotalThreadsPerThreadgroup();
+                if (tgSize > 1024) tgSize = 1024;
+                uint numGroups = (chunkSize + (uint)tgSize - 1) / (uint)tgSize;
+                enc->dispatchThreadgroups(MTL::Size(numGroups, 1, 1), MTL::Size(tgSize, 1, 1));
+            }
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            // Count kernel
             enc->setComputePipelineState(pPipe);
             enc->setBuffer(slot.custKey, 0, 0);
-            enc->setBuffer(slot.comment, 0, 1);
+            enc->setBuffer(slot.qualifies, 0, 1);
             enc->setBuffer(pCountsBuf, 0, 2);
             enc->setBytes(&chunkSize, sizeof(chunkSize), 3);
             enc->setBytes(&cs, sizeof(cs), 4);
@@ -199,9 +235,9 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     printTimingSummary(allCpuParseMs, allGpuMs, cpuPostMs);
 
     // Cleanup
-    releaseAll(pPipe, pHistPipe);
+    releaseAll(pPatternPipe, pPipe, pHistPipe);
     for (int s = 0; s < Q13_NUM_SLOTS; s++) {
-        releaseAll(q13Slots[s].custKey, q13Slots[s].comment);
+        releaseAll(q13Slots[s].custKey, q13Slots[s].comment, q13Slots[s].qualifies);
     }
     releaseAll(pCountsBuf, pHistogramBuf);
 }

@@ -4,29 +4,6 @@
 // TPC-H Q14 — Promotion Effect
 // ===================================================================
 
-// Helper: build promo bitmap on CPU from part table
-static std::pair<std::vector<uint>, int> buildPromoBitmap(
-    const std::string& partPath) {
-    // Load p_partkey (col 0) and p_type first 5 chars (col 4)
-    auto p_partkey = loadIntColumn(partPath, 0);
-    auto p_type = loadCharColumn(partPath, 4, 5);  // first 5 chars
-
-    int max_partkey = 0;
-    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
-
-    uint bitmap_ints = (max_partkey + 31) / 32 + 1;
-    std::vector<uint> bitmap(bitmap_ints, 0);
-
-    for (size_t i = 0; i < p_partkey.size(); i++) {
-        const char* t = &p_type[i * 5];
-        if (t[0] == 'P' && t[1] == 'R' && t[2] == 'O' && t[3] == 'M' && t[4] == 'O') {
-            int k = p_partkey[i];
-            bitmap[k / 32] |= (1u << (k % 32));
-        }
-    }
-    return {std::move(bitmap), max_partkey};
-}
-
 // --- Standard (SF1/SF10) ---
 void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
     std::cout << "--- Running TPC-H Query 14 Benchmark ---" << std::endl;
@@ -34,8 +11,9 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     auto q14ParseStart = std::chrono::high_resolution_clock::now();
     const std::string sf_path = g_dataset_path;
 
-    // Build promo bitmap from part table
-    auto [promo_bitmap, max_partkey] = buildPromoBitmap(sf_path + "part.tbl");
+    // Load part data (pure I/O)
+    auto p_partkey = loadIntColumn(sf_path + "part.tbl", 0);
+    auto p_type    = loadCharColumn(sf_path + "part.tbl", 4, 25);  // up to 25 chars for GPU
 
     // Load lineitem columns
     auto l_partkey       = loadIntColumn(sf_path + "lineitem.tbl", 1);
@@ -46,30 +24,59 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     double cpuParseMs = std::chrono::duration<double, std::milli>(q14ParseEnd - q14ParseStart).count();
 
     uint dataSize = (uint)l_partkey.size();
+    uint partSize = (uint)p_partkey.size();
     if (dataSize == 0) { std::cerr << "Q14: no data loaded" << std::endl; return; }
     std::cout << "Loaded " << dataSize << " lineitem rows for Q14." << std::endl;
 
+    int max_partkey = 0;
+    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    uint bitmapInts = (max_partkey + 31) / 32 + 1;
+    const uint type_stride = 25;
+
+    auto bitmapPSO = createPipeline(device, library, "q14_build_promo_bitmap");
     auto s1PSO = createPipeline(device, library, "q14_filter_and_sum_stage1");
     auto s2PSO = createPipeline(device, library, "q14_final_sum_stage2");
-    if (!s1PSO || !s2PSO) return;
+    if (!bitmapPSO || !s1PSO || !s2PSO) return;
 
     const int numTG = 2048;
     int start_date = 19950901, end_date = 19951001;
 
+    MTL::Buffer* pPartKeyBuf = device->newBuffer(p_partkey.data(), partSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pTypeBuf    = device->newBuffer(p_type.data(), (size_t)partSize * type_stride * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* bitmapBuf   = device->newBuffer(bitmapInts * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(bitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
     MTL::Buffer* partkeyBuf  = device->newBuffer(l_partkey.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* shipdateBuf = device->newBuffer(l_shipdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* priceBuf    = device->newBuffer(l_extendedprice.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* discBuf     = device->newBuffer(l_discount.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* bitmapBuf   = device->newBuffer(promo_bitmap.data(), promo_bitmap.size() * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* partialPromo = device->newBuffer(numTG * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* partialTotal = device->newBuffer(numTG * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* finalBuf     = device->newBuffer(2 * sizeof(float), MTL::ResourceStorageModeShared);
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
+        memset(bitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
+
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
 
+        // Phase 1: Build promo bitmap on GPU
+        enc->setComputePipelineState(bitmapPSO);
+        enc->setBuffer(pPartKeyBuf, 0, 0);
+        enc->setBuffer(pTypeBuf, 0, 1);
+        enc->setBuffer(bitmapBuf, 0, 2);
+        enc->setBytes(&partSize, sizeof(partSize), 3);
+        enc->setBytes(&type_stride, sizeof(type_stride), 4);
+        {
+            NS::UInteger tgSize = bitmapPSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (partSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        // Phase 2: Filter lineitem and accumulate
         enc->setComputePipelineState(s1PSO);
         enc->setBuffer(partkeyBuf, 0, 0);
         enc->setBuffer(shipdateBuf, 0, 1);
@@ -110,7 +117,7 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ14 | %u rows\n", dataSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(s1PSO, s2PSO, partkeyBuf, shipdateBuf, priceBuf, discBuf,
+    releaseAll(bitmapPSO, s1PSO, s2PSO, pPartKeyBuf, pTypeBuf, partkeyBuf, shipdateBuf, priceBuf, discBuf,
                bitmapBuf, partialPromo, partialTotal, finalBuf);
 }
 
@@ -133,33 +140,53 @@ void runQ14BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     size_t partRows = partIndex.size(), liRows = liIndex.size();
     printf("Q14 SF100: part=%zu, lineitem=%zu rows (index %.1f ms)\n", partRows, liRows, indexBuildMs);
 
-    // Build promo bitmap on CPU from part table
+    // Load part data and build promo bitmap on GPU
     auto buildT0 = std::chrono::high_resolution_clock::now();
     std::vector<int> p_partkey(partRows);
     parseIntColumnChunk(partFile, partIndex, 0, partRows, 0, p_partkey.data());
-    std::vector<char> p_type(partRows * 5);
-    parseCharColumnChunkFixed(partFile, partIndex, 0, partRows, 4, 5, p_type.data());
+    const uint type_stride = 25;
+    std::vector<char> p_type(partRows * type_stride);
+    parseCharColumnChunkFixed(partFile, partIndex, 0, partRows, 4, type_stride, p_type.data());
 
     int max_partkey = 0;
     for (auto k : p_partkey) max_partkey = std::max(max_partkey, k);
     uint bitmap_ints = (max_partkey + 31) / 32 + 1;
-    std::vector<uint> promo_bitmap(bitmap_ints, 0);
-    for (size_t i = 0; i < partRows; i++) {
-        const char* t = &p_type[i * 5];
-        if (t[0] == 'P' && t[1] == 'R' && t[2] == 'O' && t[3] == 'M' && t[4] == 'O') {
-            int k = p_partkey[i];
-            promo_bitmap[k / 32] |= (1u << (k % 32));
-        }
-    }
     auto buildT1 = std::chrono::high_resolution_clock::now();
     double buildMs = std::chrono::duration<double, std::milli>(buildT1 - buildT0).count();
 
+    auto bitmapPSO = createPipeline(device, library, "q14_build_promo_bitmap");
     auto s1PSO = createPipeline(device, library, "q14_chunked_stage1");
     auto s2PSO = createPipeline(device, library, "q14_chunked_stage2");
-    if (!s1PSO || !s2PSO) return;
+    if (!bitmapPSO || !s1PSO || !s2PSO) return;
 
-    // Upload promo bitmap (persists across chunks)
-    MTL::Buffer* bitmapBuf = device->newBuffer(promo_bitmap.data(), bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    // Upload part data and build bitmap on GPU
+    uint partSizeU = (uint)partRows;
+    MTL::Buffer* pPartKeyBuf = device->newBuffer(p_partkey.data(), partRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pTypeBuf    = device->newBuffer(p_type.data(), partRows * type_stride * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* bitmapBuf   = device->newBuffer(bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(bitmapBuf->contents(), 0, bitmap_ints * sizeof(uint));
+
+    // Dispatch bitmap kernel on GPU
+    {
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(bitmapPSO);
+        enc->setBuffer(pPartKeyBuf, 0, 0);
+        enc->setBuffer(pTypeBuf, 0, 1);
+        enc->setBuffer(bitmapBuf, 0, 2);
+        enc->setBytes(&partSizeU, sizeof(partSizeU), 3);
+        enc->setBytes(&type_stride, sizeof(type_stride), 4);
+        NS::UInteger tgSize = bitmapPSO->maxTotalThreadsPerThreadgroup();
+        if (tgSize > 1024) tgSize = 1024;
+        uint numGroups = (partSizeU + (uint)tgSize - 1) / (uint)tgSize;
+        enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        double bitmapGpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        printf("Promo bitmap built on GPU in %.2f ms\n", bitmapGpuMs);
+    }
+    releaseAll(pPartKeyBuf, pTypeBuf);
 
     size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 16, liRows); // 4 cols × 4 bytes
     const uint num_tg = 2048;
@@ -233,7 +260,7 @@ void runQ14BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     printf("\nSF100 Q14 | %zu chunks | %zu rows\n", timing.chunkCount, liRows);
     printTimingSummary(allCpuParseMs, timing.gpuMs, timing.postMs);
 
-    releaseAll(s1PSO, s2PSO, bitmapBuf, partials_promo, partials_total, finalBuf);
+    releaseAll(bitmapPSO, s1PSO, s2PSO, bitmapBuf, partials_promo, partials_total, finalBuf);
     for (int s = 0; s < NUM_SLOTS; s++)
         releaseAll(slots[s].partkey, slots[s].shipdate, slots[s].extprice, slots[s].discount);
 }

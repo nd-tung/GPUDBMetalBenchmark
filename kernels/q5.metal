@@ -14,12 +14,6 @@ WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey
 ORDER BY revenue DESC;
 */
 
-// Orders HT entry for Q5
-struct Q5OrdersHTEntry {
-    int key;       // orderkey, -1 = empty
-    int nationkey; // customer's nationkey (for same-nation check)
-};
-
 // KERNEL 1: Build customer -> nationkey direct map
 // Only inserts customers whose nationkey is in the ASIA region (via nation_bitmap).
 kernel void q5_build_customer_nation_map_kernel(
@@ -58,17 +52,17 @@ kernel void q5_build_supplier_nation_map_kernel(
     supplier_nation_map[key] = nk;
 }
 
-// KERNEL 3: Build orders HT filtered by date range and customer-in-ASIA
-// Open-addressing with linear probing. Power-of-2 capacity.
-kernel void q5_build_orders_ht_kernel(
+// KERNEL 3: Build orders -> nationkey direct map filtered by date range and customer-in-ASIA
+// Direct indexed write: orders_nation_map[orderkey] = nationkey. No atomics, no collisions.
+kernel void q5_build_orders_map_kernel(
     const device int* o_orderkey           [[buffer(0)]],
     const device int* o_custkey            [[buffer(1)]],
     const device int* o_orderdate          [[buffer(2)]],
-    device Q5OrdersHTEntry* ht             [[buffer(3)]],
+    device int* orders_nation_map          [[buffer(3)]],
     constant uint& orders_size             [[buffer(4)]],
     constant int& date_start               [[buffer(5)]],
     constant int& date_end                 [[buffer(6)]],
-    constant uint& ht_capacity             [[buffer(7)]],
+    constant uint& map_size                [[buffer(7)]],
     const device int* customer_nation_map  [[buffer(8)]],
     uint index [[thread_position_in_grid]])
 {
@@ -77,38 +71,27 @@ kernel void q5_build_orders_ht_kernel(
     int date = o_orderdate[index];
     if (date < date_start || date >= date_end) return;
 
-    // Check customer is in ASIA via direct map
     int ck = o_custkey[index];
     int cust_nk = customer_nation_map[ck];
     if (cust_nk == -1) return;
 
     int key = o_orderkey[index];
-    uint h = sf100_hash_key(key);
-
-    for (uint i = 0; i < ht_capacity; i++) {
-        uint slot = (h + i) & (ht_capacity - 1);
-        int expected = -1;
-        if (atomic_compare_exchange_weak_explicit(
-                (device atomic_int*)&ht[slot].key, &expected, key,
-                memory_order_relaxed, memory_order_relaxed)) {
-            ht[slot].nationkey = cust_nk;
-            return;
-        }
-    }
+    if ((uint)key < map_size)
+        orders_nation_map[key] = cust_nk;
 }
 
-// KERNEL 4: Probe lineitem -> orders HT, check same-nation constraint,
+// KERNEL 4: Probe lineitem -> orders direct map, check same-nation constraint,
 // aggregate revenue by nationkey into a 25-element atomic_float array.
 kernel void q5_probe_and_aggregate_kernel(
     const device int* l_orderkey        [[buffer(0)]],
     const device int* l_suppkey         [[buffer(1)]],
     const device float* l_extendedprice [[buffer(2)]],
     const device float* l_discount      [[buffer(3)]],
-    const device Q5OrdersHTEntry* orders_ht [[buffer(4)]],
+    const device int* orders_nation_map [[buffer(4)]],
     const device int* supplier_nation_map [[buffer(5)]],
     device atomic_float* nation_revenue [[buffer(6)]],
     constant uint& lineitem_size        [[buffer(7)]],
-    constant uint& ht_capacity          [[buffer(8)]],
+    constant uint& map_size             [[buffer(8)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]],
@@ -123,19 +106,10 @@ kernel void q5_probe_and_aggregate_kernel(
             if (idx >= lineitem_size) break;
 
             int orderkey = l_orderkey[idx];
+            if ((uint)orderkey >= map_size) continue;
 
-            // Probe orders HT
-            uint h = sf100_hash_key(orderkey);
-            int cust_nationkey = -1;
-            for (uint j = 0; j < ht_capacity; j++) {
-                uint slot = (h + j) & (ht_capacity - 1);
-                int ok = orders_ht[slot].key;
-                if (ok == -1) break;
-                if (ok == orderkey) {
-                    cust_nationkey = orders_ht[slot].nationkey;
-                    break;
-                }
-            }
+            // Direct map lookup — O(1), no hash collisions
+            int cust_nationkey = orders_nation_map[orderkey];
             if (cust_nationkey == -1) continue;
 
             // Check supplier is in ASIA and same nation as customer

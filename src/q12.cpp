@@ -4,29 +4,6 @@
 // TPC-H Q12 — Shipping Modes and Order Priority
 // ===================================================================
 
-// Helper: build priority bitmap on CPU from orders table
-// Sets bit for orderkeys whose o_orderpriority starts with '1' or '2' (URGENT/HIGH).
-static std::pair<std::vector<uint>, int> buildPriorityBitmap(
-    const std::string& ordersPath) {
-    auto o_orderkey      = loadIntColumn(ordersPath, 0);
-    auto o_orderpriority = loadCharColumn(ordersPath, 5);  // first char: '1'-'5'
-
-    int max_orderkey = 0;
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
-
-    uint bitmap_ints = (max_orderkey + 31) / 32 + 1;
-    std::vector<uint> bitmap(bitmap_ints, 0);
-
-    for (size_t i = 0; i < o_orderkey.size(); i++) {
-        char p = o_orderpriority[i];
-        if (p == '1' || p == '2') {  // 1-URGENT or 2-HIGH
-            int k = o_orderkey[i];
-            bitmap[k / 32] |= (1u << (k % 32));
-        }
-    }
-    return {std::move(bitmap), max_orderkey};
-}
-
 // --- Standard (SF1/SF10) ---
 void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
     std::cout << "--- Running TPC-H Query 12 Benchmark ---" << std::endl;
@@ -34,8 +11,9 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     auto parseStart = std::chrono::high_resolution_clock::now();
     const std::string sf_path = g_dataset_path;
 
-    // Build priority bitmap from orders
-    auto [prio_bitmap, max_orderkey] = buildPriorityBitmap(sf_path + "orders.tbl");
+    // Load orders columns for priority bitmap (pure I/O)
+    auto o_orderkey      = loadIntColumn(sf_path + "orders.tbl", 0);
+    auto o_orderpriority = loadCharColumn(sf_path + "orders.tbl", 5);
 
     // Load lineitem columns
     auto l_orderkey    = loadIntColumn(sf_path + "lineitem.tbl", 0);
@@ -47,30 +25,56 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
     uint dataSize = (uint)l_orderkey.size();
+    uint ordSize = (uint)o_orderkey.size();
     if (dataSize == 0) { std::cerr << "Q12: no data loaded" << std::endl; return; }
     std::cout << "Loaded " << dataSize << " lineitem rows for Q12." << std::endl;
 
+    auto bitmapPSO = createPipeline(device, library, "q12_build_priority_bitmap");
     auto s1PSO = createPipeline(device, library, "q12_filter_and_count_stage1");
     auto s2PSO = createPipeline(device, library, "q12_final_count_stage2");
-    if (!s1PSO || !s2PSO) return;
+    if (!bitmapPSO || !s1PSO || !s2PSO) return;
+
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    uint bitmapInts = (max_orderkey + 31) / 32 + 1;
 
     const int numTG = 2048;
     int receipt_start = 19940101, receipt_end = 19950101;
 
+    MTL::Buffer* ordKeyBuf     = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* ordPrioBuf    = device->newBuffer(o_orderpriority.data(), ordSize * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* bitmapBuf     = device->newBuffer(bitmapInts * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* orderkeyBuf   = device->newBuffer(l_orderkey.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* shipmodeBuf   = device->newBuffer(l_shipmode.data(), dataSize * sizeof(char), MTL::ResourceStorageModeShared);
     MTL::Buffer* shipdateBuf   = device->newBuffer(l_shipdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* commitdateBuf = device->newBuffer(l_commitdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* receiptBuf    = device->newBuffer(l_receiptdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* bitmapBuf     = device->newBuffer(prio_bitmap.data(), prio_bitmap.size() * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* partialBuf    = device->newBuffer(numTG * 4 * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* finalBuf      = device->newBuffer(4 * sizeof(uint), MTL::ResourceStorageModeShared);
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
+        memset(bitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
+
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
 
+        // Phase 1: Build priority bitmap on GPU
+        enc->setComputePipelineState(bitmapPSO);
+        enc->setBuffer(ordKeyBuf, 0, 0);
+        enc->setBuffer(ordPrioBuf, 0, 1);
+        enc->setBuffer(bitmapBuf, 0, 2);
+        enc->setBytes(&ordSize, sizeof(ordSize), 3);
+        {
+            NS::UInteger tgSize = bitmapPSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (ordSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        // Phase 2: Filter lineitem and count
         enc->setComputePipelineState(s1PSO);
         enc->setBuffer(orderkeyBuf, 0, 0);
         enc->setBuffer(shipmodeBuf, 0, 1);
@@ -117,7 +121,7 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ12 | %u rows\n", dataSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(s1PSO, s2PSO, orderkeyBuf, shipmodeBuf, shipdateBuf,
+    releaseAll(bitmapPSO, s1PSO, s2PSO, ordKeyBuf, ordPrioBuf, orderkeyBuf, shipmodeBuf, shipdateBuf,
                commitdateBuf, receiptBuf, bitmapBuf, partialBuf, finalBuf);
 }
 
@@ -140,7 +144,7 @@ void runQ12BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     size_t ordRows = ordIndex.size(), liRows = liIndex.size();
     printf("Q12 SF100: orders=%zu, lineitem=%zu rows (index %.1f ms)\n", ordRows, liRows, indexBuildMs);
 
-    // Build priority bitmap from orders on CPU
+    // Build priority bitmap on GPU from orders
     auto buildT0 = std::chrono::high_resolution_clock::now();
     std::vector<int> o_orderkey(ordRows);
     std::vector<char> o_orderpriority(ordRows);
@@ -150,24 +154,43 @@ void runQ12BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     int max_orderkey = 0;
     for (auto k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
     uint bitmap_ints = (max_orderkey + 31) / 32 + 1;
-    std::vector<uint> prio_bitmap(bitmap_ints, 0);
-    for (size_t i = 0; i < ordRows; i++) {
-        char p = o_orderpriority[i];
-        if (p == '1' || p == '2') {
-            int k = o_orderkey[i];
-            prio_bitmap[k / 32] |= (1u << (k % 32));
-        }
-    }
     auto buildT1 = std::chrono::high_resolution_clock::now();
     double buildMs = std::chrono::duration<double, std::milli>(buildT1 - buildT0).count();
-    printf("Priority bitmap: %u ints (%.1f MB), build %.1f ms\n",
+    printf("Priority bitmap: %u ints (%.1f MB), orders parsed in %.1f ms\n",
            bitmap_ints, bitmap_ints * sizeof(uint) / (1024.0*1024.0), buildMs);
 
+    auto bitmapPSO = createPipeline(device, library, "q12_build_priority_bitmap");
     auto s1PSO = createPipeline(device, library, "q12_chunked_stage1");
     auto s2PSO = createPipeline(device, library, "q12_chunked_stage2");
-    if (!s1PSO || !s2PSO) return;
+    if (!bitmapPSO || !s1PSO || !s2PSO) return;
 
-    MTL::Buffer* bitmapBuf = device->newBuffer(prio_bitmap.data(), bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    // Upload orders data and build bitmap on GPU
+    uint ordSizeU = (uint)ordRows;
+    MTL::Buffer* ordKeyBuf  = device->newBuffer(o_orderkey.data(), ordRows * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* ordPrioBuf = device->newBuffer(o_orderpriority.data(), ordRows * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* bitmapBuf  = device->newBuffer(bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(bitmapBuf->contents(), 0, bitmap_ints * sizeof(uint));
+
+    // Dispatch bitmap kernel on GPU
+    {
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(bitmapPSO);
+        enc->setBuffer(ordKeyBuf, 0, 0);
+        enc->setBuffer(ordPrioBuf, 0, 1);
+        enc->setBuffer(bitmapBuf, 0, 2);
+        enc->setBytes(&ordSizeU, sizeof(ordSizeU), 3);
+        NS::UInteger tgSize = bitmapPSO->maxTotalThreadsPerThreadgroup();
+        if (tgSize > 1024) tgSize = 1024;
+        uint numGroups = (ordSizeU + (uint)tgSize - 1) / (uint)tgSize;
+        enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        double bitmapGpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        printf("Priority bitmap built on GPU in %.2f ms\n", bitmapGpuMs);
+    }
+    releaseAll(ordKeyBuf, ordPrioBuf);
 
     // lineitem: orderkey(4) + shipmode(1) + shipdate(4) + commitdate(4) + receiptdate(4) = 17 bytes/row
     size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 17, liRows);
@@ -249,7 +272,7 @@ void runQ12BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     printf("\nSF100 Q12 | %zu chunks | %zu rows\n", timing.chunkCount, liRows);
     printTimingSummary(allCpuParseMs, timing.gpuMs, timing.postMs);
 
-    releaseAll(s1PSO, s2PSO, bitmapBuf, partialBuf, finalBuf);
+    releaseAll(bitmapPSO, s1PSO, s2PSO, bitmapBuf, partialBuf, finalBuf);
     for (int s = 0; s < NUM_SLOTS; s++)
         releaseAll(slots[s].orderkey, slots[s].shipmode, slots[s].shipdate,
                    slots[s].commitdate, slots[s].receiptdate);

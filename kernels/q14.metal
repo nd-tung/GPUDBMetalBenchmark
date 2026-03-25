@@ -73,6 +73,25 @@ kernel void q14_final_sum_stage2(
     }
 }
 
+// ===================================================================
+// Pre-computation: Build promo bitmap on GPU
+// Sets bit for each partkey where p_type starts with 'PROMO'
+// ===================================================================
+kernel void q14_build_promo_bitmap(
+    const device int*   p_partkey         [[buffer(0)]],
+    const device char*  p_type            [[buffer(1)]],  // fixed-width, e.g. 25 chars
+    device atomic_uint* promo_bitmap      [[buffer(2)]],
+    constant uint& data_size              [[buffer(3)]],
+    constant uint& type_stride            [[buffer(4)]],  // chars per p_type entry
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= data_size) return;
+    const device char* t = p_type + (uint64_t)tid * type_stride;
+    if (t[0]=='P' && t[1]=='R' && t[2]=='O' && t[3]=='M' && t[4]=='O') {
+        bitmap_set(promo_bitmap, p_partkey[tid]);
+    }
+}
+
 // --- Chunked variants ---
 kernel void q14_chunked_stage1(
     const device int*   l_partkey         [[buffer(0)]],

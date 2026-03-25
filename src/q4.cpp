@@ -37,15 +37,16 @@ void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     int max_orderkey = 0;
     for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
     for (int k : l_orderkey) max_orderkey = std::max(max_orderkey, k);
+    uint bitmapInts = (max_orderkey + 31) / 32 + 1;
 
     const int numTG = 2048;
     int date_start = 19930701, date_end = 19931001;
 
-    MTL::Buffer* liOrderkeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* commitBuf     = device->newBuffer(l_commitdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* receiptBuf    = device->newBuffer(l_receiptdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* lateBitmapBuf = createBitmapBuffer(device, max_orderkey);
-
+    MTL::Buffer* liOrderkeyBuf  = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* liCommitBuf    = device->newBuffer(l_commitdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* liReceiptBuf   = device->newBuffer(l_receiptdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* lateBitmapBuf  = device->newBuffer(bitmapInts * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(lateBitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
     MTL::Buffer* ordKeyBuf  = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* ordDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* ordPrioBuf = device->newBuffer(o_orderpriority.data(), ordSize * sizeof(char), MTL::ResourceStorageModeShared);
@@ -54,29 +55,29 @@ void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
-        // Reset late-delivery bitmap
-        memset(lateBitmapBuf->contents(), 0, lateBitmapBuf->length());
+        // Reset bitmap for each iteration
+        memset(lateBitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
 
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
 
-        // Phase 1: Build late-delivery bitmap from lineitem
+        // Phase 1: Build late-delivery bitmap on GPU
         enc->setComputePipelineState(bitmapPSO);
         enc->setBuffer(liOrderkeyBuf, 0, 0);
-        enc->setBuffer(commitBuf, 0, 1);
-        enc->setBuffer(receiptBuf, 0, 2);
+        enc->setBuffer(liCommitBuf, 0, 1);
+        enc->setBuffer(liReceiptBuf, 0, 2);
         enc->setBuffer(lateBitmapBuf, 0, 3);
         enc->setBytes(&liSize, sizeof(liSize), 4);
         {
             NS::UInteger tgSize = bitmapPSO->maxTotalThreadsPerThreadgroup();
-            if (tgSize > 256) tgSize = 256;
-            MTL::Size grid = MTL::Size::Make((liSize + tgSize - 1) / tgSize, 1, 1);
-            enc->dispatchThreadgroups(grid, MTL::Size::Make(tgSize, 1, 1));
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (liSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
         }
 
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
-        // Phase 2: Count orders by priority
+        // Phase 2: Count orders by priority (bitmap built on GPU)
         enc->setComputePipelineState(s1PSO);
         enc->setBuffer(ordKeyBuf, 0, 0);
         enc->setBuffer(ordDateBuf, 0, 1);
@@ -124,7 +125,8 @@ void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     printf("\nQ4 | %u lineitem, %u orders\n", liSize, ordSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(bitmapPSO, s1PSO, s2PSO, liOrderkeyBuf, commitBuf, receiptBuf,
+    releaseAll(bitmapPSO, s1PSO, s2PSO,
+               liOrderkeyBuf, liCommitBuf, liReceiptBuf,
                lateBitmapBuf, ordKeyBuf, ordDateBuf, ordPrioBuf, partialBuf, finalBuf);
 }
 
@@ -158,30 +160,29 @@ void runQ4BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     parseIntColumnChunk(ordFile, ordIndex, 0, ordRows, 0, o_orderkey.data());
     int max_orderkey = 0;
     for (auto k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
-    auto buildT1 = std::chrono::high_resolution_clock::now();
-    double buildMs = std::chrono::duration<double, std::milli>(buildT1 - buildT0).count();
 
     uint bitmap_ints = (max_orderkey + 31) / 32 + 1;
     printf("Late bitmap: %u ints (%.1f MB), max_orderkey=%d\n",
            bitmap_ints, bitmap_ints * sizeof(uint) / (1024.0*1024.0), max_orderkey);
+    auto buildT1 = std::chrono::high_resolution_clock::now();
+    double buildMs = std::chrono::duration<double, std::milli>(buildT1 - buildT0).count();
 
-    MTL::Buffer* lateBitmapBuf = createFilledBuffer(device, bitmap_ints * sizeof(uint), 0);
+    MTL::Buffer* lateBitmapBuf = device->newBuffer(bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(lateBitmapBuf->contents(), 0, bitmap_ints * sizeof(uint));
 
-    // ===== Phase 1: Stream lineitem to build late-delivery bitmap =====
-    size_t liChunkRows = ChunkConfig::adaptiveChunkSize(device, 12, liRows); // 3 int cols × 4 bytes
-    printf("Phase 1 lineitem chunk: %zu rows\n", liChunkRows);
-
-    const int NUM_SLOTS = 2;
+    // ===== Phase 1: Build late-delivery bitmap on GPU via chunked streaming =====
+    size_t liChunkRows = ChunkConfig::adaptiveChunkSize(device, 12, liRows); // orderkey(4)+commit(4)+receipt(4)
+    const int LI_NUM_SLOTS = 2;
     struct LISlot { MTL::Buffer* orderkey; MTL::Buffer* commitdate; MTL::Buffer* receiptdate; };
-    LISlot liSlots[NUM_SLOTS];
-    for (int s = 0; s < NUM_SLOTS; s++) {
+    LISlot liSlots[LI_NUM_SLOTS];
+    for (int s = 0; s < LI_NUM_SLOTS; s++) {
         liSlots[s].orderkey    = device->newBuffer(liChunkRows * sizeof(int), MTL::ResourceStorageModeShared);
         liSlots[s].commitdate  = device->newBuffer(liChunkRows * sizeof(int), MTL::ResourceStorageModeShared);
         liSlots[s].receiptdate = device->newBuffer(liChunkRows * sizeof(int), MTL::ResourceStorageModeShared);
     }
 
-    auto phase1Timing = chunkedStreamLoop(
-        commandQueue, liSlots, NUM_SLOTS, liRows, liChunkRows,
+    auto bitmapTiming = chunkedStreamLoop(
+        commandQueue, liSlots, LI_NUM_SLOTS, liRows, liChunkRows,
         // Parse
         [&](LISlot& slot, size_t startRow, size_t rowCount) {
             parseIntColumnChunk(liFile, liIndex, startRow, rowCount, 0, (int*)slot.orderkey->contents());
@@ -198,22 +199,21 @@ void runQ4BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             enc->setBuffer(lateBitmapBuf, 0, 3);
             enc->setBytes(&chunkSize, sizeof(chunkSize), 4);
             NS::UInteger tgSize = bitmapPSO->maxTotalThreadsPerThreadgroup();
-            if (tgSize > 256) tgSize = 256;
-            enc->dispatchThreadgroups(MTL::Size::Make((chunkSize + tgSize - 1) / tgSize, 1, 1),
-                                      MTL::Size::Make(tgSize, 1, 1));
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (chunkSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
             enc->endEncoding();
             cmdBuf->commit();
         },
-        // No accumulate for bitmap build
-        [&]([[maybe_unused]] uint cs, [[maybe_unused]] size_t cn) {}
+        // No accumulate needed
+        [&]([[maybe_unused]] uint chunkSize, [[maybe_unused]] size_t chunkNum) {}
     );
 
-    // Free lineitem chunk buffers
-    for (int s = 0; s < NUM_SLOTS; s++)
-        releaseAll(liSlots[s].orderkey, liSlots[s].commitdate, liSlots[s].receiptdate);
+    printf("Phase 1 done: bitmap built on GPU in %.1f ms (parse %.1f ms + gpu %.1f ms)\n",
+           bitmapTiming.parseMs + bitmapTiming.gpuMs, bitmapTiming.parseMs, bitmapTiming.gpuMs);
 
-    printf("Phase 1 done: bitmap built in %.1f ms parse + %.1f ms GPU\n",
-           phase1Timing.parseMs, phase1Timing.gpuMs);
+    for (int s = 0; s < LI_NUM_SLOTS; s++)
+        releaseAll(liSlots[s].orderkey, liSlots[s].commitdate, liSlots[s].receiptdate);
 
     // ===== Phase 2: Load orders fully, scan with date filter + bitmap probe =====
     auto ordParseT0 = std::chrono::high_resolution_clock::now();
@@ -273,8 +273,8 @@ void runQ4BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         for (int i = 0; i < 5; i++) printf("| %-16s | %11u |\n", prio_names[i], res[i]);
         printf("+------------------+-------------+\n");
 
-        double allCpuParseMs = indexBuildMs + buildMs + phase1Timing.parseMs + ordParseMs;
-        double allGpuMs = phase1Timing.gpuMs + phase2GpuMs;
+        double allCpuParseMs = indexBuildMs + buildMs + bitmapTiming.parseMs + ordParseMs;
+        double allGpuMs = bitmapTiming.gpuMs + phase2GpuMs;
         printf("\nSF100 Q4 | lineitem=%zu, orders=%zu\n", liRows, ordRows);
         printTimingSummary(allCpuParseMs, allGpuMs, 0.0);
     }

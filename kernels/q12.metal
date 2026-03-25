@@ -81,6 +81,38 @@ kernel void q12_final_count_stage2(
     }
 }
 
+// ===================================================================
+// Pre-computation: Build priority bitmap on GPU
+// Sets bit for each orderkey where o_orderpriority is '1' (1-URGENT) or '2' (2-HIGH)
+// ===================================================================
+kernel void q12_build_priority_bitmap(
+    const device int*   o_orderkey        [[buffer(0)]],
+    const device char*  o_orderpriority   [[buffer(1)]],
+    device atomic_uint* priority_bitmap   [[buffer(2)]],
+    constant uint& data_size              [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= data_size) return;
+    char p = o_orderpriority[tid];
+    if (p == '1' || p == '2') {
+        bitmap_set(priority_bitmap, o_orderkey[tid]);
+    }
+}
+
+kernel void q12_chunked_build_priority_bitmap(
+    const device int*   o_orderkey        [[buffer(0)]],
+    const device char*  o_orderpriority   [[buffer(1)]],
+    device atomic_uint* priority_bitmap   [[buffer(2)]],
+    constant uint& chunk_size             [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= chunk_size) return;
+    char p = o_orderpriority[tid];
+    if (p == '1' || p == '2') {
+        bitmap_set(priority_bitmap, o_orderkey[tid]);
+    }
+}
+
 // --- Chunked variants ---
 kernel void q12_chunked_stage1(
     const device int*   l_orderkey        [[buffer(0)]],
