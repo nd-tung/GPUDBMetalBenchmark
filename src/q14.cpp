@@ -12,14 +12,13 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     // Load part data (pure I/O)
-    auto p_partkey = loadIntColumn(sf_path + "part.tbl", 0);
-    auto p_type    = loadCharColumn(sf_path + "part.tbl", 4, 25);  // up to 25 chars for GPU
+    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {4, ColType::CHAR_FIXED, 25}});
+    auto& p_partkey = pCols.ints(0); auto& p_type = pCols.chars(4);
 
     // Load lineitem columns
-    auto l_partkey       = loadIntColumn(sf_path + "lineitem.tbl", 1);
-    auto l_shipdate      = loadDateColumn(sf_path + "lineitem.tbl", 10);
-    auto l_extendedprice = loadFloatColumn(sf_path + "lineitem.tbl", 5);
-    auto l_discount      = loadFloatColumn(sf_path + "lineitem.tbl", 6);
+    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{1, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
+    auto& l_partkey = lCols.ints(1); auto& l_shipdate = lCols.ints(10);
+    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
     auto q14ParseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(q14ParseEnd - q14ParseStart).count();
 

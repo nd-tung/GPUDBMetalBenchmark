@@ -10,10 +10,14 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     auto q1ParseStart = std::chrono::high_resolution_clock::now();
     const std::string filepath = g_dataset_path + "lineitem.tbl";
-    auto l_returnflag = loadCharColumn(filepath, 8), l_linestatus = loadCharColumn(filepath, 9);
-    auto l_quantity = loadFloatColumn(filepath, 4), l_extendedprice = loadFloatColumn(filepath, 5);
-    auto l_discount = loadFloatColumn(filepath, 6), l_tax = loadFloatColumn(filepath, 7);
-    auto l_shipdate = loadDateColumn(filepath, 10);
+    auto cols = loadColumnsMulti(filepath, {
+        {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {7, ColType::FLOAT},
+        {8, ColType::CHAR1}, {9, ColType::CHAR1}, {10, ColType::DATE}
+    });
+    auto& l_quantity = cols.floats(4); auto& l_extendedprice = cols.floats(5);
+    auto& l_discount = cols.floats(6); auto& l_tax = cols.floats(7);
+    auto& l_returnflag = cols.chars(8); auto& l_linestatus = cols.chars(9);
+    auto& l_shipdate = cols.ints(10);
     auto q1ParseEnd = std::chrono::high_resolution_clock::now();
     double q1CpuParseMs = std::chrono::duration<double, std::milli>(q1ParseEnd - q1ParseStart).count();
     const uint data_size = (uint)l_shipdate.size();
@@ -128,7 +132,7 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
         enc->setBuffer(f_sumDiscountBP, 0, 10);
         enc->setBuffer(f_counts, 0, 11);
         enc->setBytes(&num_threadgroups, sizeof(num_threadgroups), 12);
-        enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size::Make(6, 1, 1), MTL::Size::Make(1024, 1, 1));
         enc->endEncoding();
 
         commandBuffer->commit();

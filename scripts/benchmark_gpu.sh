@@ -13,7 +13,7 @@ BUILD_BIN="$PROJECT_ROOT/build/bin/GPUDBMetalBenchmark"
 LOG_DIR="$RESULTS_DIR/gpu_logs"
 GPU_CSV="$RESULTS_DIR/gpu_results.csv"
 
-QUERIES="Q1 Q3 Q6 Q9 Q13"
+QUERIES="Q1 Q2 Q3 Q4 Q5 Q6 Q7 Q8 Q9 Q10 Q11 Q12 Q13 Q14 Q15 Q16 Q17 Q18 Q19 Q20 Q21 Q22"
 
 if [[ "$SHOW_QUERY_RESULTS" -eq 1 ]]; then
     echo "=== GPU Metal TPC-H Benchmark with Results Export ==="

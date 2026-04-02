@@ -128,7 +128,9 @@ kernel void q1_bins_accumulate_int_stage1(
     }
 }
 
-// Stage 2: Reduce per-threadgroup partials into final 6-bin results (all on GPU).
+// Stage 2: Parallel reduce per-threadgroup partials into final 6-bin results.
+// Dispatched as 6 threadgroups × 1024 threads. Each threadgroup reduces one bin
+// using grid-stride loop + SIMD two-level reduction (no atomics).
 kernel void q1_bins_reduce_int_stage2(
     const device long* p_sum_qty_cents,
     const device long* p_sum_base_cents,
@@ -143,30 +145,45 @@ kernel void q1_bins_reduce_int_stage2(
     device uint* out_sum_discount_bp,
     device uint* out_count,
     constant uint& num_threadgroups,
-    uint index [[thread_position_in_grid]])
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
 {
-    // [AGG-MERGE] Global reduction: single-thread final reduce over all threadgroups
-    if (index != 0) return;
     const uint BINS = 6;
-    for (uint b = 0; b < BINS; ++b) {
-        long s_qty = 0, s_base = 0, s_disc = 0, s_charge = 0;
-        uint s_dbp = 0, s_cnt = 0;
-        for (uint g = 0; g < num_threadgroups; ++g) {
-            uint idx = g * BINS + b;
-            s_qty    += p_sum_qty_cents[idx];
-            s_base   += p_sum_base_cents[idx];
-            s_disc   += p_sum_disc_price_cents[idx];
-            s_charge += p_sum_charge_cents[idx];
-            s_dbp    += p_sum_discount_bp[idx];
-            s_cnt    += p_count[idx];
-        }
-        out_sum_qty_cents[b]        = s_qty;
-        out_sum_base_cents[b]       = s_base;
-        out_sum_disc_price_cents[b] = s_disc;
-        out_sum_charge_cents[b]     = s_charge;
-        out_sum_discount_bp[b]      = s_dbp;
-        out_count[b]                = s_cnt;
+    uint b = group_id; // one threadgroup per bin
+
+    // Grid-stride accumulation across threadgroups' partials for this bin
+    long s_qty = 0, s_base = 0, s_disc = 0, s_charge = 0;
+    uint s_dbp = 0, s_cnt = 0;
+    for (uint g = tid; g < num_threadgroups; g += tg_size) {
+        uint idx = g * BINS + b;
+        s_qty    += p_sum_qty_cents[idx];
+        s_base   += p_sum_base_cents[idx];
+        s_disc   += p_sum_disc_price_cents[idx];
+        s_charge += p_sum_charge_cents[idx];
+        s_dbp    += p_sum_discount_bp[idx];
+        s_cnt    += p_count[idx];
     }
+
+    // Two-level SIMD + threadgroup reduction
+    threadgroup long tg64[32];
+    threadgroup uint tg32[32];
+
+    long r;
+    r = tg_reduce_long(s_qty, tid, tg_size, tg64);
+    if (tid == 0) out_sum_qty_cents[b] = r;
+    r = tg_reduce_long(s_base, tid, tg_size, tg64);
+    if (tid == 0) out_sum_base_cents[b] = r;
+    r = tg_reduce_long(s_disc, tid, tg_size, tg64);
+    if (tid == 0) out_sum_disc_price_cents[b] = r;
+    r = tg_reduce_long(s_charge, tid, tg_size, tg64);
+    if (tid == 0) out_sum_charge_cents[b] = r;
+
+    uint u;
+    u = tg_reduce_uint(s_dbp, tid, tg_size, tg32);
+    if (tid == 0) out_sum_discount_bp[b] = u;
+    u = tg_reduce_uint(s_cnt, tid, tg_size, tg32);
+    if (tid == 0) out_count[b] = u;
 }
 
 // ===================================================================

@@ -11,18 +11,16 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     // 1. Load data for all three tables
     auto q3ParseStart = std::chrono::high_resolution_clock::now();
     const std::string sf_path = g_dataset_path;
-    auto c_custkey = loadIntColumn(sf_path + "customer.tbl", 0);
-    auto c_mktsegment = loadCharColumn(sf_path + "customer.tbl", 6);
+    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}, {6, ColType::CHAR1}});
+    auto& c_custkey = cCols.ints(0); auto& c_mktsegment = cCols.chars(6);
 
-    auto o_orderkey = loadIntColumn(sf_path + "orders.tbl", 0);
-    auto o_custkey = loadIntColumn(sf_path + "orders.tbl", 1);
-    auto o_orderdate = loadDateColumn(sf_path + "orders.tbl", 4);
-    auto o_shippriority = loadIntColumn(sf_path + "orders.tbl", 7);
+    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}, {7, ColType::INT}});
+    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1);
+    auto& o_orderdate = oCols.ints(4); auto& o_shippriority = oCols.ints(7);
 
-    auto l_orderkey = loadIntColumn(sf_path + "lineitem.tbl", 0);
-    auto l_shipdate = loadDateColumn(sf_path + "lineitem.tbl", 10);
-    auto l_extendedprice = loadFloatColumn(sf_path + "lineitem.tbl", 5);
-    auto l_discount = loadFloatColumn(sf_path + "lineitem.tbl", 6);
+    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
+    auto& l_orderkey = lCols.ints(0); auto& l_shipdate = lCols.ints(10);
+    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
     auto q3ParseEnd = std::chrono::high_resolution_clock::now();
     double q3CpuParseMs = std::chrono::duration<double, std::milli>(q3ParseEnd - q3ParseStart).count();
     

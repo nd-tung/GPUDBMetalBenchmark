@@ -10,10 +10,11 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     
     // Load required columns from lineitem table
     auto q6ParseStart = std::chrono::high_resolution_clock::now();
-    std::vector<int> l_shipdate = loadDateColumn(g_dataset_path + "lineitem.tbl", 10);    // Column 10: l_shipdate
-    std::vector<float> l_discount = loadFloatColumn(g_dataset_path + "lineitem.tbl", 6);  // Column 6: l_discount
-    std::vector<float> l_quantity = loadFloatColumn(g_dataset_path + "lineitem.tbl", 4);  // Column 4: l_quantity
-    std::vector<float> l_extendedprice = loadFloatColumn(g_dataset_path + "lineitem.tbl", 5); // Column 5: l_extendedprice
+    auto cols = loadColumnsMulti(g_dataset_path + "lineitem.tbl", {
+        {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}
+    });
+    auto& l_quantity = cols.floats(4); auto& l_extendedprice = cols.floats(5);
+    auto& l_discount = cols.floats(6); auto& l_shipdate = cols.ints(10);
     auto q6ParseEnd = std::chrono::high_resolution_clock::now();
     double q6CpuParseMs = std::chrono::duration<double, std::milli>(q6ParseEnd - q6ParseStart).count();
 

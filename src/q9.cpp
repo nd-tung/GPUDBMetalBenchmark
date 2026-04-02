@@ -12,28 +12,24 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     
     // 1. Load data for all SIX tables
     auto q9ParseStart = std::chrono::high_resolution_clock::now();
-    auto p_partkey = loadIntColumn(sf_path + "part.tbl", 0);
-    auto p_name = loadCharColumn(sf_path + "part.tbl", 1, 55);
-    auto s_suppkey = loadIntColumn(sf_path + "supplier.tbl", 0);
-    auto s_nationkey = loadIntColumn(sf_path + "supplier.tbl", 3);
-    auto l_partkey = loadIntColumn(sf_path + "lineitem.tbl", 1);
-    auto l_suppkey = loadIntColumn(sf_path + "lineitem.tbl", 2);
-    auto l_orderkey = loadIntColumn(sf_path + "lineitem.tbl", 0);
-    auto l_quantity = loadFloatColumn(sf_path + "lineitem.tbl", 4);
-    auto l_extendedprice = loadFloatColumn(sf_path + "lineitem.tbl", 5);
-    auto l_discount = loadFloatColumn(sf_path + "lineitem.tbl", 6);
-    auto ps_partkey = loadIntColumn(sf_path + "partsupp.tbl", 0);
-    auto ps_suppkey = loadIntColumn(sf_path + "partsupp.tbl", 1);
-    auto ps_supplycost = loadFloatColumn(sf_path + "partsupp.tbl", 3);
-    auto o_orderkey = loadIntColumn(sf_path + "orders.tbl", 0);
-    auto o_orderdate = loadDateColumn(sf_path + "orders.tbl", 4);
-    auto n_nationkey = loadIntColumn(sf_path + "nation.tbl", 0);
-    auto n_name = loadCharColumn(sf_path + "nation.tbl", 1, 25);
+    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}});
+    auto& p_partkey = pCols.ints(0); auto& p_name = pCols.chars(1);
+    auto s = loadSupplierBasic(sf_path);
+    auto& s_suppkey = s.suppkey;
+    auto& s_nationkey = s.nationkey;
+    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
+    auto& l_orderkey = lCols.ints(0); auto& l_partkey = lCols.ints(1); auto& l_suppkey = lCols.ints(2);
+    auto& l_quantity = lCols.floats(4); auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto psCols = loadColumnsMulti(sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
+    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1); auto& ps_supplycost = psCols.floats(3);
+    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {4, ColType::DATE}});
+    auto& o_orderkey = oCols.ints(0); auto& o_orderdate = oCols.ints(4);
+    auto nat = loadNation(sf_path);
     auto q9ParseEnd = std::chrono::high_resolution_clock::now();
     double q9CpuParseMs = std::chrono::duration<double, std::milli>(q9ParseEnd - q9ParseStart).count();
 
     // Create a map for nation names
-    auto nation_names = buildNationNames(n_nationkey, n_name.data(), 25);
+    auto nation_names = buildNationNames(nat.nationkey, nat.name.data(), NationData::NAME_WIDTH);
     
     // Get sizes
     const uint part_size = (uint)p_partkey.size(), supplier_size = (uint)s_suppkey.size(), lineitem_size = (uint)l_partkey.size();
@@ -94,7 +90,7 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     // Dummy size for compatibility
     const uint supplier_ht_size = 0;
     
-    const uint partsupp_ht_size = nextPow2(partsupp_size * 4); // power-of-2 for bitwise AND probing
+    const uint partsupp_ht_size = nextPow2(partsupp_size); // power-of-2 for bitwise AND probing
     // PartSuppEntry has 4 ints (partkey, suppkey, idx, pad); initialize all to -1 to mark empty
     std::vector<int> cpu_partsupp_ht(partsupp_ht_size * 4, -1);
     MTL::Buffer* pPsPartKeyBuffer = pDevice->newBuffer(ps_partkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
@@ -195,20 +191,8 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         
         pBuildEnc->endEncoding();
 
-        // Ensure build phase is complete before probe phase
-        pCommandBuffer->commit();
-        pCommandBuffer->waitUntilCompleted();
-        
-        double buildTime = 0;
-        if (iter == 2) {
-            buildTime = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
-        }
-        
-        // Restart command buffer for probe phase
-        pCommandBuffer = pCommandQueue->commandBuffer();
-
         // Encoder 2: Probe & Merge Phase (Stages 5-6)
-        // Splitting encoders ensures memory consistency between builds and probe
+        // Encoder boundary provides memory barrier — no need for separate command buffer
         MTL::ComputeCommandEncoder* pProbeEnc = pCommandBuffer->computeCommandEncoder();
         
         // Stage 5: Probe + local aggregation
@@ -240,8 +224,7 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         pCommandBuffer->waitUntilCompleted();
         
         if (iter == 2) {
-            double probeTime = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
-            q9_gpu_compute_time = buildTime + probeTime;
+            q9_gpu_compute_time = pCommandBuffer->GPUEndTime() - pCommandBuffer->GPUStartTime();
         }
     }
 

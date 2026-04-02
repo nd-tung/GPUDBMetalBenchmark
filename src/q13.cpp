@@ -13,9 +13,10 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
     
     // 1. Load data (pure I/O)
     auto q13ParseStart = std::chrono::high_resolution_clock::now();
-    auto o_custkey = loadIntColumn(sf_path + "orders.tbl", 1);
-    auto o_comment = loadCharColumn(sf_path + "orders.tbl", 8, 80);  // fixed 80 chars for GPU
-    auto c_custkey = loadIntColumn(sf_path + "customer.tbl", 0);
+    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{1, ColType::INT}, {8, ColType::CHAR_FIXED, 80}});
+    auto& o_custkey = oCols.ints(1); auto& o_comment = oCols.chars(8);
+    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}});
+    auto& c_custkey = cCols.ints(0);
     auto q13ParseEnd = std::chrono::high_resolution_clock::now();
     double q13CpuParseMs = std::chrono::duration<double, std::milli>(q13ParseEnd - q13ParseStart).count();
 

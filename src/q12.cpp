@@ -12,15 +12,13 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     // Load orders columns for priority bitmap (pure I/O)
-    auto o_orderkey      = loadIntColumn(sf_path + "orders.tbl", 0);
-    auto o_orderpriority = loadCharColumn(sf_path + "orders.tbl", 5);
+    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {5, ColType::CHAR1}});
+    auto& o_orderkey = oCols.ints(0); auto& o_orderpriority = oCols.chars(5);
 
     // Load lineitem columns
-    auto l_orderkey    = loadIntColumn(sf_path + "lineitem.tbl", 0);
-    auto l_shipmode    = loadCharColumn(sf_path + "lineitem.tbl", 14);  // first char
-    auto l_shipdate    = loadDateColumn(sf_path + "lineitem.tbl", 10);
-    auto l_commitdate  = loadDateColumn(sf_path + "lineitem.tbl", 11);
-    auto l_receiptdate = loadDateColumn(sf_path + "lineitem.tbl", 12);
+    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {10, ColType::DATE}, {11, ColType::DATE}, {12, ColType::DATE}, {14, ColType::CHAR1}});
+    auto& l_orderkey = lCols.ints(0); auto& l_shipmode = lCols.chars(14);
+    auto& l_shipdate = lCols.ints(10); auto& l_commitdate = lCols.ints(11); auto& l_receiptdate = lCols.ints(12);
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 

@@ -12,14 +12,12 @@ void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     const std::string sf_path = g_dataset_path;
 
     // Load lineitem columns for late-delivery bitmap
-    auto l_orderkey    = loadIntColumn(sf_path + "lineitem.tbl", 0);
-    auto l_commitdate  = loadDateColumn(sf_path + "lineitem.tbl", 11);
-    auto l_receiptdate = loadDateColumn(sf_path + "lineitem.tbl", 12);
+    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {11, ColType::DATE}, {12, ColType::DATE}});
+    auto& l_orderkey = lCols.ints(0); auto& l_commitdate = lCols.ints(11); auto& l_receiptdate = lCols.ints(12);
 
     // Load orders columns
-    auto o_orderkey      = loadIntColumn(sf_path + "orders.tbl", 0);
-    auto o_orderdate     = loadDateColumn(sf_path + "orders.tbl", 4);
-    auto o_orderpriority = loadCharColumn(sf_path + "orders.tbl", 5);  // first char
+    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {4, ColType::DATE}, {5, ColType::CHAR1}});
+    auto& o_orderkey = oCols.ints(0); auto& o_orderdate = oCols.ints(4); auto& o_orderpriority = oCols.chars(5);
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 

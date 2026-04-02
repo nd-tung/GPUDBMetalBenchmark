@@ -93,6 +93,16 @@ struct HashTableEntry {
 };
 
 // ===================================================================
+// DATE RANGE HELPERS (YYYYMMDD integer dates)
+// ===================================================================
+
+// Half-open: date in [lo, hi)  — standard for year ranges
+inline bool date_in_range_ho(int date, int lo, int hi) { return date >= lo && date < hi; }
+
+// Closed:   date in [lo, hi]  — for inclusive end dates
+inline bool date_in_range(int date, int lo, int hi) { return date >= lo && date <= hi; }
+
+// ===================================================================
 // BITMAP HELPERS
 // ===================================================================
 

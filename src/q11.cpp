@@ -13,16 +13,15 @@ void runQ11Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     // 1. Load data
     auto parseStart = std::chrono::high_resolution_clock::now();
 
-    auto n_nationkey = loadIntColumn(sf_path + "nation.tbl", 0);
-    auto n_name = loadCharColumn(sf_path + "nation.tbl", 1, 25);
+    auto nat = loadNation(sf_path);
 
-    auto s_suppkey = loadIntColumn(sf_path + "supplier.tbl", 0);
-    auto s_nationkey = loadIntColumn(sf_path + "supplier.tbl", 3);
+    auto s = loadSupplierBasic(sf_path);
+    auto& s_suppkey = s.suppkey;
+    auto& s_nationkey = s.nationkey;
 
-    auto ps_partkey = loadIntColumn(sf_path + "partsupp.tbl", 0);
-    auto ps_suppkey = loadIntColumn(sf_path + "partsupp.tbl", 1);
-    auto ps_availqty = loadIntColumn(sf_path + "partsupp.tbl", 2);
-    auto ps_supplycost = loadFloatColumn(sf_path + "partsupp.tbl", 3);
+    auto psCols = loadColumnsMulti(sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {3, ColType::FLOAT}});
+    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1);
+    auto& ps_availqty = psCols.ints(2); auto& ps_supplycost = psCols.floats(3);
 
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
@@ -32,13 +31,7 @@ void runQ11Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     std::cout << "Loaded data. PartSupp: " << partsupp_size << ", Supplier: " << supplier_size << std::endl;
 
     // 2. CPU: Find GERMANY nationkey, build supplier bitmap
-    int germany_nationkey = -1;
-    for (size_t i = 0; i < n_nationkey.size(); i++) {
-        if (trimFixed(n_name.data(), i, 25) == "GERMANY") {
-            germany_nationkey = n_nationkey[i];
-            break;
-        }
-    }
+    int germany_nationkey = findNationKey(nat, "GERMANY");
     if (germany_nationkey == -1) {
         std::cerr << "Error: GERMANY not found in nation table" << std::endl;
         return;

@@ -228,6 +228,138 @@ inline uint buildNationBitmap(const std::vector<int>& nationkeys,
     return bitmap;
 }
 
+// ===================================================================
+// MULTI-COLUMN SINGLE-PASS LOADER (for SF1/SF10)
+// ===================================================================
+
+enum class ColType { INT, FLOAT, DATE, CHAR1, CHAR_FIXED };
+
+struct ColSpec {
+    int          columnIndex;
+    ColType      type;
+    int          fixedWidth;  // only for CHAR_FIXED
+    
+    ColSpec(int idx, ColType t, int fw = 0) : columnIndex(idx), type(t), fixedWidth(fw) {}
+};
+
+struct LoadedColumns {
+    std::vector<std::vector<int>>   intCols;
+    std::vector<std::vector<float>> floatCols;
+    std::vector<std::vector<char>>  charCols;
+    
+    // Maps from (columnIndex, type) → index into intCols/floatCols/charCols
+    std::unordered_map<int, size_t> intMap, floatMap, charMap;
+    
+    const std::vector<int>&   ints(int col)   const { return intCols[intMap.at(col)]; }
+    const std::vector<float>& floats(int col) const { return floatCols[floatMap.at(col)]; }
+    const std::vector<char>&  chars(int col)  const { return charCols[charMap.at(col)]; }
+    
+    std::vector<int>&   ints(int col)   { return intCols[intMap.at(col)]; }
+    std::vector<float>& floats(int col) { return floatCols[floatMap.at(col)]; }
+    std::vector<char>&  chars(int col)  { return charCols[charMap.at(col)]; }
+};
+
+inline LoadedColumns loadColumnsMulti(const std::string& filePath, const std::vector<ColSpec>& specs) {
+    LoadedColumns result;
+    
+    // Pre-allocate storage slots and build maps
+    struct ColHandler {
+        int    columnIndex;
+        ColType type;
+        int    fixedWidth;
+        size_t storageIdx;
+    };
+    std::vector<ColHandler> handlers;
+    int maxCol = 0;
+    
+    for (const auto& s : specs) {
+        ColHandler h;
+        h.columnIndex = s.columnIndex;
+        h.type = s.type;
+        h.fixedWidth = s.fixedWidth;
+        maxCol = std::max(maxCol, s.columnIndex);
+        
+        switch (s.type) {
+            case ColType::INT:
+            case ColType::DATE:
+                h.storageIdx = result.intCols.size();
+                result.intMap[s.columnIndex] = h.storageIdx;
+                result.intCols.emplace_back();
+                break;
+            case ColType::FLOAT:
+                h.storageIdx = result.floatCols.size();
+                result.floatMap[s.columnIndex] = h.storageIdx;
+                result.floatCols.emplace_back();
+                break;
+            case ColType::CHAR1:
+            case ColType::CHAR_FIXED:
+                h.storageIdx = result.charCols.size();
+                result.charMap[s.columnIndex] = h.storageIdx;
+                result.charCols.emplace_back();
+                break;
+        }
+        handlers.push_back(h);
+    }
+    
+    // Build fast lookup: columnIndex → handler index
+    std::vector<int> colToHandler(maxCol + 1, -1);
+    for (size_t i = 0; i < handlers.size(); i++)
+        colToHandler[handlers[i].columnIndex] = (int)i;
+    
+    std::ifstream file(filePath);
+    if (!file.is_open()) { std::cerr << "Error: Could not open file " << filePath << std::endl; return result; }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        int col = 0;
+        size_t start = 0;
+        size_t end = line.find('|');
+        while (end != std::string::npos && col <= maxCol) {
+            if (colToHandler[col] >= 0) {
+                auto& h = handlers[colToHandler[col]];
+                const char* tok = line.c_str() + start;
+                size_t tokLen = end - start;
+                
+                switch (h.type) {
+                    case ColType::INT:
+                        result.intCols[h.storageIdx].push_back(atoi(tok));
+                        break;
+                    case ColType::FLOAT:
+                        result.floatCols[h.storageIdx].push_back(strtof(tok, nullptr));
+                        break;
+                    case ColType::DATE: {
+                        // Parse YYYY-MM-DD without string copies
+                        int y = 0, m = 0, d = 0;
+                        const char* p = tok;
+                        const char* tokEnd = tok + tokLen;
+                        while (p < tokEnd && *p >= '0' && *p <= '9') { y = y * 10 + (*p - '0'); p++; }
+                        if (p < tokEnd) p++; // skip '-'
+                        while (p < tokEnd && *p >= '0' && *p <= '9') { m = m * 10 + (*p - '0'); p++; }
+                        if (p < tokEnd) p++; // skip '-'
+                        while (p < tokEnd && *p >= '0' && *p <= '9') { d = d * 10 + (*p - '0'); p++; }
+                        result.intCols[h.storageIdx].push_back(y * 10000 + m * 100 + d);
+                        break;
+                    }
+                    case ColType::CHAR1:
+                        result.charCols[h.storageIdx].push_back(tokLen > 0 ? tok[0] : '\0');
+                        break;
+                    case ColType::CHAR_FIXED: {
+                        auto& v = result.charCols[h.storageIdx];
+                        int cp = (int)tokLen < h.fixedWidth ? (int)tokLen : h.fixedWidth;
+                        v.insert(v.end(), tok, tok + cp);
+                        v.insert(v.end(), h.fixedWidth - cp, '\0');
+                        break;
+                    }
+                }
+            }
+            start = end + 1;
+            end = line.find('|', start);
+            col++;
+        }
+    }
+    return result;
+}
+
 // --- Standard Column Loaders (file-based, for SF1/SF10) ---
 template<typename T, typename ParseFn>
 inline std::vector<T> loadColumn(const std::string& filePath, int columnIndex, ParseFn parse) {
@@ -275,6 +407,105 @@ inline std::vector<char> loadCharColumn(const std::string& filePath, int columnI
     }
     return data;
 }
+
+// ===================================================================
+// SHARED TABLE LOADERS
+// ===================================================================
+
+// --- Nation Table ---
+struct NationData {
+    std::vector<int>  nationkey;
+    std::vector<char> name;      // fixed-width 25 chars per row
+    std::vector<int>  regionkey;
+    static constexpr int NAME_WIDTH = 25;
+};
+
+inline NationData loadNation(const std::string& sf_path, bool with_regionkey = false) {
+    NationData d;
+    std::vector<ColSpec> specs = {{0, ColType::INT}, {1, ColType::CHAR_FIXED, NationData::NAME_WIDTH}};
+    if (with_regionkey) specs.push_back({2, ColType::INT});
+    auto cols = loadColumnsMulti(sf_path + "nation.tbl", specs);
+    d.nationkey = std::move(cols.ints(0));
+    d.name      = std::move(cols.chars(1));
+    if (with_regionkey) d.regionkey = std::move(cols.ints(2));
+    return d;
+}
+
+// --- Region Table ---
+struct RegionData {
+    std::vector<int>  regionkey;
+    std::vector<char> name;
+    static constexpr int NAME_WIDTH = 25;
+};
+
+inline RegionData loadRegion(const std::string& sf_path) {
+    RegionData d;
+    auto cols = loadColumnsMulti(sf_path + "region.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, RegionData::NAME_WIDTH}});
+    d.regionkey = std::move(cols.ints(0));
+    d.name      = std::move(cols.chars(1));
+    return d;
+}
+
+// --- Supplier Table (basic: suppkey + nationkey) ---
+struct SupplierBasic {
+    std::vector<int> suppkey;
+    std::vector<int> nationkey;
+};
+
+inline SupplierBasic loadSupplierBasic(const std::string& sf_path) {
+    SupplierBasic d;
+    auto cols = loadColumnsMulti(sf_path + "supplier.tbl", {{0, ColType::INT}, {3, ColType::INT}});
+    d.suppkey   = std::move(cols.ints(0));
+    d.nationkey = std::move(cols.ints(3));
+    return d;
+}
+
+// --- Single nation key lookup by name ---
+inline int findNationKey(const NationData& nat, const std::string& target) {
+    for (size_t i = 0; i < nat.nationkey.size(); i++)
+        if (trimFixed(nat.name.data(), i, NationData::NAME_WIDTH) == target) return nat.nationkey[i];
+    return -1;
+}
+
+// --- CPU Bitmap Builder ---
+// Builds a bitmap for keys satisfying a predicate. Returns (bitmap_vector, bitmap_ints, max_key).
+struct CPUBitmap {
+    std::vector<uint> data;
+    uint ints;
+    int max_key;
+};
+
+template<typename Pred>
+inline CPUBitmap buildCPUBitmap(const std::vector<int>& keys, Pred pred) {
+    CPUBitmap b;
+    b.max_key = 0;
+    for (int k : keys) b.max_key = std::max(b.max_key, k);
+    b.ints = (b.max_key + 31) / 32 + 1;
+    b.data.assign(b.ints, 0);
+    for (size_t i = 0; i < keys.size(); i++) {
+        if (pred(i)) {
+            int k = keys[i];
+            b.data[k / 32] |= (1u << (k % 32));
+        }
+    }
+    return b;
+}
+
+// Overload: bitmap where every key qualifies (no predicate).
+inline CPUBitmap buildCPUBitmap(const std::vector<int>& keys) {
+    return buildCPUBitmap(keys, [](size_t) { return true; });
+}
+
+// Upload a CPU bitmap to a Metal buffer (caller must release).
+inline MTL::Buffer* uploadBitmap(MTL::Device* device, const CPUBitmap& bm) {
+    auto buf = device->newBuffer(bm.ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    memcpy(buf->contents(), bm.data.data(), bm.ints * sizeof(uint));
+    return buf;
+}
+
+// ===================================================================
+// TIMING & BUFFER HELPERS
+// ===================================================================
 
 // --- Timing Summary ---
 inline void printTimingSummary(double parseMs, double gpuMs, double postMs) {
@@ -652,6 +883,16 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 void runQ19Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 void runQ11Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ7Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ8Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ10Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ15Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ16Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ18Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ20Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ21Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ22Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 
 void runQ1BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 void runQ2BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
@@ -665,6 +906,16 @@ void runQ13BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
 void runQ14BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 void runQ19BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 void runQ11BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ7BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ8BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ10BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ15BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ16BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ17BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ18BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ20BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ21BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
+void runQ22BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 
 void runSelectionBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);
 void runAggregationBenchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library);

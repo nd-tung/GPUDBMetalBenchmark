@@ -20,7 +20,17 @@ static void showHelp() {
     std::cout << "  q12           - Run TPC-H Query 12 (Shipping Modes & Order Priority)" << std::endl;
     std::cout << "  q13           - Run TPC-H Query 13 (Customer Distribution)" << std::endl;
     std::cout << "  q14           - Run TPC-H Query 14 (Promotion Effect)" << std::endl;
+    std::cout << "  q7            - Run TPC-H Query 7 (Volume Shipping)" << std::endl;
+    std::cout << "  q8            - Run TPC-H Query 8 (National Market Share)" << std::endl;
+    std::cout << "  q10           - Run TPC-H Query 10 (Returned Item Reporting)" << std::endl;
+    std::cout << "  q15           - Run TPC-H Query 15 (Top Supplier)" << std::endl;
+    std::cout << "  q16           - Run TPC-H Query 16 (Parts/Supplier Relationship)" << std::endl;
+    std::cout << "  q17           - Run TPC-H Query 17 (Small-Quantity-Order Revenue)" << std::endl;
+    std::cout << "  q18           - Run TPC-H Query 18 (Large Volume Customer)" << std::endl;
     std::cout << "  q19           - Run TPC-H Query 19 (Discounted Revenue)" << std::endl;
+    std::cout << "  q20           - Run TPC-H Query 20 (Potential Part Promotion)" << std::endl;
+    std::cout << "  q21           - Run TPC-H Query 21 (Suppliers Who Kept Orders Waiting)" << std::endl;
+    std::cout << "  q22           - Run TPC-H Query 22 (Global Sales Opportunity)" << std::endl;
     std::cout << "  help          - Show this help message" << std::endl;
     std::cout << "" << std::endl;
     std::cout << "Scale Factors:" << std::endl;
@@ -101,7 +111,17 @@ int main(int argc, const char * argv[]) {
             "kernels/q13.metal",
             "kernels/q14.metal",
             "kernels/q19.metal",
-            "kernels/q11.metal"
+            "kernels/q11.metal",
+            "kernels/q7.metal",
+            "kernels/q8.metal",
+            "kernels/q10.metal",
+            "kernels/q15.metal",
+            "kernels/q16.metal",
+            "kernels/q17.metal",
+            "kernels/q18.metal",
+            "kernels/q20.metal",
+            "kernels/q21.metal",
+            "kernels/q22.metal"
         };
         std::string metalSource;
         bool allFilesRead = true;
@@ -144,7 +164,12 @@ int main(int argc, const char * argv[]) {
         {"q9", runQ9BenchmarkSF100}, {"q12", runQ12BenchmarkSF100},
         {"q13", runQ13BenchmarkSF100}, {"q14", runQ14BenchmarkSF100},
         {"q19", runQ19BenchmarkSF100},
-        {"q11", runQ11BenchmarkSF100}
+        {"q11", runQ11BenchmarkSF100},
+        {"q7", runQ7BenchmarkSF100}, {"q8", runQ8BenchmarkSF100},
+        {"q10", runQ10BenchmarkSF100}, {"q15", runQ15BenchmarkSF100},
+        {"q16", runQ16BenchmarkSF100}, {"q17", runQ17BenchmarkSF100},
+        {"q18", runQ18BenchmarkSF100}, {"q20", runQ20BenchmarkSF100},
+        {"q21", runQ21BenchmarkSF100}, {"q22", runQ22BenchmarkSF100}
     };
     std::vector<BenchEntry> std_benchmarks = {
         {"selection", runSelectionBenchmark}, {"aggregation", runAggregationBenchmark},
@@ -153,7 +178,12 @@ int main(int argc, const char * argv[]) {
         {"q4", runQ4Benchmark}, {"q5", runQ5Benchmark}, {"q6", runQ6Benchmark},
         {"q9", runQ9Benchmark}, {"q12", runQ12Benchmark}, {"q13", runQ13Benchmark},
         {"q14", runQ14Benchmark}, {"q19", runQ19Benchmark},
-        {"q11", runQ11Benchmark}
+        {"q11", runQ11Benchmark},
+        {"q7", runQ7Benchmark}, {"q8", runQ8Benchmark},
+        {"q10", runQ10Benchmark}, {"q15", runQ15Benchmark},
+        {"q16", runQ16Benchmark}, {"q17", runQ17Benchmark},
+        {"q18", runQ18Benchmark}, {"q20", runQ20Benchmark},
+        {"q21", runQ21Benchmark}, {"q22", runQ22Benchmark}
     };
 
     auto& benchmarks = g_sf100_mode ? sf100_benchmarks : std_benchmarks;

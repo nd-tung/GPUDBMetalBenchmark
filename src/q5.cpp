@@ -12,27 +12,22 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     // 1. Load data
     auto q5ParseStart = std::chrono::high_resolution_clock::now();
-    auto c_custkey = loadIntColumn(sf_path + "customer.tbl", 0);
-    auto c_nationkey = loadIntColumn(sf_path + "customer.tbl", 3);
+    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
+    auto& c_custkey = cCols.ints(0); auto& c_nationkey = cCols.ints(3);
 
-    auto s_suppkey = loadIntColumn(sf_path + "supplier.tbl", 0);
-    auto s_nationkey = loadIntColumn(sf_path + "supplier.tbl", 3);
+    auto s = loadSupplierBasic(sf_path);
+    auto& s_suppkey = s.suppkey;
+    auto& s_nationkey = s.nationkey;
 
-    auto o_orderkey = loadIntColumn(sf_path + "orders.tbl", 0);
-    auto o_custkey = loadIntColumn(sf_path + "orders.tbl", 1);
-    auto o_orderdate = loadDateColumn(sf_path + "orders.tbl", 4);
+    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
+    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1); auto& o_orderdate = oCols.ints(4);
 
-    auto l_orderkey = loadIntColumn(sf_path + "lineitem.tbl", 0);
-    auto l_suppkey = loadIntColumn(sf_path + "lineitem.tbl", 2);
-    auto l_extendedprice = loadFloatColumn(sf_path + "lineitem.tbl", 5);
-    auto l_discount = loadFloatColumn(sf_path + "lineitem.tbl", 6);
+    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
+    auto& l_orderkey = lCols.ints(0); auto& l_suppkey = lCols.ints(2);
+    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
 
-    auto n_nationkey = loadIntColumn(sf_path + "nation.tbl", 0);
-    auto n_name = loadCharColumn(sf_path + "nation.tbl", 1, 25);
-    auto n_regionkey = loadIntColumn(sf_path + "nation.tbl", 2);
-
-    auto r_regionkey = loadIntColumn(sf_path + "region.tbl", 0);
-    auto r_name = loadCharColumn(sf_path + "region.tbl", 1, 25);
+    auto nat = loadNation(sf_path, true);
+    auto reg = loadRegion(sf_path);
     auto q5ParseEnd = std::chrono::high_resolution_clock::now();
     double q5CpuParseMs = std::chrono::duration<double, std::milli>(q5ParseEnd - q5ParseStart).count();
 
@@ -44,15 +39,15 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
               << ", Orders: " << orders_size << ", Lineitem: " << lineitem_size << std::endl;
 
     // 2. CPU: Identify ASIA nations -> build nation bitmap
-    int asia_regionkey = findRegionKey(r_regionkey, r_name.data(), 25, "ASIA");
+    int asia_regionkey = findRegionKey(reg.regionkey, reg.name.data(), RegionData::NAME_WIDTH, "ASIA");
     if (asia_regionkey == -1) {
         std::cerr << "Error: ASIA region not found" << std::endl;
         return;
     }
 
     // Build nation name map
-    auto nation_names = buildNationNames(n_nationkey, n_name.data(), 25);
-    uint cpu_nation_bitmap = buildNationBitmap(n_nationkey, n_regionkey, asia_regionkey);
+    auto nation_names = buildNationNames(nat.nationkey, nat.name.data(), NationData::NAME_WIDTH);
+    uint cpu_nation_bitmap = buildNationBitmap(nat.nationkey, nat.regionkey, asia_regionkey);
 
     // 3. Setup GPU kernels
     auto pCustMapPipe = createPipeline(pDevice, pLibrary, "q5_build_customer_nation_map_kernel");

@@ -12,29 +12,25 @@ void runQ2Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     // 1. Load data
     auto q2ParseStart = std::chrono::high_resolution_clock::now();
-    auto p_partkey = loadIntColumn(sf_path + "part.tbl", 0);
-    auto p_size = loadIntColumn(sf_path + "part.tbl", 5);
-    auto p_type = loadCharColumn(sf_path + "part.tbl", 4, 25);
-    auto p_mfgr = loadCharColumn(sf_path + "part.tbl", 2, 25);
+    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {2, ColType::CHAR_FIXED, 25}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
+    auto& p_partkey = pCols.ints(0); auto& p_mfgr = pCols.chars(2); auto& p_type = pCols.chars(4); auto& p_size = pCols.ints(5);
 
-    auto s_suppkey = loadIntColumn(sf_path + "supplier.tbl", 0);
-    auto s_name = loadCharColumn(sf_path + "supplier.tbl", 1, 25);
-    auto s_address = loadCharColumn(sf_path + "supplier.tbl", 2, 40);
-    auto s_nationkey = loadIntColumn(sf_path + "supplier.tbl", 3);
-    auto s_phone = loadCharColumn(sf_path + "supplier.tbl", 4, 15);
-    auto s_acctbal = loadFloatColumn(sf_path + "supplier.tbl", 5);
-    auto s_comment = loadCharColumn(sf_path + "supplier.tbl", 6, 101);
+    auto sCols = loadColumnsMulti(sf_path + "supplier.tbl", {
+        {0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40},
+        {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT}, {6, ColType::CHAR_FIXED, 101}
+    });
+    auto& s_suppkey = sCols.ints(0); auto& s_name = sCols.chars(1); auto& s_address = sCols.chars(2);
+    auto& s_nationkey = sCols.ints(3); auto& s_phone = sCols.chars(4); auto& s_acctbal = sCols.floats(5);
+    auto& s_comment = sCols.chars(6);
 
-    auto ps_partkey = loadIntColumn(sf_path + "partsupp.tbl", 0);
-    auto ps_suppkey = loadIntColumn(sf_path + "partsupp.tbl", 1);
-    auto ps_supplycost = loadFloatColumn(sf_path + "partsupp.tbl", 3);
+    auto psCols = loadColumnsMulti(sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
+    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1); auto& ps_supplycost = psCols.floats(3);
 
-    auto n_nationkey = loadIntColumn(sf_path + "nation.tbl", 0);
-    auto n_name = loadCharColumn(sf_path + "nation.tbl", 1, 25);
-    auto n_regionkey = loadIntColumn(sf_path + "nation.tbl", 2);
+    auto nCols = loadColumnsMulti(sf_path + "nation.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::INT}});
+    auto& n_nationkey = nCols.ints(0); auto& n_name = nCols.chars(1); auto& n_regionkey = nCols.ints(2);
 
-    auto r_regionkey = loadIntColumn(sf_path + "region.tbl", 0);
-    auto r_name = loadCharColumn(sf_path + "region.tbl", 1, 25);
+    auto rCols = loadColumnsMulti(sf_path + "region.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
+    auto& r_regionkey = rCols.ints(0); auto& r_name = rCols.chars(1);
     auto q2ParseEnd = std::chrono::high_resolution_clock::now();
     double q2CpuParseMs = std::chrono::duration<double, std::milli>(q2ParseEnd - q2ParseStart).count();
 

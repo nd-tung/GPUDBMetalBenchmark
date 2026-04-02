@@ -12,18 +12,14 @@ void runQ19Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     // Load part data (pure I/O)
-    auto p_partkey   = loadIntColumn(sf_path + "part.tbl", 0);
-    auto p_brand     = loadCharColumn(sf_path + "part.tbl", 3, 10);
-    auto p_container = loadCharColumn(sf_path + "part.tbl", 6, 10);
-    auto p_size      = loadIntColumn(sf_path + "part.tbl", 5);
+    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {5, ColType::INT}, {6, ColType::CHAR_FIXED, 10}});
+    auto& p_partkey = pCols.ints(0); auto& p_brand = pCols.chars(3); auto& p_size = pCols.ints(5); auto& p_container = pCols.chars(6);
 
     // Load lineitem columns
-    auto l_partkey       = loadIntColumn(sf_path + "lineitem.tbl", 1);
-    auto l_quantity      = loadFloatColumn(sf_path + "lineitem.tbl", 4);
-    auto l_extendedprice = loadFloatColumn(sf_path + "lineitem.tbl", 5);
-    auto l_discount      = loadFloatColumn(sf_path + "lineitem.tbl", 6);
-    auto l_shipmode      = loadCharColumn(sf_path + "lineitem.tbl", 14, 10);  // up to 10 chars
-    auto l_shipinstruct  = loadCharColumn(sf_path + "lineitem.tbl", 13, 25);  // up to 25 chars
+    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{1, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {13, ColType::CHAR_FIXED, 25}, {14, ColType::CHAR_FIXED, 10}});
+    auto& l_partkey = lCols.ints(1); auto& l_quantity = lCols.floats(4);
+    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto& l_shipinstruct = lCols.chars(13); auto& l_shipmode = lCols.chars(14);
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
