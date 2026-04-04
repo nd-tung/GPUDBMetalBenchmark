@@ -59,9 +59,8 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     auto pSuppBuildPipe = createPipeline(pDevice, pLibrary, "q9_build_supplier_ht_kernel");
     auto pPartSuppBuildPipe = createPipeline(pDevice, pLibrary, "q9_build_partsupp_ht_kernel");
     auto pOrdersBuildPipe = createPipeline(pDevice, pLibrary, "q9_build_orders_ht_kernel");
-    auto pProbeAggPipe = createPipeline(pDevice, pLibrary, "q9_probe_and_local_agg_kernel");
-    auto pMergePipe = createPipeline(pDevice, pLibrary, "q9_merge_results_kernel");
-    if (!pPartBuildPipe || !pSuppBuildPipe || !pPartSuppBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe || !pMergePipe) return;
+    auto pProbeAggPipe = createPipeline(pDevice, pLibrary, "q9_probe_and_global_agg_kernel");
+    if (!pPartBuildPipe || !pSuppBuildPipe || !pPartSuppBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe) return;
 
     // 3. Create all GPU buffers
     // Part Bitmap (Optimization 1)
@@ -111,10 +110,7 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     MTL::Buffer* pLinePriceBuffer = pDevice->newBuffer(l_extendedprice.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pLineDiscBuffer = pDevice->newBuffer(l_discount.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
 
-    const uint num_threadgroups = 2048, local_ht_size = 256, intermediate_size = num_threadgroups * local_ht_size;
-    MTL::Buffer* pIntermediateBuffer = pDevice->newBuffer(intermediate_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
-    // Ensure intermediate buffer is zero-initialized so merge stage can early-out on empty slots
-    std::memset(pIntermediateBuffer->contents(), 0, intermediate_size * sizeof(Q9Aggregates_CPU));
+    const uint num_threadgroups = 2048;
     const uint final_ht_size = nextPow2(25 * 10); // 25 nations * ~10 years, rounded to power-of-2
     std::vector<uint> cpu_final_ht(final_ht_size * (sizeof(Q9Aggregates_CPU)/sizeof(uint)), 0);
     MTL::Buffer* pFinalHTBuffer = pDevice->newBuffer(cpu_final_ht.data(), final_ht_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
@@ -128,7 +124,6 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         std::memset(pSuppMapBuffer->contents(), -1, supp_map_size * sizeof(int));
         std::memset(pPartSuppHTBuffer->contents(), 0xFF, partsupp_ht_size * sizeof(int) * 4);
         std::memset(pOrdersHTBuffer->contents(), 0xFF, orders_ht_size * sizeof(int) * 2);
-        std::memset(pIntermediateBuffer->contents(), 0, intermediate_size * sizeof(Q9Aggregates_CPU));
         std::memset(pFinalHTBuffer->contents(), 0, final_ht_size * sizeof(Q9Aggregates_CPU));
         
         MTL::CommandBuffer* pCommandBuffer = pCommandQueue->commandBuffer();
@@ -191,31 +186,27 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         
         pBuildEnc->endEncoding();
 
-        // Encoder 2: Probe & Merge Phase (Stages 5-6)
-        // Encoder boundary provides memory barrier — no need for separate command buffer
+        // Encoder 2: Probe & Direct Global Aggregation (single kernel, no merge needed)
         MTL::ComputeCommandEncoder* pProbeEnc = pCommandBuffer->computeCommandEncoder();
         
-        // Stage 5: Probe + local aggregation
+        // Probe + global aggregation
         pProbeEnc->setComputePipelineState(pProbeAggPipe);
         pProbeEnc->setBuffer(pLineSuppKeyBuffer, 0, 0); pProbeEnc->setBuffer(pLinePartKeyBuffer, 0, 1);
         pProbeEnc->setBuffer(pLineOrdKeyBuffer, 0, 2); pProbeEnc->setBuffer(pLinePriceBuffer, 0, 3);
         pProbeEnc->setBuffer(pLineDiscBuffer, 0, 4); pProbeEnc->setBuffer(pLineQtyBuffer, 0, 5);
         pProbeEnc->setBuffer(pPsSupplyCostBuffer, 0, 6); 
-        pProbeEnc->setBuffer(pPartBitmapBuffer, 0, 7); // Bitmap
-        pProbeEnc->setBuffer(pSuppMapBuffer, 0, 8);    // Direct Map
+        pProbeEnc->setBuffer(pPartBitmapBuffer, 0, 7);
+        pProbeEnc->setBuffer(pSuppMapBuffer, 0, 8);
         pProbeEnc->setBuffer(pPartSuppHTBuffer, 0, 9);
-        pProbeEnc->setBuffer(pOrdersHTBuffer, 0, 10); pProbeEnc->setBuffer(pIntermediateBuffer, 0, 11);
-        pProbeEnc->setBytes(&lineitem_size, sizeof(lineitem_size), 12); pProbeEnc->setBytes(&part_ht_size, sizeof(part_ht_size), 13);
-        pProbeEnc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 14); pProbeEnc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 15);
+        pProbeEnc->setBuffer(pOrdersHTBuffer, 0, 10);
+        pProbeEnc->setBuffer(pFinalHTBuffer, 0, 11);
+        pProbeEnc->setBytes(&lineitem_size, sizeof(lineitem_size), 12);
+        pProbeEnc->setBytes(&part_ht_size, sizeof(part_ht_size), 13);
+        pProbeEnc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 14);
+        pProbeEnc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 15);
         pProbeEnc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 16);
+        pProbeEnc->setBytes(&final_ht_size, sizeof(final_ht_size), 17);
         pProbeEnc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
-        
-        pProbeEnc->memoryBarrier(MTL::BarrierScopeBuffers);
-        // Stage 6: Merge
-        pProbeEnc->setComputePipelineState(pMergePipe);
-        pProbeEnc->setBuffer(pIntermediateBuffer, 0, 0); pProbeEnc->setBuffer(pFinalHTBuffer, 0, 1);
-        pProbeEnc->setBytes(&intermediate_size, sizeof(intermediate_size), 2); pProbeEnc->setBytes(&final_ht_size, sizeof(final_ht_size), 3);
-        pProbeEnc->dispatchThreads(MTL::Size(intermediate_size, 1, 1), MTL::Size(1024, 1, 1));
         
         pProbeEnc->endEncoding();
 
@@ -239,14 +230,14 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printTimingSummary(q9CpuParseMs, q9GpuMs, q9_cpu_ms);
     
     // Release all
-    releaseAll(pPartBuildPipe, pSuppBuildPipe, pPartSuppBuildPipe, pOrdersBuildPipe, pProbeAggPipe, pMergePipe,
+    releaseAll(pPartBuildPipe, pSuppBuildPipe, pPartSuppBuildPipe, pOrdersBuildPipe, pProbeAggPipe,
               pPartKeyBuffer, pPartNameBuffer, pPartBitmapBuffer,
               pSuppKeyBuffer, pSuppNationKeyBuffer, pSuppMapBuffer,
               pPsPartKeyBuffer, pPsSuppKeyBuffer, pPsSupplyCostBuffer, pPartSuppHTBuffer,
               pOrdKeyBuffer, pOrdDateBuffer, pOrdersHTBuffer,
               pLinePartKeyBuffer, pLineSuppKeyBuffer, pLineOrdKeyBuffer,
               pLineQtyBuffer, pLinePriceBuffer, pLineDiscBuffer,
-              pIntermediateBuffer, pFinalHTBuffer);
+              pFinalHTBuffer);
 }
 
 
@@ -290,9 +281,8 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     auto pSuppBuildPipe = createPipeline(device, library, "q9_build_supplier_ht_kernel");
     auto pPartSuppBuildPipe = createPipeline(device, library, "q9_build_partsupp_ht_kernel");
     auto pOrdersBuildPipe = createPipeline(device, library, "q9_build_orders_ht_kernel");
-    auto pProbeAggPipe = createPipeline(device, library, "q9_probe_and_local_agg_kernel");
-    auto pMergePipe = createPipeline(device, library, "q9_merge_results_kernel");
-    if (!pPartBuildPipe || !pSuppBuildPipe || !pPartSuppBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe || !pMergePipe) return;
+    auto pProbeAggPipe = createPipeline(device, library, "q9_probe_and_global_agg_kernel");
+    if (!pPartBuildPipe || !pSuppBuildPipe || !pPartSuppBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe) return;
 
     // Timing accumulators
     double totalCpuParseMs = 0, totalGpuMs = 0;
@@ -483,9 +473,7 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     }
 
     // Intermediate + final aggregation buffers (persistent across chunks)
-    const uint num_threadgroups = 2048, local_ht_size = 256;
-    const uint intermediate_size = num_threadgroups * local_ht_size;
-    MTL::Buffer* pIntermediateBuf = device->newBuffer(intermediate_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
+    const uint num_threadgroups = 2048;
     const uint final_ht_size = nextPow2(25 * 10); // 25 nations * ~10 years, rounded to power-of-2
     MTL::Buffer* pFinalHTBuf = device->newBuffer(final_ht_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
     memset(pFinalHTBuf->contents(), 0, final_ht_size * sizeof(Q9Aggregates_CPU));
@@ -501,13 +489,9 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             parseFloatColumnChunk(liFile, liIdx, startRow, rowCount, 5, (float*)slot.price->contents());
             parseFloatColumnChunk(liFile, liIdx, startRow, rowCount, 6, (float*)slot.disc->contents());
         },
-        // Dispatch (probe + merge, two-stage within one command buffer)
+        // Dispatch (probe + direct global aggregation, single kernel)
         [&](Q9LiSlot& slot, uint chunkSize, MTL::CommandBuffer* cmdBuf) {
-            // Reset intermediate buffer for this chunk
-            memset(pIntermediateBuf->contents(), 0, intermediate_size * sizeof(Q9Aggregates_CPU));
-
             auto enc = cmdBuf->computeCommandEncoder();
-            // Probe + local agg
             enc->setComputePipelineState(pProbeAggPipe);
             enc->setBuffer(slot.suppKey, 0, 0);
             enc->setBuffer(slot.partKey, 0, 1);
@@ -520,21 +504,14 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             enc->setBuffer(pSuppMapBuf, 0, 8);
             enc->setBuffer(pPartSuppHTBuf, 0, 9);
             enc->setBuffer(pOrdersHTBuf, 0, 10);
-            enc->setBuffer(pIntermediateBuf, 0, 11);
+            enc->setBuffer(pFinalHTBuf, 0, 11);
             enc->setBytes(&chunkSize, sizeof(chunkSize), 12);
             enc->setBytes(&part_ht_size, sizeof(part_ht_size), 13);
             enc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 14);
             enc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 15);
             enc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 16);
+            enc->setBytes(&final_ht_size, sizeof(final_ht_size), 17);
             enc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
-            enc->memoryBarrier(MTL::BarrierScopeBuffers);
-            // Merge into final HT
-            enc->setComputePipelineState(pMergePipe);
-            enc->setBuffer(pIntermediateBuf, 0, 0);
-            enc->setBuffer(pFinalHTBuf, 0, 1);
-            enc->setBytes(&intermediate_size, sizeof(intermediate_size), 2);
-            enc->setBytes(&final_ht_size, sizeof(final_ht_size), 3);
-            enc->dispatchThreads(MTL::Size(intermediate_size, 1, 1), MTL::Size(1024, 1, 1));
             enc->endEncoding();
             cmdBuf->commit();
         },
@@ -560,11 +537,11 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     printTimingSummary(allCpuParseMs, allGpuMs, cpuPostMs);
 
     // Cleanup
-    releaseAll(pPartBuildPipe, pSuppBuildPipe, pPartSuppBuildPipe, pOrdersBuildPipe, pProbeAggPipe, pMergePipe,
+    releaseAll(pPartBuildPipe, pSuppBuildPipe, pPartSuppBuildPipe, pOrdersBuildPipe, pProbeAggPipe,
               pPartBitmapBuf, pSuppMapBuf, pOrdersHTBuf, pPartSuppHTBuf, pPsSupplyCostBuf);
     for (int s = 0; s < Q9_NUM_SLOTS; s++) {
         releaseAll(liSlots[s].partKey, liSlots[s].suppKey, liSlots[s].ordKey,
                   liSlots[s].qty, liSlots[s].price, liSlots[s].disc);
     }
-    releaseAll(pIntermediateBuf, pFinalHTBuf);
+    releaseAll(pFinalHTBuf);
 }

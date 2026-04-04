@@ -100,22 +100,37 @@ kernel void q19_build_part_group_map_kernel(
     const device char* brand = p_brand + (uint64_t)tid * brand_stride;
     const device char* cont  = p_container + (uint64_t)tid * container_stride;
 
-    // Brand#12, SM BOX/SM CASE/SM PACK/SM PKG, size 1-5 → group 0
-    // Brand#23, MED BOX/MED BAG/MED PACK/MED PKG, size 1-10 → group 1
-    // Brand#34, LG BOX/LG CASE/LG PACK/LG PKG, size 1-15 → group 2
+    // Brand#12, SM CASE/SM BOX/SM PACK/SM PKG, size 1-5 → group 0
+    // Brand#23, MED BAG/MED BOX/MED PKG/MED PACK, size 1-10 → group 1
+    // Brand#34, LG CASE/LG BOX/LG PACK/LG PKG, size 1-15 → group 2
 
+    // Helper: check container suffix (after prefix+space) for CASE/BOX/PACK/PKG
+    // SM containers start suffix at index 3, LG at index 3, MED at index 4
     uchar grp = 0xFF;
-    // Check Brand#12
-    if (brand[6]=='1' && brand[7]=='2' && sz >= 1 && sz <= 5) {
-        if ((cont[0]=='S' && cont[1]=='M')) grp = 0;
+
+    // Check Brand#12 + SM containers
+    if (brand[6]=='1' && brand[7]=='2' && sz >= 1 && sz <= 5 &&
+        cont[0]=='S' && cont[1]=='M' && cont[2]==' ') {
+        // SM CASE(C,A,S), SM BOX(B,O,X), SM PACK(P,A,C), SM PKG(P,K,G)
+        char c3 = cont[3]; char c4 = cont[4]; char c5 = cont[5];
+        if ((c3=='C' && c4=='A' && c5=='S') || (c3=='B' && c4=='O') ||
+            (c3=='P' && c4=='A' && c5=='C') || (c3=='P' && c4=='K')) grp = 0;
     }
-    // Check Brand#23
-    if (brand[6]=='2' && brand[7]=='3' && sz >= 1 && sz <= 10) {
-        if ((cont[0]=='M' && cont[1]=='E' && cont[2]=='D')) grp = 1;
+    // Check Brand#23 + MED containers
+    else if (brand[6]=='2' && brand[7]=='3' && sz >= 1 && sz <= 10 &&
+             cont[0]=='M' && cont[1]=='E' && cont[2]=='D' && cont[3]==' ') {
+        // MED BAG(B,A,G), MED BOX(B,O,X), MED PKG(P,K,G), MED PACK(P,A,C)
+        char c4 = cont[4]; char c5 = cont[5]; char c6 = cont[6];
+        if ((c4=='B' && c5=='A' && c6=='G') || (c4=='B' && c5=='O') ||
+            (c4=='P' && c5=='K') || (c4=='P' && c5=='A' && c6=='C')) grp = 1;
     }
-    // Check Brand#34
-    if (brand[6]=='3' && brand[7]=='4' && sz >= 1 && sz <= 15) {
-        if ((cont[0]=='L' && cont[1]=='G')) grp = 2;
+    // Check Brand#34 + LG containers
+    else if (brand[6]=='3' && brand[7]=='4' && sz >= 1 && sz <= 15 &&
+             cont[0]=='L' && cont[1]=='G' && cont[2]==' ') {
+        // LG CASE(C,A,S), LG BOX(B,O,X), LG PACK(P,A,C), LG PKG(P,K,G)
+        char c3 = cont[3]; char c4 = cont[4]; char c5 = cont[5];
+        if ((c3=='C' && c4=='A' && c5=='S') || (c3=='B' && c4=='O') ||
+            (c3=='P' && c4=='A' && c5=='C') || (c3=='P' && c4=='K')) grp = 2;
     }
     part_group_map[pk] = grp;
 }
@@ -137,9 +152,10 @@ kernel void q19_shipmode_filter_kernel(
 
     // Check shipinstruct starts with 'DELIVER IN PERSON'
     bool instruct_ok = (si[0]=='D' && si[1]=='E' && si[2]=='L');
-    // Check shipmode is 'AIR' or 'AIR REG'
-    bool mode_ok = (sm[0]=='A' && sm[1]=='I' && sm[2]=='R');
-    l_qualifies[tid] = (instruct_ok && mode_ok) ? 1 : 0;
+    // Check shipmode is 'AIR' (exact: 'A','I','R' then NUL/space) or 'REG AIR'
+    bool is_air     = (sm[0]=='A' && sm[1]=='I' && sm[2]=='R' && (sm[3]=='\0' || sm[3]==' '));
+    bool is_reg_air = (sm[0]=='R' && sm[1]=='E' && sm[2]=='G' && sm[3]==' ' && sm[4]=='A');
+    l_qualifies[tid] = (instruct_ok && (is_air || is_reg_air)) ? 1 : 0;
 }
 
 kernel void q19_chunked_shipmode_filter_kernel(
@@ -155,8 +171,9 @@ kernel void q19_chunked_shipmode_filter_kernel(
     const device char* sm = l_shipmode + (uint64_t)tid * shipmode_stride;
     const device char* si = l_shipinstruct + (uint64_t)tid * shipinstruct_stride;
     bool instruct_ok = (si[0]=='D' && si[1]=='E' && si[2]=='L');
-    bool mode_ok = (sm[0]=='A' && sm[1]=='I' && sm[2]=='R');
-    l_qualifies[tid] = (instruct_ok && mode_ok) ? 1 : 0;
+    bool is_air     = (sm[0]=='A' && sm[1]=='I' && sm[2]=='R' && (sm[3]=='\0' || sm[3]==' '));
+    bool is_reg_air = (sm[0]=='R' && sm[1]=='E' && sm[2]=='G' && sm[3]==' ' && sm[4]=='A');
+    l_qualifies[tid] = (instruct_ok && (is_air || is_reg_air)) ? 1 : 0;
 }
 
 // --- Chunked variants ---

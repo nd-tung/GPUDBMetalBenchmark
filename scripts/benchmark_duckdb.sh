@@ -134,15 +134,16 @@ PRAGMA memory_limit='8GB';
 PRAGMA temp_directory='/tmp';
 EOF
 
-    local tables=(lineitem orders customer part supplier partsupp nation)
+    local tables=(nation region part supplier partsupp customer orders lineitem)
     local schemas=(
-        "l_orderkey INTEGER, l_partkey INTEGER, l_suppkey INTEGER, l_linenumber INTEGER, l_quantity DECIMAL(15,2), l_extendedprice DECIMAL(15,2), l_discount DECIMAL(15,2), l_tax DECIMAL(15,2), l_returnflag VARCHAR(1), l_linestatus VARCHAR(1), l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR(25), l_shipmode VARCHAR(10), l_comment VARCHAR(44)"
-        "o_orderkey INTEGER, o_custkey INTEGER, o_orderstatus VARCHAR(1), o_totalprice DECIMAL(15,2), o_orderdate DATE, o_orderpriority VARCHAR(15), o_clerk VARCHAR(15), o_shippriority INTEGER, o_comment VARCHAR(79)"
-        "c_custkey INTEGER, c_name VARCHAR(25), c_address VARCHAR(40), c_nationkey INTEGER, c_phone VARCHAR(15), c_acctbal DECIMAL(15,2), c_mktsegment VARCHAR(10), c_comment VARCHAR(117)"
+        "n_nationkey INTEGER, n_name VARCHAR(25), n_regionkey INTEGER, n_comment VARCHAR(152)"
+        "r_regionkey INTEGER, r_name VARCHAR(25), r_comment VARCHAR(152)"
         "p_partkey INTEGER, p_name VARCHAR(55), p_mfgr VARCHAR(25), p_brand VARCHAR(10), p_type VARCHAR(25), p_size INTEGER, p_container VARCHAR(10), p_retailprice DECIMAL(15,2), p_comment VARCHAR(23)"
         "s_suppkey INTEGER, s_name VARCHAR(25), s_address VARCHAR(40), s_nationkey INTEGER, s_phone VARCHAR(15), s_acctbal DECIMAL(15,2), s_comment VARCHAR(101)"
         "ps_partkey INTEGER, ps_suppkey INTEGER, ps_availqty INTEGER, ps_supplycost DECIMAL(15,2), ps_comment VARCHAR(199)"
-        "n_nationkey INTEGER, n_name VARCHAR(25), n_regionkey INTEGER, n_comment VARCHAR(152)"
+        "c_custkey INTEGER, c_name VARCHAR(25), c_address VARCHAR(40), c_nationkey INTEGER, c_phone VARCHAR(15), c_acctbal DECIMAL(15,2), c_mktsegment VARCHAR(10), c_comment VARCHAR(117)"
+        "o_orderkey INTEGER, o_custkey INTEGER, o_orderstatus VARCHAR(1), o_totalprice DECIMAL(15,2), o_orderdate DATE, o_orderpriority VARCHAR(15), o_clerk VARCHAR(15), o_shippriority INTEGER, o_comment VARCHAR(79)"
+        "l_orderkey INTEGER, l_partkey INTEGER, l_suppkey INTEGER, l_linenumber INTEGER, l_quantity DECIMAL(15,2), l_extendedprice DECIMAL(15,2), l_discount DECIMAL(15,2), l_tax DECIMAL(15,2), l_returnflag VARCHAR(1), l_linestatus VARCHAR(1), l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR(25), l_shipmode VARCHAR(10), l_comment VARCHAR(44)"
     )
 
     for i in "${!tables[@]}"; do
@@ -180,20 +181,18 @@ run_benchmarks() {
     duckdb "$db_file" -c "SELECT COUNT(*) FROM lineitem; SELECT COUNT(*) FROM orders; SELECT COUNT(*) FROM customer;" >/dev/null 2>&1
     echo ""
 
-    print_header "TPC-H Query 1 ($scale_factor)"
-    execute_sql "Q1" "SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price, SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, AVG(l_quantity) AS avg_qty, AVG(l_extendedprice) AS avg_price, AVG(l_discount) AS avg_disc, COUNT(*) AS count_order FROM lineitem WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90 days' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;" "$scale_factor" "$db_file"
-
-    print_header "TPC-H Query 3 ($scale_factor)"
-    execute_sql "Q3" "SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)) AS revenue, o_orderdate, o_shippriority FROM customer, orders, lineitem WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey AND l_orderkey = o_orderkey AND o_orderdate < DATE '1995-03-15' AND l_shipdate > DATE '1995-03-15' GROUP BY l_orderkey, o_orderdate, o_shippriority ORDER BY revenue DESC, o_orderdate LIMIT 10;" "$scale_factor" "$db_file"
-
-    print_header "TPC-H Query 6 ($scale_factor)"
-    execute_sql "Q6" "SELECT SUM(l_extendedprice * l_discount) AS revenue FROM lineitem WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24;" "$scale_factor" "$db_file"
-
-    print_header "TPC-H Query 9 ($scale_factor)"
-    execute_sql "Q9" "SELECT n.n_name AS nation, EXTRACT(YEAR FROM o.o_orderdate) AS o_year, SUM(l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity) AS sum_profit FROM part p, supplier s, lineitem l, partsupp ps, orders o, nation n WHERE s.s_suppkey = l.l_suppkey AND ps.ps_suppkey = l.l_suppkey AND ps.ps_partkey = l.l_partkey AND p.p_partkey = l.l_partkey AND o.o_orderkey = l.l_orderkey AND s.s_nationkey = n.n_nationkey AND p.p_name LIKE '%green%' GROUP BY nation, o_year ORDER BY nation, o_year DESC;" "$scale_factor" "$db_file"
-
-    print_header "TPC-H Query 13 ($scale_factor)"
-    execute_sql "Q13" "SELECT c_count, COUNT(*) AS custdist FROM (SELECT c.c_custkey, COUNT(o.o_orderkey) AS c_count FROM customer c LEFT OUTER JOIN orders o ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%special%requests%' GROUP BY c.c_custkey) AS c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC;" "$scale_factor" "$db_file"
+    # Run all 22 TPC-H queries from sql/ directory
+    for q_num in $(seq 1 22); do
+        local sql_file="$PROJECT_ROOT/sql/q${q_num}.sql"
+        if [[ ! -f "$sql_file" ]]; then
+            echo -e "${RED}Warning: $sql_file not found, skipping Q${q_num}${NC}"
+            continue
+        fi
+        local query_sql
+        query_sql=$(grep -v '^--' "$sql_file" | tr '\n' ' ')
+        print_header "TPC-H Query ${q_num} ($scale_factor)"
+        execute_sql "Q${q_num}" "$query_sql" "$scale_factor" "$db_file"
+    done
 
     rm -f "$db_file"
 }

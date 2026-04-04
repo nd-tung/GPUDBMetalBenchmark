@@ -189,8 +189,11 @@ kernel void q9_build_orders_ht_kernel(
 }
 
 
-// KERNEL 5: The main kernel. Streams lineitem and probes all other hash tables.
-kernel void q9_probe_and_local_agg_kernel(
+// KERNEL 5: Probe lineitem + direct global atomic aggregation.
+// Replaces old TG-local HT + CAS locks + intermediate buffer + merge kernel.
+// Only ~175 unique (nation, year) slots → direct atomic_float add has low contention.
+// Uses open-addressing with CAS on key for slot claiming, atomic_fetch_add on profit.
+kernel void q9_probe_and_global_agg_kernel(
     // lineitem columns
     const device int* l_suppkey, const device int* l_partkey, const device int* l_orderkey,
     const device float* l_extendedprice, const device float* l_discount, const device float* l_quantity,
@@ -200,55 +203,43 @@ kernel void q9_probe_and_local_agg_kernel(
     const device uint* part_bitmap, 
     const device int* supplier_nation_map,
     const device PartSuppEntry* partsupp_ht, const device HashTableEntry* orders_ht,
-    // Output buffer
-    device Q9Aggregates_Local* intermediate_results,
+    // Direct global aggregation output
+    device Q9Aggregates* global_agg,
     // Parameters
     constant uint& lineitem_size, constant uint& part_ht_size, constant uint& supplier_ht_size,
     constant uint& partsupp_ht_size, constant uint& orders_ht_size,
+    constant uint& global_agg_size,
     // Thread IDs
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]],
     uint grid_size [[threads_per_grid]])
 {
-    const int local_ht_size = 256;
-    threadgroup Q9Aggregates_Local local_ht[local_ht_size];
-    threadgroup atomic_int tg_locks[local_ht_size]; // 0=unlocked, 1=locked
-    for (int i = thread_id_in_group; i < local_ht_size; i += threads_per_group) {
-        local_ht[i].key = 0; local_ht[i].profit = 0.0f;
-        atomic_store_explicit(&tg_locks[i], 0, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     const uint global_tid = (group_id * threads_per_group) + thread_id_in_group;
     const uint BATCH = 4;
     const uint stride = grid_size * BATCH;
+    const uint agg_mask = global_agg_size - 1;
 
     for (uint base = global_tid * BATCH; base < lineitem_size; base += stride) {
-        for(int k=0; k<BATCH; ++k) {
+        for(uint k=0; k<BATCH; ++k) {
             uint i = base + k;
             if (i >= lineitem_size) break;
 
             int partkey = l_partkey[i];
-
-            // 1. Check Bitmap
             if (!bitmap_test(part_bitmap, partkey)) continue;
 
             int suppkey = l_suppkey[i];
-
-            // 2. Direct Lookup
             int nationkey = supplier_nation_map[suppkey];
             if (nationkey == -1) continue;
 
-
-            // 3. Probe partsupp_ht to get supply cost index (use combined hash of (partkey,suppkey))
+            // Probe partsupp_ht
             int ps_idx = -1;
             uint ps_mask = partsupp_ht_size - 1;
             uint ps_hash = ((uint)partkey * 0x9E3779B1u ^ (uint)suppkey * 0x85EBCA77u) & ps_mask;
             for (uint j = 0; j <= ps_mask; ++j) {
                 uint probe_idx = (ps_hash + j) & ps_mask;
                 int pk2 = atomic_load_explicit(&partsupp_ht[probe_idx].partkey, memory_order_relaxed);
-                if (pk2 == -1) break; // empty slot -> not found
+                if (pk2 == -1) break;
                 if (pk2 == partkey) {
                     int sk2 = atomic_load_explicit(&partsupp_ht[probe_idx].suppkey, memory_order_relaxed);
                     if (sk2 == suppkey) {
@@ -259,7 +250,7 @@ kernel void q9_probe_and_local_agg_kernel(
             }
             if (ps_idx == -1) continue;
 
-            // 4. Probe orders_ht to get year
+            // Probe orders_ht
             int orderkey = l_orderkey[i];
             int year = -1;
             uint ord_mask = orders_ht_size - 1;
@@ -275,67 +266,24 @@ kernel void q9_probe_and_local_agg_kernel(
             }
             if (year == -1) continue;
 
-            // All probes succeeded!
-            
-            // --- AGGREGATE ---
+            // Direct global atomic aggregation
             float profit = l_extendedprice[i] * (1.0f - l_discount[i]) - ps_supplycost[ps_idx] * l_quantity[i];
             uint agg_key = (uint)(nationkey << 16) | year;
-            uint agg_hash = agg_key % local_ht_size;
+            uint agg_hash = agg_key & agg_mask;
 
-            for(int m = 0; m < local_ht_size; ++m) {
-                uint probe_idx = (agg_hash + m) % local_ht_size;
-                int expected = 0;
-                if (atomic_compare_exchange_weak_explicit(&tg_locks[probe_idx], &expected, 1, memory_order_relaxed, memory_order_relaxed)) {
-                    if (local_ht[probe_idx].key == 0) {
-                        local_ht[probe_idx].key = agg_key;
-                        local_ht[probe_idx].profit = profit;
-                        atomic_store_explicit(&tg_locks[probe_idx], 0, memory_order_relaxed);
-                        break;
-                    } else if (local_ht[probe_idx].key == agg_key) {
-                        local_ht[probe_idx].profit += profit;
-                        atomic_store_explicit(&tg_locks[probe_idx], 0, memory_order_relaxed);
-                        break;
-                    }
-                    // release and continue probing
-                    atomic_store_explicit(&tg_locks[probe_idx], 0, memory_order_relaxed);
+            for (uint m = 0; m <= agg_mask; ++m) {
+                uint probe_idx = (agg_hash + m) & agg_mask;
+                uint expected = 0;
+                if (atomic_compare_exchange_weak_explicit(&global_agg[probe_idx].key, &expected, agg_key, memory_order_relaxed, memory_order_relaxed)) {
+                    // Claimed empty slot — add profit
+                    atomic_fetch_add_explicit(&global_agg[probe_idx].profit, profit, memory_order_relaxed);
+                    break;
+                }
+                if (atomic_load_explicit(&global_agg[probe_idx].key, memory_order_relaxed) == agg_key) {
+                    atomic_fetch_add_explicit(&global_agg[probe_idx].profit, profit, memory_order_relaxed);
+                    break;
                 }
             }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Write local results to global memory
-    for (int i = thread_id_in_group; i < local_ht_size; i += threads_per_group) {
-        if (local_ht[i].key != 0) {
-            intermediate_results[group_id * local_ht_size + i] = local_ht[i];
-        }
-    }
-}
-
-
-// KERNEL 6: Final merge kernel
-kernel void q9_merge_results_kernel(
-    const device Q9Aggregates_Local* intermediate_results,
-    device Q9Aggregates* final_hashtable,
-    constant uint& intermediate_size,
-    constant uint& final_hashtable_size,
-    uint index [[thread_position_in_grid]])
-{
-    if (index >= intermediate_size) return;
-    Q9Aggregates_Local local_result = intermediate_results[index];
-    if (local_result.key == 0) return;
-
-    uint final_mask = final_hashtable_size - 1;
-    uint hash_index = local_result.key & final_mask;
-    for (uint i = 0; i <= final_mask; ++i) {
-        uint probe_index = (hash_index + i) & final_mask;
-        uint expected = 0;
-        if (atomic_compare_exchange_weak_explicit(&final_hashtable[probe_index].key, &expected, local_result.key, memory_order_relaxed, memory_order_relaxed)) {
-            atomic_store_explicit(&final_hashtable[probe_index].profit, 0.0f, memory_order_relaxed);
-        }
-        if (atomic_load_explicit(&final_hashtable[probe_index].key, memory_order_relaxed) == local_result.key) {
-            atomic_fetch_add_explicit(&final_hashtable[probe_index].profit, local_result.profit, memory_order_relaxed);
-            return;
         }
     }
 }

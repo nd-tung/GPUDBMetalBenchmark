@@ -23,10 +23,9 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     const uint data_size = (uint)l_shipdate.size();
     if (data_size == 0) { std::cerr << "Q1: no data loaded" << std::endl; return; }
 
-    // Create pipelines for Integer-cent two-pass Q1
-    auto stage1PSO = createPipeline(device, library, "q1_bins_accumulate_int_stage1");
-    auto stage2PSO = createPipeline(device, library, "q1_bins_reduce_int_stage2");
-    if (!stage1PSO || !stage2PSO) return;
+    // Create pipeline for fused single-pass Q1
+    auto fusedPSO = createPipeline(device, library, "q1_fused_kernel");
+    if (!fusedPSO) return;
 
     // Create buffers for columns
     MTL::Buffer* shipdateBuffer = device->newBuffer(l_shipdate.data(), data_size * sizeof(int), MTL::ResourceStorageModeShared);
@@ -37,65 +36,43 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     MTL::Buffer* discBuffer = device->newBuffer(l_discount.data(), data_size * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* taxBuffer = device->newBuffer(l_tax.data(), data_size * sizeof(float), MTL::ResourceStorageModeShared);
 
-    // Buffers for two-pass integer-cent path
+    // Output buffers: 6 bins, long metrics stored as lo/hi uint pairs
     const uint bins = 6;
-    const uint num_threadgroups = 1024; // also passed to stage2
+    const uint num_threadgroups = 1024;
 
-    // Stage 1 partials: size = num_threadgroups * bins
-    MTL::Buffer* p_sumQtyCents = device->newBuffer(num_threadgroups * bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* p_sumBaseCents = device->newBuffer(num_threadgroups * bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* p_sumDiscPriceCents = device->newBuffer(num_threadgroups * bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* p_sumChargeCents = device->newBuffer(num_threadgroups * bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* p_sumDiscountBP = device->newBuffer(num_threadgroups * bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* p_counts = device->newBuffer(num_threadgroups * bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    // Zero initialize partials (defensive)
-    memset(p_sumQtyCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-    memset(p_sumBaseCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-    memset(p_sumDiscPriceCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-    memset(p_sumChargeCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-    memset(p_sumDiscountBP->contents(), 0, num_threadgroups * bins * sizeof(uint32_t));
-    memset(p_counts->contents(), 0, num_threadgroups * bins * sizeof(uint32_t));
-
-    // Stage 2 finals: size = bins
-    MTL::Buffer* f_sumQtyCents = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* f_sumBaseCents = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* f_sumDiscPriceCents = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* f_sumChargeCents = device->newBuffer(bins * sizeof(long), MTL::ResourceStorageModeShared);
-    MTL::Buffer* f_sumDiscountBP = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* f_counts = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    memset(f_sumQtyCents->contents(), 0, bins * sizeof(long));
-    memset(f_sumBaseCents->contents(), 0, bins * sizeof(long));
-    memset(f_sumDiscPriceCents->contents(), 0, bins * sizeof(long));
-    memset(f_sumChargeCents->contents(), 0, bins * sizeof(long));
-    memset(f_sumDiscountBP->contents(), 0, bins * sizeof(uint32_t));
-    memset(f_counts->contents(), 0, bins * sizeof(uint32_t));
+    MTL::Buffer* out_qty_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_qty_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_base_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_base_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_disc_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_disc_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_charge_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_charge_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_discount_bp = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* out_count = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
 
     const int cutoffDate = 19980902; // DATE '1998-12-01' - INTERVAL '90' DAY
 
-    // Dispatch kernels (2 warmup + 1 measured)
+    // Dispatch kernel (2 warmup + 1 measured)
     double q1_gpu_ms = 0.0;
     
     for(int iter = 0; iter < 3; ++iter) {
-        // Reset partials and finals
-        memset(p_sumQtyCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-        memset(p_sumBaseCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-        memset(p_sumDiscPriceCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-        memset(p_sumChargeCents->contents(), 0, num_threadgroups * bins * sizeof(long));
-        memset(p_sumDiscountBP->contents(), 0, num_threadgroups * bins * sizeof(uint32_t));
-        memset(p_counts->contents(), 0, num_threadgroups * bins * sizeof(uint32_t));
-        
-        memset(f_sumQtyCents->contents(), 0, bins * sizeof(long));
-        memset(f_sumBaseCents->contents(), 0, bins * sizeof(long));
-        memset(f_sumDiscPriceCents->contents(), 0, bins * sizeof(long));
-        memset(f_sumChargeCents->contents(), 0, bins * sizeof(long));
-        memset(f_sumDiscountBP->contents(), 0, bins * sizeof(uint32_t));
-        memset(f_counts->contents(), 0, bins * sizeof(uint32_t));
+        // Zero all output buffers
+        memset(out_qty_lo->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_qty_hi->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_base_lo->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_base_hi->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_disc_lo->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_disc_hi->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_charge_lo->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_charge_hi->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_discount_bp->contents(), 0, bins * sizeof(uint32_t));
+        memset(out_count->contents(), 0, bins * sizeof(uint32_t));
 
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = commandBuffer->computeCommandEncoder();
         
-        // Stage 1: accumulate partials
-        enc->setComputePipelineState(stage1PSO);
+        enc->setComputePipelineState(fusedPSO);
         enc->setBuffer(shipdateBuffer, 0, 0);
         enc->setBuffer(flagBuffer, 0, 1);
         enc->setBuffer(statusBuffer, 0, 2);
@@ -103,36 +80,21 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
         enc->setBuffer(priceBuffer, 0, 4);
         enc->setBuffer(discBuffer, 0, 5);
         enc->setBuffer(taxBuffer, 0, 6);
-        enc->setBuffer(p_sumQtyCents, 0, 7);
-        enc->setBuffer(p_sumBaseCents, 0, 8);
-        enc->setBuffer(p_sumDiscPriceCents, 0, 9);
-        enc->setBuffer(p_sumChargeCents, 0, 10);
-        enc->setBuffer(p_sumDiscountBP, 0, 11);
-        enc->setBuffer(p_counts, 0, 12);
-        enc->setBytes(&data_size, sizeof(data_size), 13);
-        enc->setBytes(&cutoffDate, sizeof(cutoffDate), 14);
-        enc->setBytes(&num_threadgroups, sizeof(num_threadgroups), 15);
-        NS::UInteger tgSize = stage1PSO->maxTotalThreadsPerThreadgroup();
-        if (tgSize > 1024) tgSize = 1024; // matches shared arrays in kernel
+        enc->setBuffer(out_qty_lo, 0, 7);
+        enc->setBuffer(out_qty_hi, 0, 8);
+        enc->setBuffer(out_base_lo, 0, 9);
+        enc->setBuffer(out_base_hi, 0, 10);
+        enc->setBuffer(out_disc_lo, 0, 11);
+        enc->setBuffer(out_disc_hi, 0, 12);
+        enc->setBuffer(out_charge_lo, 0, 13);
+        enc->setBuffer(out_charge_hi, 0, 14);
+        enc->setBuffer(out_discount_bp, 0, 15);
+        enc->setBuffer(out_count, 0, 16);
+        enc->setBytes(&data_size, sizeof(data_size), 17);
+        enc->setBytes(&cutoffDate, sizeof(cutoffDate), 18);
+        NS::UInteger tgSize = fusedPSO->maxTotalThreadsPerThreadgroup();
+        if (tgSize > 1024) tgSize = 1024;
         enc->dispatchThreadgroups(MTL::Size::Make(num_threadgroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
-
-        enc->memoryBarrier(MTL::BarrierScopeBuffers);
-        // Stage 2: reduce partials to finals on the same encoder
-        enc->setComputePipelineState(stage2PSO);
-        enc->setBuffer(p_sumQtyCents, 0, 0);
-        enc->setBuffer(p_sumBaseCents, 0, 1);
-        enc->setBuffer(p_sumDiscPriceCents, 0, 2);
-        enc->setBuffer(p_sumChargeCents, 0, 3);
-        enc->setBuffer(p_sumDiscountBP, 0, 4);
-        enc->setBuffer(p_counts, 0, 5);
-        enc->setBuffer(f_sumQtyCents, 0, 6);
-        enc->setBuffer(f_sumBaseCents, 0, 7);
-        enc->setBuffer(f_sumDiscPriceCents, 0, 8);
-        enc->setBuffer(f_sumChargeCents, 0, 9);
-        enc->setBuffer(f_sumDiscountBP, 0, 10);
-        enc->setBuffer(f_counts, 0, 11);
-        enc->setBytes(&num_threadgroups, sizeof(num_threadgroups), 12);
-        enc->dispatchThreadgroups(MTL::Size::Make(6, 1, 1), MTL::Size::Make(1024, 1, 1));
         enc->endEncoding();
 
         commandBuffer->commit();
@@ -146,13 +108,22 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     // CPU post-processing (build final results) timing start
     auto q1_cpu_post_start = std::chrono::high_resolution_clock::now();
 
-    // Read back final results
-    long* sum_qty_c = (long*)f_sumQtyCents->contents();
-    long* sum_base_c = (long*)f_sumBaseCents->contents();
-    long* sum_disc_c = (long*)f_sumDiscPriceCents->contents();
-    long* sum_charge_c = (long*)f_sumChargeCents->contents();
-    uint32_t* sum_discount_bp = (uint32_t*)f_sumDiscountBP->contents();
-    uint32_t* counts = (uint32_t*)f_counts->contents();
+    // Read back final results from lo/hi pairs
+    uint32_t* qty_lo = (uint32_t*)out_qty_lo->contents();
+    uint32_t* qty_hi = (uint32_t*)out_qty_hi->contents();
+    uint32_t* base_lo = (uint32_t*)out_base_lo->contents();
+    uint32_t* base_hi = (uint32_t*)out_base_hi->contents();
+    uint32_t* disc_lo = (uint32_t*)out_disc_lo->contents();
+    uint32_t* disc_hi = (uint32_t*)out_disc_hi->contents();
+    uint32_t* charge_lo = (uint32_t*)out_charge_lo->contents();
+    uint32_t* charge_hi = (uint32_t*)out_charge_hi->contents();
+    uint32_t* sum_discount_bp = (uint32_t*)out_discount_bp->contents();
+    uint32_t* counts = (uint32_t*)out_count->contents();
+
+    auto reconstruct_long = [](uint32_t lo, uint32_t hi) -> long {
+        uint64_t v = ((uint64_t)hi << 32) | (uint64_t)lo;
+        return (long)v;
+    };
 
     struct Q1Result { double sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc; uint count; };
     std::map<std::pair<char,char>, Q1Result> final_results;
@@ -161,14 +132,14 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
         char rf = (rfIdx==0?'A':rfIdx==1?'N':'R');
         char ls = (lsIdx==0?'F':'O');
         Q1Result r;
-        r.sum_qty = (double)sum_qty_c[bin] / 100.0;
-        r.sum_base_price = (double)sum_base_c[bin] / 100.0;
-        r.sum_disc_price = (double)sum_disc_c[bin] / 100.0;
-        r.sum_charge = (double)sum_charge_c[bin] / 100.0;
+        r.sum_qty = (double)reconstruct_long(qty_lo[bin], qty_hi[bin]) / 100.0;
+        r.sum_base_price = (double)reconstruct_long(base_lo[bin], base_hi[bin]) / 100.0;
+        r.sum_disc_price = (double)reconstruct_long(disc_lo[bin], disc_hi[bin]) / 100.0;
+        r.sum_charge = (double)reconstruct_long(charge_lo[bin], charge_hi[bin]) / 100.0;
         r.count = counts[bin];
         r.avg_qty = r.sum_qty / (double)r.count;
         r.avg_price = r.sum_base_price / (double)r.count;
-        r.avg_disc = ((double)sum_discount_bp[bin] / 100.0) / (double)r.count; // average discount as fraction
+        r.avg_disc = ((double)sum_discount_bp[bin] / 100.0) / (double)r.count;
         final_results[{rf, ls}] = r;
     };
     emit_bin(0,0,0); // A/F
@@ -194,10 +165,11 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     printf("\nQ1 | %u rows\n", data_size);
     printTimingSummary(q1CpuParseMs, q1_gpu_ms, q1_cpu_ms);
 
-    releaseAll(stage1PSO, stage2PSO, shipdateBuffer, flagBuffer, statusBuffer,
+    releaseAll(fusedPSO, shipdateBuffer, flagBuffer, statusBuffer,
               qtyBuffer, priceBuffer, discBuffer, taxBuffer,
-              p_sumQtyCents, p_sumBaseCents, p_sumDiscPriceCents, p_sumChargeCents, p_sumDiscountBP, p_counts,
-              f_sumQtyCents, f_sumBaseCents, f_sumDiscPriceCents, f_sumChargeCents, f_sumDiscountBP, f_counts);
+              out_qty_lo, out_qty_hi, out_base_lo, out_base_hi,
+              out_disc_lo, out_disc_hi, out_charge_lo, out_charge_hi,
+              out_discount_bp, out_count);
 }
 
 

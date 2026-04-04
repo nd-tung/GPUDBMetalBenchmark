@@ -115,6 +115,29 @@ inline void bitmap_set(device atomic_uint* bitmap, int key) {
 }
 
 // ===================================================================
+// 64-BIT ATOMIC ADD EMULATION (Metal lacks native atomic_long)
+// ===================================================================
+// Uses a pair of device atomic_uint (lo, hi) to represent a 64-bit value.
+// CAS loop on the low word with carry propagation to the high word.
+inline void atomic_add_long_pair(device atomic_uint* lo, device atomic_uint* hi, long val) {
+    ulong uval = as_type<ulong>(val);
+    uint add_lo = (uint)(uval);
+    uint add_hi = (uint)(uval >> 32);
+    uint old_lo = atomic_fetch_add_explicit(lo, add_lo, memory_order_relaxed);
+    // Detect carry: if old_lo + add_lo wrapped (overflow)
+    uint new_lo = old_lo + add_lo;
+    uint carry = (new_lo < old_lo) ? 1u : 0u;
+    if (add_hi != 0 || carry != 0) {
+        atomic_fetch_add_explicit(hi, add_hi + carry, memory_order_relaxed);
+    }
+}
+
+inline long load_long_pair(const device uint* lo, const device uint* hi) {
+    ulong v = ((ulong)(*hi) << 32) | (ulong)(*lo);
+    return as_type<long>(v);
+}
+
+// ===================================================================
 // HASH TABLE PROBE HELPERS — always use power-of-2 capacity + mask
 // ===================================================================
 
