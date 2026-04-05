@@ -15,12 +15,22 @@ OBJ_DIR      = $(BUILD_DIR)/obj
 
 CXX      = clang++
 CXXFLAGS = -std=c++20 -Wall -Wextra -O3
-INCLUDES = -I$(METAL_CPP_DIR)
-FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore
+INCLUDES = -I$(METAL_CPP_DIR) -I$(PG_QUERY_DIR) -Icodegen
+FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++
 
 SOURCES = $(wildcard $(SOURCE_DIR)/*.cpp)
 OBJECTS = $(SOURCES:$(SOURCE_DIR)/%.cpp=$(OBJ_DIR)/%.o)
+
+# Codegen sources
+CODEGEN_DIR = codegen
+CODEGEN_SOURCES = $(wildcard $(CODEGEN_DIR)/*.cpp)
+CODEGEN_OBJECTS = $(CODEGEN_SOURCES:$(CODEGEN_DIR)/%.cpp=$(OBJ_DIR)/codegen_%.o)
+
 TARGET  = $(BIN_DIR)/$(PROJECT_NAME)
+
+# libpg_query
+PG_QUERY_DIR = third_party/libpg_query
+PG_QUERY_LIB = $(PG_QUERY_DIR)/libpg_query.a
 
 METAL    = xcrun -sdk macosx metal
 METALLIB = xcrun -sdk macosx metallib
@@ -50,9 +60,9 @@ endif
 
 rebuild: clean all
 
-$(TARGET): $(OBJECTS) | $(BIN_DIR)
+$(TARGET): $(OBJECTS) $(CODEGEN_OBJECTS) | $(BIN_DIR)
 	@echo "Linking $(PROJECT_NAME)..."
-	$(CXX) $(OBJECTS) $(FRAMEWORKS) -o $@
+	$(CXX) $(OBJECTS) $(CODEGEN_OBJECTS) $(PG_QUERY_LIB) $(FRAMEWORKS) -o $@
 	@echo "Build complete: $@"
 
 $(KERNEL_AIR): $(KERNEL_DIR)/DatabaseKernels.metal $(wildcard $(KERNEL_DIR)/*.metal $(KERNEL_DIR)/*.h) | $(BUILD_DIR)
@@ -66,6 +76,10 @@ $(KERNEL_METALLIB): $(KERNEL_AIR)
 $(OBJ_DIR)/%.o: $(SOURCE_DIR)/%.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJ_DIR)
+	@echo "Compiling codegen/$<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -Isrc -c $< -o $@
 
 $(BIN_DIR) $(OBJ_DIR) $(BUILD_DIR):
 	@mkdir -p $@
