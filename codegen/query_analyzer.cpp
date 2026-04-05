@@ -8,6 +8,7 @@ extern "C" {
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
+#include <unordered_map>
 
 using json = nlohmann::json;
 
@@ -18,6 +19,9 @@ namespace codegen {
 // ===================================================================
 
 namespace {
+
+// File-scope alias map: alias -> real table name (e.g. "l1" -> "lineitem")
+std::unordered_map<std::string, std::string> g_aliasMap;
 
 const auto& schema() { return TPCHSchema::instance(); }
 
@@ -67,8 +71,9 @@ ExprPtr walkColumnRef(const json& node, const std::vector<std::string>& tables) 
 
     std::string resolvedTable;
     if (!tblQualifier.empty()) {
-        resolvedTable = tblQualifier;
-        // Could be an alias — for now assume direct table name
+        // Resolve alias to real table name if needed
+        auto ait = g_aliasMap.find(tblQualifier);
+        resolvedTable = (ait != g_aliasMap.end()) ? ait->second : tblQualifier;
     } else {
         auto [t, c] = resolveColumn(colName, tables);
         resolvedTable = t;
@@ -368,10 +373,17 @@ void extractTables(const json& fromItem, std::vector<std::string>& tables,
         auto& rv = fromItem["RangeVar"];
         std::string name = rv["relname"].get<std::string>();
         tables.push_back(name);
-        if (rv.contains("alias") && rv["alias"].contains("Alias"))
-            aliases.push_back(rv["alias"]["Alias"]["aliasname"].get<std::string>());
-        else
+        if (rv.contains("alias")) {
+            auto& a = rv["alias"];
+            if (a.contains("Alias"))
+                aliases.push_back(a["Alias"]["aliasname"].get<std::string>());
+            else if (a.contains("aliasname"))
+                aliases.push_back(a["aliasname"].get<std::string>());
+            else
+                aliases.push_back(name);
+        } else {
             aliases.push_back(name);
+        }
     }
     if (fromItem.contains("JoinExpr")) {
         auto& je = fromItem["JoinExpr"];
@@ -382,10 +394,17 @@ void extractTables(const json& fromItem, std::vector<std::string>& tables,
         // Subquery in FROM — push a placeholder
         tables.push_back("__subquery__");
         auto& rs = fromItem["RangeSubselect"];
-        if (rs.contains("alias") && rs["alias"].contains("Alias"))
-            aliases.push_back(rs["alias"]["Alias"]["aliasname"].get<std::string>());
-        else
+        if (rs.contains("alias")) {
+            auto& a = rs["alias"];
+            if (a.contains("Alias"))
+                aliases.push_back(a["Alias"]["aliasname"].get<std::string>());
+            else if (a.contains("aliasname"))
+                aliases.push_back(a["aliasname"].get<std::string>());
+            else
+                aliases.push_back("__subquery__");
+        } else {
             aliases.push_back("__subquery__");
+        }
     }
 }
 
@@ -530,6 +549,12 @@ AnalyzedQuery analyzeSQL(const std::string& sql) {
     if (sel.contains("fromClause")) {
         for (auto& item : sel["fromClause"])
             extractTables(item, aq.tables, aq.tableAliases);
+        // Build alias -> real table name map
+        g_aliasMap.clear();
+        for (size_t i = 0; i < aq.tables.size(); ++i) {
+            if (i < aq.tableAliases.size() && aq.tableAliases[i] != aq.tables[i])
+                g_aliasMap[aq.tableAliases[i]] = aq.tables[i];
+        }
         // Extract explicit JOIN ON conditions
         for (auto& item : sel["fromClause"])
             extractJoinOns(item, aq.tables, aq.joins, aq.filters);

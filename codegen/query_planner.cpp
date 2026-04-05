@@ -560,6 +560,89 @@ QueryPlan planQ22(const AnalyzedQuery& /*aq*/) {
     return plan;
 }
 
+// Q9: Product Type Profit — 6 tables with p_name LIKE '%green%'
+bool matchQ9(const AnalyzedQuery& aq) {
+    // Q9 has 6 tables: part, supplier, lineitem, partsupp, orders, nation
+    if (aq.tables.size() != 6) return false;
+    bool hasPart = false, hasPartsupp = false, hasNation = false;
+    for (auto& t : aq.tables) {
+        if (t == "part") hasPart = true;
+        if (t == "partsupp") hasPartsupp = true;
+        if (t == "nation") hasNation = true;
+    }
+    return hasPart && hasPartsupp && hasNation;
+}
+
+QueryPlan planQ9(const AnalyzedQuery& /*aq*/) {
+    QueryPlan plan;
+    plan.name = "Q9";
+    // 5 GPU kernels: build part bitmap, supplier map, partsupp HT, orders HT, probe lineitem
+    // Direct global atomic aggregation by (nation, year) key
+    return plan;
+}
+
+// Q16: Parts/Supplier Relationship — partsupp+part with NOT IN + COUNT DISTINCT
+bool matchQ16(const AnalyzedQuery& aq) {
+    // Q16 has partsupp+part (2 tables) + NOT IN subquery on supplier
+    if (aq.tables.size() != 2) return false;
+    std::vector<std::string> sorted = aq.tables;
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted[0] != "part" || sorted[1] != "partsupp") return false;
+    // Distinguish from Q2 (5+ tables) by table count alone (already checked == 2)
+    return true;
+}
+
+QueryPlan planQ16(const AnalyzedQuery& /*aq*/) {
+    QueryPlan plan;
+    plan.name = "Q16";
+    // CPU builds complaint bitmap + part group map
+    // GPU kernel 1: scan partsupp, set bits in per-group bitmaps
+    // GPU kernel 2: popcount each group's bitmap
+    return plan;
+}
+
+// Q20: Potential Part Promotion — supplier+nation with nested subqueries
+bool matchQ20(const AnalyzedQuery& aq) {
+    // Q20 outer query is supplier+nation (2 tables) with s_suppkey IN (subquery)
+    if (aq.tables.size() != 2) return false;
+    std::vector<std::string> sorted = aq.tables;
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted[0] != "nation" || sorted[1] != "supplier") return false;
+    // Has nested subqueries
+    return !aq.subqueries.empty();
+}
+
+QueryPlan planQ20(const AnalyzedQuery& /*aq*/) {
+    QueryPlan plan;
+    plan.name = "Q20";
+    // GPU kernel 1: aggregate lineitem quantity into HT keyed by (partkey, suppkey)
+    // GPU kernel 2: probe partsupp, check threshold, set qualifying suppkey bitmap
+    return plan;
+}
+
+// Q21: Suppliers Who Kept Orders Waiting — supplier+lineitem+orders+nation
+bool matchQ21(const AnalyzedQuery& aq) {
+    // Q21 has supplier, lineitem (as l1), orders, nation (4 tables)
+    // Distinguish from other multi-table queries by EXISTS/NOT EXISTS subqueries
+    if (aq.tables.size() < 4) return false;
+    bool hasSupp = false, hasLi = false, hasOrd = false, hasNat = false;
+    for (auto& t : aq.tables) {
+        if (t == "supplier") hasSupp = true;
+        if (t == "lineitem") hasLi = true;
+        if (t == "orders") hasOrd = true;
+        if (t == "nation") hasNat = true;
+    }
+    return hasSupp && hasLi && hasOrd && hasNat;
+}
+
+QueryPlan planQ21(const AnalyzedQuery& /*aq*/) {
+    QueryPlan plan;
+    plan.name = "Q21";
+    // GPU pass 1: build per-order supplier tracking (CAS multi-value)
+    // GPU pass 2: count qualifying lineitems per SA supplier
+    return plan;
+}
+
 // Q5: Local Supplier Volume — 6 tables including region
 bool matchQ5(const AnalyzedQuery& aq) {
     for (auto& t : aq.tables)
@@ -621,12 +704,16 @@ QueryPlan buildPlan(const AnalyzedQuery& aq) {
     if (matchQ4(aq))  return planQ4(aq);  // Q4 before Q12 (both orders+lineitem)
     if (matchQ12(aq)) return planQ12(aq);
     if (matchQ18(aq)) return planQ18(aq); // Q18 before Q10 (both cust+ord+li, Q18 groups by o_orderkey)
+    if (matchQ21(aq)) return planQ21(aq); // Q21 before Q10 (supp+li+ord+nation, 4 tables)
     if (matchQ10(aq)) return planQ10(aq); // Q10 before Q3 (both have cust+li+ord)
+    if (matchQ9(aq))  return planQ9(aq);  // Q9 before Q2 (6 tables with partsupp+part+nation)
     if (matchQ2(aq))  return planQ2(aq);  // Q2 before Q5/Q11 (has partsupp+region)
+    if (matchQ16(aq)) return planQ16(aq); // Q16 before Q14 (partsupp+part, 2 tables)
     if (matchQ5(aq))  return planQ5(aq);  // Q5 has "region" in tables
     if (matchQ7(aq))  return planQ7(aq);  // Q7/Q8/Q22 before Q13 (all __subquery__)
     if (matchQ8(aq))  return planQ8(aq);
     if (matchQ22(aq)) return planQ22(aq);
+    if (matchQ20(aq)) return planQ20(aq); // Q20: supplier+nation with subqueries
     if (matchQ1(aq))  return planQ1(aq);
     if (matchQ6(aq))  return planQ6(aq);
     if (matchQ3(aq))  return planQ3(aq);

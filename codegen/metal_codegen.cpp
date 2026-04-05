@@ -1447,6 +1447,471 @@ kernel void gen_q18_filter_orders(
     result.kernels.push_back({"gen_q18_filter_orders", 256, false});
 }
 
+// ===================================================================
+// Q9: Product Type Profit Measure
+// ===================================================================
+static void generateQ9Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q9 structs
+struct GenQ9PartSuppEntry {
+    atomic_int partkey;
+    atomic_int suppkey;
+    atomic_int idx;
+    int _pad;
+};
+
+struct GenQ9Aggregates {
+    atomic_uint key;
+    atomic_float profit;
+};
+
+// Hash table entry for orders (key + value)
+struct GenQ9OrdersHTEntry {
+    atomic_int key;
+    atomic_int value;
+};
+
+// Q9 Kernel 1: Build part bitmap — filter p_name LIKE '%green%' (SWAR)
+kernel void gen_q9_build_part_bitmap(
+    const device int* p_partkey     [[buffer(0)]],
+    const device char* p_name       [[buffer(1)]],
+    device atomic_uint* part_bitmap [[buffer(2)]],
+    constant uint& part_size        [[buffer(3)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= part_size) return;
+    const device uchar* name = (const device uchar*)(p_name + index * 55);
+    bool match = false;
+    const uint g_spread = 0x67676767u;
+    for (int w = 0; w < 13 && !match; ++w) {
+        uint word = (uint)name[w*4]
+                  | ((uint)name[w*4+1] << 8)
+                  | ((uint)name[w*4+2] << 16)
+                  | ((uint)name[w*4+3] << 24);
+        uint xor_val = word ^ g_spread;
+        if (((xor_val - 0x01010101u) & ~xor_val & 0x80808080u) == 0) continue;
+        int base = w * 4;
+        for (int b = 0; b < 4 && base + b <= 50; ++b) {
+            if (name[base+b]=='g' && name[base+b+1]=='r' && name[base+b+2]=='e' &&
+                name[base+b+3]=='e' && name[base+b+4]=='n') { match = true; break; }
+        }
+    }
+    if (match) bitmap_set(part_bitmap, p_partkey[index]);
+}
+
+// Q9 Kernel 2: Build supplier -> nationkey direct map
+kernel void gen_q9_build_supplier_map(
+    const device int* s_suppkey     [[buffer(0)]],
+    const device int* s_nationkey   [[buffer(1)]],
+    device int* supplier_nation_map [[buffer(2)]],
+    constant uint& supplier_size    [[buffer(3)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= supplier_size) return;
+    supplier_nation_map[s_suppkey[index]] = s_nationkey[index];
+}
+
+// Q9 Kernel 3: Build partsupp HT (open-addressing with CAS)
+kernel void gen_q9_build_partsupp_ht(
+    const device int* ps_partkey        [[buffer(0)]],
+    const device int* ps_suppkey        [[buffer(1)]],
+    device GenQ9PartSuppEntry* ht       [[buffer(2)]],
+    constant uint& partsupp_size        [[buffer(3)]],
+    constant uint& ht_size              [[buffer(4)]],
+    const device uint* part_bitmap      [[buffer(5)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= partsupp_size) return;
+    int pk = ps_partkey[index];
+    if (!bitmap_test(part_bitmap, pk)) return;
+    int sk = ps_suppkey[index];
+    uint mix = (uint)pk * 0x9E3779B1u ^ (uint)sk * 0x85EBCA77u;
+    uint mask = ht_size - 1;
+    uint h = mix & mask;
+    for (uint i = 0; i <= mask; ++i) {
+        uint probe = (h + i) & mask;
+        int expected = -1;
+        if (atomic_compare_exchange_weak_explicit(&ht[probe].partkey, &expected, pk,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&ht[probe].suppkey, sk, memory_order_relaxed);
+            atomic_store_explicit(&ht[probe].idx, (int)index, memory_order_relaxed);
+            return;
+        }
+        int cur_pk = atomic_load_explicit(&ht[probe].partkey, memory_order_relaxed);
+        if (cur_pk == -1) return;
+        if (cur_pk == pk) {
+            int cur_sk = atomic_load_explicit(&ht[probe].suppkey, memory_order_relaxed);
+            if (cur_sk == sk) {
+                atomic_store_explicit(&ht[probe].idx, (int)index, memory_order_relaxed);
+                return;
+            }
+        }
+    }
+}
+
+// Q9 Kernel 4: Build orders HT (orderkey -> year)
+kernel void gen_q9_build_orders_ht(
+    const device int* o_orderkey    [[buffer(0)]],
+    const device int* o_orderdate   [[buffer(1)]],
+    device GenQ9OrdersHTEntry* ht   [[buffer(2)]],
+    constant uint& orders_size      [[buffer(3)]],
+    constant uint& ht_size          [[buffer(4)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= orders_size) return;
+    int key = o_orderkey[index];
+    int year = o_orderdate[index] / 10000;
+    uint mask = ht_size - 1;
+    uint h = sf100_hash_key(key) & mask;
+    for (uint i = 0; i <= mask; ++i) {
+        uint probe = (h + i) & mask;
+        int expected = -1;
+        if (atomic_compare_exchange_weak_explicit(&ht[probe].key, &expected, key,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&ht[probe].value, year, memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+// Q9 Kernel 5: Probe lineitem + direct global aggregation
+kernel void gen_q9_probe_and_aggregate(
+    const device int* l_suppkey         [[buffer(0)]],
+    const device int* l_partkey         [[buffer(1)]],
+    const device int* l_orderkey        [[buffer(2)]],
+    const device float* l_extendedprice [[buffer(3)]],
+    const device float* l_discount      [[buffer(4)]],
+    const device float* l_quantity      [[buffer(5)]],
+    const device float* ps_supplycost   [[buffer(6)]],
+    const device uint* part_bitmap      [[buffer(7)]],
+    const device int* supplier_nation_map [[buffer(8)]],
+    const device GenQ9PartSuppEntry* partsupp_ht [[buffer(9)]],
+    const device GenQ9OrdersHTEntry* orders_ht   [[buffer(10)]],
+    device GenQ9Aggregates* global_agg  [[buffer(11)]],
+    constant uint& lineitem_size        [[buffer(12)]],
+    constant uint& partsupp_ht_size     [[buffer(13)]],
+    constant uint& orders_ht_size       [[buffer(14)]],
+    constant uint& agg_size             [[buffer(15)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    const uint global_tid = (group_id * threads_per_group) + thread_id_in_group;
+    const uint BATCH = 4;
+    const uint stride = grid_size * BATCH;
+    const uint agg_mask = agg_size - 1;
+    const uint ps_mask = partsupp_ht_size - 1;
+    const uint ord_mask = orders_ht_size - 1;
+
+    for (uint base = global_tid * BATCH; base < lineitem_size; base += stride) {
+        for (uint k = 0; k < BATCH; ++k) {
+            uint i = base + k;
+            if (i >= lineitem_size) break;
+
+            int partkey = l_partkey[i];
+            if (!bitmap_test(part_bitmap, partkey)) continue;
+            int suppkey = l_suppkey[i];
+            int nationkey = supplier_nation_map[suppkey];
+            if (nationkey == -1) continue;
+
+            // Probe partsupp HT
+            int ps_idx = -1;
+            uint ps_hash = ((uint)partkey * 0x9E3779B1u ^ (uint)suppkey * 0x85EBCA77u) & ps_mask;
+            for (uint j = 0; j <= ps_mask; ++j) {
+                uint probe = (ps_hash + j) & ps_mask;
+                int pk2 = atomic_load_explicit(&partsupp_ht[probe].partkey, memory_order_relaxed);
+                if (pk2 == -1) break;
+                if (pk2 == partkey) {
+                    int sk2 = atomic_load_explicit(&partsupp_ht[probe].suppkey, memory_order_relaxed);
+                    if (sk2 == suppkey) {
+                        ps_idx = atomic_load_explicit(&partsupp_ht[probe].idx, memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+            if (ps_idx == -1) continue;
+
+            // Probe orders HT
+            int orderkey = l_orderkey[i];
+            int year = -1;
+            uint ord_hash = sf100_hash_key(orderkey) & ord_mask;
+            for (uint j = 0; j <= ord_mask; ++j) {
+                uint probe = (ord_hash + j) & ord_mask;
+                int o_key = atomic_load_explicit(&orders_ht[probe].key, memory_order_relaxed);
+                if (o_key == orderkey) {
+                    year = atomic_load_explicit(&orders_ht[probe].value, memory_order_relaxed);
+                    break;
+                }
+                if (o_key == -1) break;
+            }
+            if (year == -1) continue;
+
+            float profit = l_extendedprice[i] * (1.0f - l_discount[i]) - ps_supplycost[ps_idx] * l_quantity[i];
+            uint agg_key = (uint)(nationkey << 16) | (uint)year;
+            uint agg_hash = agg_key & agg_mask;
+            for (uint m = 0; m <= agg_mask; ++m) {
+                uint probe = (agg_hash + m) & agg_mask;
+                uint expected = 0;
+                if (atomic_compare_exchange_weak_explicit(&global_agg[probe].key, &expected, agg_key,
+                        memory_order_relaxed, memory_order_relaxed)) {
+                    atomic_fetch_add_explicit(&global_agg[probe].profit, profit, memory_order_relaxed);
+                    break;
+                }
+                if (atomic_load_explicit(&global_agg[probe].key, memory_order_relaxed) == agg_key) {
+                    atomic_fetch_add_explicit(&global_agg[probe].profit, profit, memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q9_build_part_bitmap", 256, true});
+    result.kernels.push_back({"gen_q9_build_supplier_map", 256, true});
+    result.kernels.push_back({"gen_q9_build_partsupp_ht", 256, true});
+    result.kernels.push_back({"gen_q9_build_orders_ht", 256, true});
+    result.kernels.push_back({"gen_q9_probe_and_aggregate", 1024, false});
+}
+
+// ===================================================================
+// Q16: Parts/Supplier Relationship
+// ===================================================================
+static void generateQ16Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q16 Kernel 1: Scan partsupp, set bits in per-group bitmaps
+kernel void gen_q16_scan_and_bitmap(
+    const device int* ps_partkey        [[buffer(0)]],
+    const device int* ps_suppkey        [[buffer(1)]],
+    const device int* part_group_map    [[buffer(2)]],
+    const device uint* complaint_bitmap [[buffer(3)]],
+    device atomic_uint* group_bitmaps   [[buffer(4)]],
+    constant uint& partsupp_size        [[buffer(5)]],
+    constant uint& part_map_size        [[buffer(6)]],
+    constant uint& bv_ints              [[buffer(7)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= partsupp_size) return;
+    int pk = ps_partkey[tid];
+    if ((uint)pk >= part_map_size) return;
+    int gid = part_group_map[pk];
+    if (gid < 0) return;
+    int sk = ps_suppkey[tid];
+    if (bitmap_test(complaint_bitmap, sk)) return;
+    uint word_idx = (uint)gid * bv_ints + ((uint)sk >> 5);
+    uint bit = 1u << ((uint)sk & 31u);
+    atomic_fetch_or_explicit(&group_bitmaps[word_idx], bit, memory_order_relaxed);
+}
+
+// Q16 Kernel 2: Popcount each group's bitmap
+kernel void gen_q16_popcount(
+    const device uint* group_bitmaps    [[buffer(0)]],
+    device uint* group_counts           [[buffer(1)]],
+    constant uint& num_groups           [[buffer(2)]],
+    constant uint& bv_ints              [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid_in_group [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint gid = group_id;
+    if (gid >= num_groups) return;
+    const device uint* bv = group_bitmaps + (uint64_t)gid * bv_ints;
+    uint local_count = 0;
+    for (uint w = tid_in_group; w < bv_ints; w += tg_size) {
+        local_count += popcount(bv[w]);
+    }
+    threadgroup uint shared[32];
+    uint r = tg_reduce_uint(local_count, tid_in_group, tg_size, shared);
+    if (tid_in_group == 0) group_counts[gid] = r;
+}
+)METAL";
+    result.kernels.push_back({"gen_q16_scan_and_bitmap", 256, true});
+    result.kernels.push_back({"gen_q16_popcount", 256, false});
+}
+
+// ===================================================================
+// Q20: Potential Part Promotion
+// ===================================================================
+static void generateQ20Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+struct GenQ20HTEntry {
+    atomic_int key_hi;
+    atomic_int key_lo;
+    atomic_float value;
+};
+
+// Q20 Kernel 1: Aggregate lineitem quantity into HT keyed by (partkey, suppkey)
+kernel void gen_q20_aggregate_lineitem(
+    const device int* l_partkey     [[buffer(0)]],
+    const device int* l_suppkey     [[buffer(1)]],
+    const device float* l_quantity  [[buffer(2)]],
+    const device int* l_shipdate    [[buffer(3)]],
+    const device uint* part_bitmap  [[buffer(4)]],
+    device GenQ20HTEntry* ht        [[buffer(5)]],
+    constant uint& lineitem_size    [[buffer(6)]],
+    constant uint& ht_mask          [[buffer(7)]],
+    constant int& date_start        [[buffer(8)]],
+    constant int& date_end          [[buffer(9)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int date = l_shipdate[i];
+        if (date < date_start || date >= date_end) continue;
+        int pk = l_partkey[i];
+        if (!bitmap_test(part_bitmap, pk)) continue;
+        int sk = l_suppkey[i];
+        float qty = l_quantity[i];
+        uint h = sf100_hash_key(pk * 100001 + sk);
+        for (uint j = 0; j <= ht_mask; j++) {
+            uint slot = (h + j) & ht_mask;
+            int expected = -1;
+            if (atomic_compare_exchange_weak_explicit(&ht[slot].key_hi, &expected, pk,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                atomic_store_explicit(&ht[slot].key_lo, sk, memory_order_relaxed);
+                atomic_fetch_add_explicit(&ht[slot].value, qty, memory_order_relaxed);
+                break;
+            }
+            int cur_pk = atomic_load_explicit(&ht[slot].key_hi, memory_order_relaxed);
+            int cur_sk = atomic_load_explicit(&ht[slot].key_lo, memory_order_relaxed);
+            if (cur_pk == pk && cur_sk == sk) {
+                atomic_fetch_add_explicit(&ht[slot].value, qty, memory_order_relaxed);
+                break;
+            }
+        }
+    }
+}
+
+// Q20 Kernel 2: Probe partsupp against HT, check threshold, set qualifying bitmap
+kernel void gen_q20_probe_partsupp(
+    const device int* ps_partkey        [[buffer(0)]],
+    const device int* ps_suppkey        [[buffer(1)]],
+    const device int* ps_availqty       [[buffer(2)]],
+    const device uint* part_bitmap      [[buffer(3)]],
+    const device uint* canada_bitmap    [[buffer(4)]],
+    const device GenQ20HTEntry* ht      [[buffer(5)]],
+    device atomic_uint* qual_bitmap     [[buffer(6)]],
+    constant uint& partsupp_size        [[buffer(7)]],
+    constant uint& ht_mask              [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= partsupp_size) return;
+    int pk = ps_partkey[tid];
+    if (!bitmap_test(part_bitmap, pk)) return;
+    int sk = ps_suppkey[tid];
+    if (!bitmap_test(canada_bitmap, sk)) return;
+    uint h = sf100_hash_key(pk * 100001 + sk);
+    for (uint j = 0; j <= ht_mask; j++) {
+        uint slot = (h + j) & ht_mask;
+        int cur_pk = atomic_load_explicit(&ht[slot].key_hi, memory_order_relaxed);
+        if (cur_pk == -1) break;
+        if (cur_pk == pk) {
+            int cur_sk = atomic_load_explicit(&ht[slot].key_lo, memory_order_relaxed);
+            if (cur_sk == sk) {
+                float sum_qty = atomic_load_explicit(&ht[slot].value, memory_order_relaxed);
+                if ((float)ps_availqty[tid] > 0.5f * sum_qty) {
+                    atomic_fetch_or_explicit(&qual_bitmap[(uint)sk >> 5],
+                                            1u << ((uint)sk & 31u), memory_order_relaxed);
+                }
+                return;
+            }
+        }
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q20_aggregate_lineitem", 1024, false});
+    result.kernels.push_back({"gen_q20_probe_partsupp", 256, true});
+}
+
+// ===================================================================
+// Q21: Suppliers Who Kept Orders Waiting
+// ===================================================================
+static void generateQ21Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q21 Pass 1: Build per-order supplier tracking (CAS multi-value)
+kernel void gen_q21_build_order_tracking(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device int* l_suppkey         [[buffer(1)]],
+    const device int* l_receiptdate     [[buffer(2)]],
+    const device int* l_commitdate      [[buffer(3)]],
+    const device int* orders_status_map [[buffer(4)]],
+    device atomic_int* first_supp       [[buffer(5)]],
+    device atomic_uint* multi_supp_bm   [[buffer(6)]],
+    device atomic_int* late_supp        [[buffer(7)]],
+    device atomic_uint* multi_late_bm   [[buffer(8)]],
+    constant uint& lineitem_size        [[buffer(9)]],
+    constant uint& map_size             [[buffer(10)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int okey = l_orderkey[i];
+        if ((uint)okey >= map_size) continue;
+        int status = orders_status_map[okey];
+        if (status != 1) continue;
+        int sk = l_suppkey[i];
+        int expected = -1;
+        if (!atomic_compare_exchange_weak_explicit(&first_supp[okey], &expected, sk,
+                memory_order_relaxed, memory_order_relaxed)) {
+            if (expected != sk) bitmap_set(multi_supp_bm, okey);
+        }
+        bool is_late = (l_receiptdate[i] > l_commitdate[i]);
+        if (is_late) {
+            int exp_late = -1;
+            if (!atomic_compare_exchange_weak_explicit(&late_supp[okey], &exp_late, sk,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                if (exp_late != sk) bitmap_set(multi_late_bm, okey);
+            }
+        }
+    }
+}
+
+// Q21 Pass 2: Count qualifying lineitems per SAUDI ARABIA supplier
+kernel void gen_q21_count_qualifying(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device int* l_suppkey         [[buffer(1)]],
+    const device int* l_receiptdate     [[buffer(2)]],
+    const device int* l_commitdate      [[buffer(3)]],
+    const device int* orders_status_map [[buffer(4)]],
+    const device int* first_supp        [[buffer(5)]],
+    const device uint* multi_supp_bm    [[buffer(6)]],
+    const device int* late_supp         [[buffer(7)]],
+    const device uint* multi_late_bm    [[buffer(8)]],
+    const device uint* sa_supp_bitmap   [[buffer(9)]],
+    device atomic_uint* supp_count      [[buffer(10)]],
+    constant uint& lineitem_size        [[buffer(11)]],
+    constant uint& map_size             [[buffer(12)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int okey = l_orderkey[i];
+        if ((uint)okey >= map_size) continue;
+        int status = orders_status_map[okey];
+        if (status != 1) continue;
+        int sk = l_suppkey[i];
+        if (l_receiptdate[i] <= l_commitdate[i]) continue;
+        if (!bitmap_test(sa_supp_bitmap, sk)) continue;
+        if (!bitmap_test(multi_supp_bm, okey)) continue;
+        if (bitmap_test(multi_late_bm, okey)) continue;
+        if (late_supp[okey] != sk) continue;
+        atomic_fetch_add_explicit(&supp_count[sk], 1u, memory_order_relaxed);
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q21_build_order_tracking", 1024, false});
+    result.kernels.push_back({"gen_q21_count_qualifying", 1024, false});
+}
+
 } // anonymous namespace
 
 // ===================================================================
@@ -1479,6 +1944,10 @@ GeneratedKernels generateMetal(const QueryPlan& plan) {
     else if (plan.name == "Q22") generateQ22Kernels(out, result);
     else if (plan.name == "Q2") generateQ2Kernels(out, result);
     else if (plan.name == "Q18") generateQ18Kernels(out, result);
+    else if (plan.name == "Q9") generateQ9Kernels(out, result);
+    else if (plan.name == "Q16") generateQ16Kernels(out, result);
+    else if (plan.name == "Q20") generateQ20Kernels(out, result);
+    else if (plan.name == "Q21") generateQ21Kernels(out, result);
     else throw std::runtime_error("No Metal codegen for plan: " + plan.name);
 
     result.metalSource = out.str();
