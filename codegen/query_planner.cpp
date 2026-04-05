@@ -268,8 +268,96 @@ QueryPlan planQ19(const AnalyzedQuery& /*aq*/) {
     return plan;
 }
 
-// More patterns will be added for Q2, Q4, Q5, Q7-Q12, Q15-Q22…
-// For now, return a fallback plan
+// Q4: Two-table (orders, lineitem) with EXISTS subquery
+bool matchQ4(const AnalyzedQuery& aq) {
+    // Q4 has orders as main table + EXISTS subquery (lineitem)
+    // The analyzer extracts EXISTS as an ExistsPred in the filter tree
+    if (aq.tables.size() == 1 && aq.tables[0] == "orders" && aq.hasGroupBy()) {
+        for (auto& g : aq.groupBy) {
+            if (auto* cr = std::get_if<ColRef>(&g->node))
+                if (cr->column == "o_orderpriority") return true;
+        }
+    }
+    return false;
+}
+
+QueryPlan planQ4(const AnalyzedQuery& /*aq*/) {
+    QueryPlan plan;
+    plan.name = "Q4";
+
+    // Step 1: GPU bitmap build on lineitem (commitdate < receiptdate)
+    BitmapBuildOp bm;
+    bm.table = "lineitem";
+    bm.keyCol = bind("lineitem", "l_orderkey");
+    bm.filter = Predicate::cmp(CmpOp::LT,
+        Expr::col("lineitem","l_commitdate",11,DataType::DATE),
+        Expr::col("lineitem","l_receiptdate",12,DataType::DATE));
+    plan.ops.push_back(std::move(bm));
+
+    // Step 2: Scan orders with date filter + bitmap_test, N-bin TG reduce
+    TwoStageReduceOp reduce;
+    reduce.numBins = 5; // '1' through '5' priorities
+    reduce.binExpr = Expr::col("orders","o_orderpriority",5,DataType::CHAR1);
+    reduce.aggregations = {
+        {AggFunc::COUNT, nullptr, "order_count"},
+    };
+    plan.ops.push_back(std::move(reduce));
+
+    CpuSortOp sort;
+    sort.keys = {{"o_orderpriority", false}};
+    plan.ops.push_back(std::move(sort));
+
+    return plan;
+}
+
+// Q12: Two-table (orders, lineitem) with shipmode grouping
+bool matchQ12(const AnalyzedQuery& aq) {
+    if (aq.tables.size() != 2) return false;
+    std::vector<std::string> sorted = aq.tables;
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted[0] != "lineitem" || sorted[1] != "orders") return false;
+    // Distinguish from Q4 by checking GROUP BY on shipmode
+    for (auto& g : aq.groupBy) {
+        if (auto* cr = std::get_if<ColRef>(&g->node))
+            if (cr->column == "l_shipmode") return true;
+    }
+    return false;
+}
+
+QueryPlan planQ12(const AnalyzedQuery& /*aq*/) {
+    QueryPlan plan;
+    plan.name = "Q12";
+
+    // Step 1: GPU bitmap build on orders (priority in '1','2')
+    BitmapBuildOp bm;
+    bm.table = "orders";
+    bm.keyCol = bind("orders", "o_orderkey");
+    bm.filter = Predicate::logOr({
+        Predicate::cmp(CmpOp::EQ,
+            Expr::col("orders","o_orderpriority",5,DataType::CHAR1),
+            Expr::lits("1")),
+        Predicate::cmp(CmpOp::EQ,
+            Expr::col("orders","o_orderpriority",5,DataType::CHAR1),
+            Expr::lits("2")),
+    });
+    plan.ops.push_back(std::move(bm));
+
+    // Step 2: Scan lineitem with 4 filters + bitmap_test, 4-bin TG reduce
+    TwoStageReduceOp reduce;
+    reduce.numBins = 4; // MAIL-HIGH, MAIL-LOW, SHIP-HIGH, SHIP-LOW
+    reduce.binExpr = Expr::col("lineitem","l_shipmode",14,DataType::CHAR1);
+    reduce.aggregations = {
+        {AggFunc::COUNT, nullptr, "high_line_count"},
+        {AggFunc::COUNT, nullptr, "low_line_count"},
+    };
+    plan.ops.push_back(std::move(reduce));
+
+    CpuSortOp sort;
+    sort.keys = {{"l_shipmode", false}};
+    plan.ops.push_back(std::move(sort));
+
+    return plan;
+}
 
 } // anonymous namespace
 
@@ -280,6 +368,8 @@ QueryPlan planQ19(const AnalyzedQuery& /*aq*/) {
 QueryPlan buildPlan(const AnalyzedQuery& aq) {
     // Try pattern matchers in order of specificity
     if (matchQ19(aq)) return planQ19(aq); // Q19 before Q14 (both lineitem+part)
+    if (matchQ4(aq))  return planQ4(aq);  // Q4 before Q12 (both orders+lineitem)
+    if (matchQ12(aq)) return planQ12(aq);
     if (matchQ1(aq))  return planQ1(aq);
     if (matchQ6(aq))  return planQ6(aq);
     if (matchQ3(aq))  return planQ3(aq);

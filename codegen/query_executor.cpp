@@ -633,6 +633,414 @@ void executeQ13(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     releaseAll(oCustBuf, oCommentBuf, countsBuf, histBuf);
 }
 
+// ===================================================================
+// Q4 EXECUTOR
+// ===================================================================
+
+void executeQ4(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+               const RuntimeCompiler::CompiledQuery& cq,
+               const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl",
+        {{0, ColType::INT}, {11, ColType::DATE}, {12, ColType::DATE}});
+    auto& l_orderkey = lCols.ints(0);
+    auto& l_commitdate = lCols.ints(11);
+    auto& l_receiptdate = lCols.ints(12);
+
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl",
+        {{0, ColType::INT}, {4, ColType::DATE}, {5, ColType::CHAR1}});
+    auto& o_orderkey = oCols.ints(0);
+    auto& o_orderdate = oCols.ints(4);
+    auto& o_orderpriority = oCols.chars(5);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint liSize = (uint)l_orderkey.size();
+    uint ordSize = (uint)o_orderkey.size();
+    if (liSize == 0 || ordSize == 0) { std::cerr << "Q4: no data" << std::endl; return; }
+
+    auto* bmPSO = findPSO(cq, "gen_q4_build_late_bitmap");
+    auto* s1PSO = findPSO(cq, "gen_q4_count_stage1");
+    auto* s2PSO = findPSO(cq, "gen_q4_count_stage2");
+    if (!bmPSO || !s1PSO || !s2PSO) return;
+
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : l_orderkey) max_orderkey = std::max(max_orderkey, k);
+    auto* lateBitmapBuf = createBitmapBuffer(device, max_orderkey);
+
+    const uint numTG = 2048;
+    int date_start = 19930701, date_end = 19931001;
+
+    auto* liOrderkeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* liCommitBuf   = device->newBuffer(l_commitdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* liReceiptBuf  = device->newBuffer(l_receiptdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* ordKeyBuf     = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* ordDateBuf    = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* ordPrioBuf    = device->newBuffer(o_orderpriority.data(), ordSize * sizeof(char), MTL::ResourceStorageModeShared);
+    auto* partialBuf    = device->newBuffer(numTG * 5 * sizeof(uint), MTL::ResourceStorageModeShared);
+    auto* finalBuf      = device->newBuffer(5 * sizeof(uint), MTL::ResourceStorageModeShared);
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(lateBitmapBuf->contents(), 0, lateBitmapBuf->length());
+
+        auto* cmdBuf = cmdQueue->commandBuffer();
+        auto* enc = cmdBuf->computeCommandEncoder();
+
+        enc->setComputePipelineState(bmPSO);
+        enc->setBuffer(liOrderkeyBuf, 0, 0);
+        enc->setBuffer(liCommitBuf, 0, 1);
+        enc->setBuffer(liReceiptBuf, 0, 2);
+        enc->setBuffer(lateBitmapBuf, 0, 3);
+        enc->setBytes(&liSize, sizeof(liSize), 4);
+        {
+            NS::UInteger tgSize = bmPSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (liSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        enc->setComputePipelineState(s1PSO);
+        enc->setBuffer(ordKeyBuf, 0, 0);
+        enc->setBuffer(ordDateBuf, 0, 1);
+        enc->setBuffer(ordPrioBuf, 0, 2);
+        enc->setBuffer(lateBitmapBuf, 0, 3);
+        enc->setBuffer(partialBuf, 0, 4);
+        enc->setBytes(&ordSize, sizeof(ordSize), 5);
+        enc->setBytes(&date_start, sizeof(date_start), 6);
+        enc->setBytes(&date_end, sizeof(date_end), 7);
+        {
+            NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            enc->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        const uint numTGs = numTG;
+        enc->setComputePipelineState(s2PSO);
+        enc->setBuffer(partialBuf, 0, 0);
+        enc->setBuffer(finalBuf, 0, 1);
+        enc->setBytes(&numTGs, sizeof(numTGs), 2);
+        enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
+
+        enc->endEncoding();
+        cmdBuf->commit();
+        cmdBuf->waitUntilCompleted();
+
+        if (iter == 2)
+            gpuMs = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+    }
+
+    auto postStart = std::chrono::high_resolution_clock::now();
+    uint* res = (uint*)finalBuf->contents();
+
+    const char* prio_names[] = {"1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"};
+    printf("\nTPC-H Gen-Q4 Results:\n");
+    printf("+------------------+-------------+\n");
+    printf("| o_orderpriority  | order_count |\n");
+    printf("+------------------+-------------+\n");
+    for (int i = 0; i < 5; i++)
+        printf("| %-16s | %11u |\n", prio_names[i], res[i]);
+    printf("+------------------+-------------+\n");
+
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q4 | %u lineitem, %u orders\n", liSize, ordSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(lateBitmapBuf, liOrderkeyBuf, liCommitBuf, liReceiptBuf,
+               ordKeyBuf, ordDateBuf, ordPrioBuf, partialBuf, finalBuf);
+}
+
+// ===================================================================
+// Q12 EXECUTOR
+// ===================================================================
+
+void executeQ12(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                const RuntimeCompiler::CompiledQuery& cq,
+                const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl",
+        {{0, ColType::INT}, {5, ColType::CHAR1}});
+    auto& o_orderkey = oCols.ints(0);
+    auto& o_orderpriority = oCols.chars(5);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl",
+        {{0, ColType::INT}, {10, ColType::DATE}, {11, ColType::DATE}, {12, ColType::DATE}, {14, ColType::CHAR1}});
+    auto& l_orderkey = lCols.ints(0);
+    auto& l_shipmode = lCols.chars(14);
+    auto& l_shipdate = lCols.ints(10);
+    auto& l_commitdate = lCols.ints(11);
+    auto& l_receiptdate = lCols.ints(12);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint liSize = (uint)l_orderkey.size();
+    uint ordSize = (uint)o_orderkey.size();
+    if (liSize == 0) { std::cerr << "Q12: no data" << std::endl; return; }
+
+    auto* bmPSO = findPSO(cq, "gen_q12_build_priority_bitmap");
+    auto* s1PSO = findPSO(cq, "gen_q12_filter_stage1");
+    auto* s2PSO = findPSO(cq, "gen_q12_filter_stage2");
+    if (!bmPSO || !s1PSO || !s2PSO) return;
+
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    auto* bitmapBuf = createBitmapBuffer(device, max_orderkey);
+
+    const uint numTG = 2048;
+    int receipt_start = 19940101, receipt_end = 19950101;
+
+    auto* ordKeyBuf     = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* ordPrioBuf    = device->newBuffer(o_orderpriority.data(), ordSize * sizeof(char), MTL::ResourceStorageModeShared);
+    auto* orderkeyBuf   = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* shipmodeBuf   = device->newBuffer(l_shipmode.data(), liSize * sizeof(char), MTL::ResourceStorageModeShared);
+    auto* shipdateBuf   = device->newBuffer(l_shipdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* commitdateBuf = device->newBuffer(l_commitdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* receiptBuf    = device->newBuffer(l_receiptdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* partialBuf    = device->newBuffer(numTG * 4 * sizeof(uint), MTL::ResourceStorageModeShared);
+    auto* finalBuf      = device->newBuffer(4 * sizeof(uint), MTL::ResourceStorageModeShared);
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(bitmapBuf->contents(), 0, bitmapBuf->length());
+
+        auto* cmdBuf = cmdQueue->commandBuffer();
+        auto* enc = cmdBuf->computeCommandEncoder();
+
+        enc->setComputePipelineState(bmPSO);
+        enc->setBuffer(ordKeyBuf, 0, 0);
+        enc->setBuffer(ordPrioBuf, 0, 1);
+        enc->setBuffer(bitmapBuf, 0, 2);
+        enc->setBytes(&ordSize, sizeof(ordSize), 3);
+        {
+            NS::UInteger tgSize = bmPSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (ordSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        enc->setComputePipelineState(s1PSO);
+        enc->setBuffer(orderkeyBuf, 0, 0);
+        enc->setBuffer(shipmodeBuf, 0, 1);
+        enc->setBuffer(shipdateBuf, 0, 2);
+        enc->setBuffer(commitdateBuf, 0, 3);
+        enc->setBuffer(receiptBuf, 0, 4);
+        enc->setBuffer(bitmapBuf, 0, 5);
+        enc->setBuffer(partialBuf, 0, 6);
+        enc->setBytes(&liSize, sizeof(liSize), 7);
+        enc->setBytes(&receipt_start, sizeof(receipt_start), 8);
+        enc->setBytes(&receipt_end, sizeof(receipt_end), 9);
+        {
+            NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            enc->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        const uint numTGs = numTG;
+        enc->setComputePipelineState(s2PSO);
+        enc->setBuffer(partialBuf, 0, 0);
+        enc->setBuffer(finalBuf, 0, 1);
+        enc->setBytes(&numTGs, sizeof(numTGs), 2);
+        enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
+
+        enc->endEncoding();
+        cmdBuf->commit();
+        cmdBuf->waitUntilCompleted();
+
+        if (iter == 2)
+            gpuMs = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+    }
+
+    auto postStart = std::chrono::high_resolution_clock::now();
+    uint* res = (uint*)finalBuf->contents();
+
+    printf("\nTPC-H Gen-Q12 Results:\n");
+    printf("+----------+------------------+-----------------+\n");
+    printf("| shipmode | high_line_count  | low_line_count  |\n");
+    printf("+----------+------------------+-----------------+\n");
+    printf("| MAIL     | %16u | %15u |\n", res[0], res[1]);
+    printf("| SHIP     | %16u | %15u |\n", res[2], res[3]);
+    printf("+----------+------------------+-----------------+\n");
+
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q12 | %u lineitem, %u orders\n", liSize, ordSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(bitmapBuf, ordKeyBuf, ordPrioBuf, orderkeyBuf, shipmodeBuf,
+               shipdateBuf, commitdateBuf, receiptBuf, partialBuf, finalBuf);
+}
+
+// ===================================================================
+// Q19 EXECUTOR
+// ===================================================================
+
+void executeQ19(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                const RuntimeCompiler::CompiledQuery& cq,
+                const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto pCols = loadColumnsMulti(dataDir + "part.tbl",
+        {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {5, ColType::INT}, {6, ColType::CHAR_FIXED, 10}});
+    auto& p_partkey = pCols.ints(0);
+    auto& p_brand = pCols.chars(3);
+    auto& p_size = pCols.ints(5);
+    auto& p_container = pCols.chars(6);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl",
+        {{1, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT},
+         {13, ColType::CHAR_FIXED, 25}, {14, ColType::CHAR_FIXED, 10}});
+    auto& l_partkey = lCols.ints(1);
+    auto& l_quantity = lCols.floats(4);
+    auto& l_extendedprice = lCols.floats(5);
+    auto& l_discount = lCols.floats(6);
+    auto& l_shipinstruct = lCols.chars(13);
+    auto& l_shipmode = lCols.chars(14);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint liSize = (uint)l_partkey.size();
+    uint partSize = (uint)p_partkey.size();
+    if (liSize == 0) { std::cerr << "Q19: no data" << std::endl; return; }
+
+    int max_partkey = 0;
+    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    uint mapSize = (uint)(max_partkey + 1);
+    const uint brand_stride = 10;
+    const uint container_stride = 10;
+    const uint shipmode_stride = 10;
+    const uint shipinstruct_stride = 25;
+
+    auto* mapPSO    = findPSO(cq, "gen_q19_build_part_group_map");
+    auto* filterPSO = findPSO(cq, "gen_q19_shipmode_filter");
+    auto* s1PSO     = findPSO(cq, "gen_q19_sum_stage1");
+    auto* s2PSO     = findPSO(cq, "gen_q19_sum_stage2");
+    if (!mapPSO || !filterPSO || !s1PSO || !s2PSO) return;
+
+    const uint numTG = 2048;
+
+    auto* pPartKeyBuf   = device->newBuffer(p_partkey.data(), partSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pBrandBuf     = device->newBuffer(p_brand.data(), (size_t)partSize * brand_stride, MTL::ResourceStorageModeShared);
+    auto* pContainerBuf = device->newBuffer(p_container.data(), (size_t)partSize * container_stride, MTL::ResourceStorageModeShared);
+    auto* pSizeBuf      = device->newBuffer(p_size.data(), partSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* mapBuf        = device->newBuffer(mapSize * sizeof(uint8_t), MTL::ResourceStorageModeShared);
+
+    auto* smBuf        = device->newBuffer(l_shipmode.data(), (size_t)liSize * shipmode_stride, MTL::ResourceStorageModeShared);
+    auto* siBuf        = device->newBuffer(l_shipinstruct.data(), (size_t)liSize * shipinstruct_stride, MTL::ResourceStorageModeShared);
+    auto* qualifiesBuf = device->newBuffer(liSize * sizeof(uint8_t), MTL::ResourceStorageModeShared);
+
+    auto* partkeyBuf = device->newBuffer(l_partkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* qtyBuf     = device->newBuffer(l_quantity.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* priceBuf   = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* discBuf    = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* partialBuf = device->newBuffer(numTG * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* finalBuf   = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(mapBuf->contents(), 0xFF, mapSize * sizeof(uint8_t));
+
+        auto* cmdBuf = cmdQueue->commandBuffer();
+        auto* enc = cmdBuf->computeCommandEncoder();
+
+        // Phase 1: Build part group map
+        enc->setComputePipelineState(mapPSO);
+        enc->setBuffer(pPartKeyBuf, 0, 0);
+        enc->setBuffer(pBrandBuf, 0, 1);
+        enc->setBuffer(pContainerBuf, 0, 2);
+        enc->setBuffer(pSizeBuf, 0, 3);
+        enc->setBuffer(mapBuf, 0, 4);
+        enc->setBytes(&partSize, sizeof(partSize), 5);
+        enc->setBytes(&brand_stride, sizeof(brand_stride), 6);
+        enc->setBytes(&container_stride, sizeof(container_stride), 7);
+        {
+            NS::UInteger tgSize = mapPSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (partSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        // Phase 2: Compute shipmode qualifies flag
+        enc->setComputePipelineState(filterPSO);
+        enc->setBuffer(smBuf, 0, 0);
+        enc->setBuffer(siBuf, 0, 1);
+        enc->setBuffer(qualifiesBuf, 0, 2);
+        enc->setBytes(&liSize, sizeof(liSize), 3);
+        enc->setBytes(&shipmode_stride, sizeof(shipmode_stride), 4);
+        enc->setBytes(&shipinstruct_stride, sizeof(shipinstruct_stride), 5);
+        {
+            NS::UInteger tgSize = filterPSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            uint numGroups = (liSize + (uint)tgSize - 1) / (uint)tgSize;
+            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        // Phase 3: Main filter+sum
+        enc->setComputePipelineState(s1PSO);
+        enc->setBuffer(partkeyBuf, 0, 0);
+        enc->setBuffer(qtyBuf, 0, 1);
+        enc->setBuffer(priceBuf, 0, 2);
+        enc->setBuffer(discBuf, 0, 3);
+        enc->setBuffer(qualifiesBuf, 0, 4);
+        enc->setBuffer(mapBuf, 0, 5);
+        enc->setBuffer(partialBuf, 0, 6);
+        enc->setBytes(&liSize, sizeof(liSize), 7);
+        enc->setBytes(&mapSize, sizeof(mapSize), 8);
+        {
+            NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 1024) tgSize = 1024;
+            enc->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1), MTL::Size::Make(tgSize, 1, 1));
+        }
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        const uint numTGs = numTG;
+        enc->setComputePipelineState(s2PSO);
+        enc->setBuffer(partialBuf, 0, 0);
+        enc->setBuffer(finalBuf, 0, 1);
+        enc->setBytes(&numTGs, sizeof(numTGs), 2);
+        enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
+
+        enc->endEncoding();
+        cmdBuf->commit();
+        cmdBuf->waitUntilCompleted();
+
+        if (iter == 2)
+            gpuMs = (cmdBuf->GPUEndTime() - cmdBuf->GPUStartTime()) * 1000.0;
+    }
+
+    auto postStart = std::chrono::high_resolution_clock::now();
+    float revenue = *(float*)finalBuf->contents();
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nTPC-H Gen-Q19 Result: Revenue = $%.2f\n", revenue);
+    printf("\nGen-Q19 | %u lineitem, %u part\n", liSize, partSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(pPartKeyBuf, pBrandBuf, pContainerBuf, pSizeBuf,
+               smBuf, siBuf, qualifiesBuf,
+               partkeyBuf, qtyBuf, priceBuf, discBuf,
+               mapBuf, partialBuf, finalBuf);
+}
+
 } // anonymous namespace
 
 // ===================================================================
@@ -649,6 +1057,9 @@ void executeQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     else if (plan.name == "Q3")  executeQ3(device, cmdQueue, compiled, dataDir);
     else if (plan.name == "Q14") executeQ14(device, cmdQueue, compiled, dataDir);
     else if (plan.name == "Q13") executeQ13(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q4")  executeQ4(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q12") executeQ12(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q19") executeQ19(device, cmdQueue, compiled, dataDir);
     else throw std::runtime_error("No executor for plan: " + plan.name);
 }
 
