@@ -1041,6 +1041,1336 @@ void executeQ19(MTL::Device* device, MTL::CommandQueue* cmdQueue,
                mapBuf, partialBuf, finalBuf);
 }
 
+// ===================================================================
+// Q15 EXECUTOR
+// ===================================================================
+
+void executeQ15(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                const RuntimeCompiler::CompiledQuery& cq,
+                const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl", {
+        {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}
+    });
+    auto& l_suppkey = lCols.ints(2);
+    auto& l_shipdate = lCols.ints(10);
+    auto& l_extendedprice = lCols.floats(5);
+    auto& l_discount = lCols.floats(6);
+
+    auto sCols = loadColumnsMulti(dataDir + "supplier.tbl", {
+        {0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {4, ColType::CHAR_FIXED, 15}
+    });
+    auto& s_suppkey = sCols.ints(0);
+    auto& s_name = sCols.chars(1);
+    auto& s_address = sCols.chars(2);
+    auto& s_phone = sCols.chars(4);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint liSize = (uint)l_suppkey.size();
+    int max_suppkey = 0;
+    for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
+    uint map_size = max_suppkey + 1;
+
+    auto* pso = findPSO(cq, "gen_q15_aggregate_revenue");
+    if (!pso) return;
+
+    auto* suppkeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* shipdateBuf = device->newBuffer(l_shipdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* priceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* discBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* revenueMapBuf = device->newBuffer(map_size * sizeof(float), MTL::ResourceStorageModeShared);
+
+    int date_start = 19960101, date_end = 19960401;
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(revenueMapBuf->contents(), 0, map_size * sizeof(float));
+
+        auto* cb = cmdQueue->commandBuffer();
+        auto* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(suppkeyBuf, 0, 0);
+        enc->setBuffer(shipdateBuf, 0, 1);
+        enc->setBuffer(priceBuf, 0, 2);
+        enc->setBuffer(discBuf, 0, 3);
+        enc->setBuffer(revenueMapBuf, 0, 4);
+        enc->setBytes(&liSize, sizeof(liSize), 5);
+        enc->setBytes(&date_start, sizeof(date_start), 6);
+        enc->setBytes(&date_end, sizeof(date_end), 7);
+        enc->dispatchThreads(MTL::Size(liSize, 1, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (iter == 2) gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+
+    // CPU post: find max revenue, print matching supplier(s)
+    auto postStart = std::chrono::high_resolution_clock::now();
+    float* revenue_map = (float*)revenueMapBuf->contents();
+    float max_revenue = 0.0f;
+    for (uint i = 0; i < map_size; i++)
+        if (revenue_map[i] > max_revenue) max_revenue = revenue_map[i];
+
+    std::vector<size_t> supp_index(map_size, SIZE_MAX);
+    for (size_t i = 0; i < s_suppkey.size(); i++) supp_index[s_suppkey[i]] = i;
+
+    printf("\nTPC-H Gen-Q15 Results:\n");
+    printf("+---------+------------------+------------------+------------------+------------------+\n");
+    printf("| suppkey |           s_name |        s_address |          s_phone |    total_revenue |\n");
+    printf("+---------+------------------+------------------+------------------+------------------+\n");
+    for (uint i = 0; i < map_size; i++) {
+        if (revenue_map[i] == max_revenue && max_revenue > 0.0f) {
+            size_t si = supp_index[i];
+            if (si == SIZE_MAX) continue;
+            printf("| %7d | %-16s | %-16s | %-16s | %16.2f |\n",
+                   (int)i,
+                   trimFixed(s_name.data(), si, 25).c_str(),
+                   trimFixed(s_address.data(), si, 40).c_str(),
+                   trimFixed(s_phone.data(), si, 15).c_str(),
+                   revenue_map[i]);
+        }
+    }
+    printf("+---------+------------------+------------------+------------------+------------------+\n");
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q15 | %u rows (lineitem)\n", liSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(suppkeyBuf, shipdateBuf, priceBuf, discBuf, revenueMapBuf);
+}
+
+// ===================================================================
+// Q11 EXECUTOR
+// ===================================================================
+
+void executeQ11(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                const RuntimeCompiler::CompiledQuery& cq,
+                const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto nat = loadNation(dataDir);
+    auto s = loadSupplierBasic(dataDir);
+    auto& s_suppkey = s.suppkey;
+    auto& s_nationkey = s.nationkey;
+
+    auto psCols = loadColumnsMulti(dataDir + "partsupp.tbl", {
+        {0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {3, ColType::FLOAT}
+    });
+    auto& ps_partkey = psCols.ints(0);
+    auto& ps_suppkey = psCols.ints(1);
+    auto& ps_availqty = psCols.ints(2);
+    auto& ps_supplycost = psCols.floats(3);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint partsupp_size = (uint)ps_partkey.size();
+    uint supplier_size = (uint)s_suppkey.size();
+
+    // CPU: Find GERMANY nationkey, build supplier bitmap
+    int germany_nk = findNationKey(nat, "GERMANY");
+    if (germany_nk == -1) { std::cerr << "GERMANY not found" << std::endl; return; }
+
+    std::vector<int> germany_keys = {germany_nk};
+    auto suppBm = buildSuppBitmapAndIndex(s_suppkey.data(), s_nationkey.data(),
+                                           supplier_size, germany_keys);
+
+    auto* pso = findPSO(cq, "gen_q11_aggregate");
+    if (!pso) return;
+
+    int max_partkey = 0;
+    for (int k : ps_partkey) max_partkey = std::max(max_partkey, k);
+    uint value_map_size = (uint)(max_partkey + 1);
+    uint tg_size = 256;
+    uint num_tg = (partsupp_size + tg_size - 1) / tg_size;
+
+    auto* psPartKeyBuf = device->newBuffer(ps_partkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* psSuppKeyBuf = device->newBuffer(ps_suppkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* psSupplyCostBuf = device->newBuffer(ps_supplycost.data(), partsupp_size * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* psAvailQtyBuf = device->newBuffer(ps_availqty.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* suppBitmapBuf = device->newBuffer(suppBm.bitmap.data(), suppBm.bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    auto* valueMapBuf = device->newBuffer(value_map_size * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* partialSumsBuf = device->newBuffer(num_tg * sizeof(float), MTL::ResourceStorageModeShared);
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(valueMapBuf->contents(), 0, value_map_size * sizeof(float));
+        memset(partialSumsBuf->contents(), 0, num_tg * sizeof(float));
+
+        auto* cb = cmdQueue->commandBuffer();
+        auto* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(psPartKeyBuf, 0, 0);
+        enc->setBuffer(psSuppKeyBuf, 0, 1);
+        enc->setBuffer(psSupplyCostBuf, 0, 2);
+        enc->setBuffer(psAvailQtyBuf, 0, 3);
+        enc->setBuffer(suppBitmapBuf, 0, 4);
+        enc->setBuffer(valueMapBuf, 0, 5);
+        enc->setBuffer(partialSumsBuf, 0, 6);
+        enc->setBytes(&partsupp_size, sizeof(partsupp_size), 7);
+        enc->dispatchThreads(MTL::Size(partsupp_size, 1, 1), MTL::Size(tg_size, 1, 1));
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (iter == 2) gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+
+    // CPU post: compute global sum → threshold, filter+sort
+    auto postStart = std::chrono::high_resolution_clock::now();
+    float* partial_sums = (float*)partialSumsBuf->contents();
+    double global_sum = 0.0;
+    for (uint i = 0; i < num_tg; i++) global_sum += partial_sums[i];
+    double threshold = global_sum * 0.0001;
+
+    float* value_map = (float*)valueMapBuf->contents();
+    struct Q11Result { int partkey; double value; };
+    std::vector<Q11Result> results;
+    for (uint i = 0; i < value_map_size; i++) {
+        if (value_map[i] > threshold)
+            results.push_back({(int)i, (double)value_map[i]});
+    }
+    std::sort(results.begin(), results.end(),
+              [](const Q11Result& a, const Q11Result& b) { return a.value > b.value; });
+
+    printf("\nTPC-H Gen-Q11 Results (Top 20 of %zu):\n", results.size());
+    printf("+-----------+------------------+\n");
+    printf("| ps_partkey|            value |\n");
+    printf("+-----------+------------------+\n");
+    size_t limit = std::min(results.size(), (size_t)20);
+    for (size_t i = 0; i < limit; i++)
+        printf("| %9d | %16.2f |\n", results[i].partkey, results[i].value);
+    printf("+-----------+------------------+\n");
+    printf("Total qualifying rows: %zu, Global sum: %.2f, Threshold: %.2f\n",
+           results.size(), global_sum, threshold);
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q11 | %u rows (partsupp)\n", partsupp_size);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(psPartKeyBuf, psSuppKeyBuf, psSupplyCostBuf, psAvailQtyBuf,
+               suppBitmapBuf, valueMapBuf, partialSumsBuf);
+}
+
+// ===================================================================
+// Q10 EXECUTOR
+// ===================================================================
+
+void executeQ10(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                const RuntimeCompiler::CompiledQuery& cq,
+                const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto cCols = loadColumnsMulti(dataDir + "customer.tbl", {
+        {0, ColType::INT}, {1, ColType::CHAR_FIXED, 18}, {2, ColType::CHAR_FIXED, 40},
+        {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT}, {7, ColType::CHAR_FIXED, 117}
+    });
+    auto& c_custkey = cCols.ints(0);
+    auto& c_name = cCols.chars(1);
+    auto& c_nationkey = cCols.ints(3);
+    auto& c_acctbal = cCols.floats(5);
+
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl", {
+        {0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}
+    });
+    auto& o_orderkey = oCols.ints(0);
+    auto& o_custkey = oCols.ints(1);
+    auto& o_orderdate = oCols.ints(4);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl", {
+        {0, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {8, ColType::CHAR1}
+    });
+    auto& l_orderkey = lCols.ints(0);
+    auto& l_extendedprice = lCols.floats(5);
+    auto& l_discount = lCols.floats(6);
+    auto& l_returnflag = lCols.chars(8);
+
+    auto nat = loadNation(dataDir);
+    auto nation_names = buildNationNames(nat.nationkey, nat.name.data(), NationData::NAME_WIDTH);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint ordSize = (uint)o_orderkey.size();
+    uint liSize = (uint)l_orderkey.size();
+
+    // Build custkey → row index
+    int max_custkey = 0;
+    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    std::vector<size_t> cust_index(max_custkey + 1, SIZE_MAX);
+    for (size_t i = 0; i < c_custkey.size(); i++) cust_index[c_custkey[i]] = i;
+
+    auto* buildPSO = findPSO(cq, "gen_q10_build_orders_map");
+    auto* probePSO = findPSO(cq, "gen_q10_probe_and_aggregate");
+    if (!buildPSO || !probePSO) return;
+
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    uint map_size = max_orderkey + 1;
+
+    auto* ordKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* ordCustBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* ordDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* ordersMapBuf = createFilledBuffer(device, (size_t)map_size * sizeof(int), -1);
+
+    auto* liOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* liRetFlagBuf = device->newBuffer(l_returnflag.data(), liSize * sizeof(char), MTL::ResourceStorageModeShared);
+    auto* liPriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* liDiscBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+
+    uint cust_rev_size = max_custkey + 1;
+    auto* custRevBuf = device->newBuffer(cust_rev_size * sizeof(float), MTL::ResourceStorageModeShared);
+
+    int date_start = 19931001, date_end = 19940101;
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(ordersMapBuf->contents(), -1, (size_t)map_size * sizeof(int));
+        memset(custRevBuf->contents(), 0, cust_rev_size * sizeof(float));
+
+        auto* cb = cmdQueue->commandBuffer();
+        auto* enc = cb->computeCommandEncoder();
+
+        // Build orders map
+        enc->setComputePipelineState(buildPSO);
+        enc->setBuffer(ordKeyBuf, 0, 0);
+        enc->setBuffer(ordCustBuf, 0, 1);
+        enc->setBuffer(ordDateBuf, 0, 2);
+        enc->setBuffer(ordersMapBuf, 0, 3);
+        enc->setBytes(&ordSize, sizeof(ordSize), 4);
+        enc->setBytes(&date_start, sizeof(date_start), 5);
+        enc->setBytes(&date_end, sizeof(date_end), 6);
+        enc->dispatchThreads(MTL::Size(ordSize, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        // Probe lineitem
+        enc->setComputePipelineState(probePSO);
+        enc->setBuffer(liOrdKeyBuf, 0, 0);
+        enc->setBuffer(liRetFlagBuf, 0, 1);
+        enc->setBuffer(liPriceBuf, 0, 2);
+        enc->setBuffer(liDiscBuf, 0, 3);
+        enc->setBuffer(ordersMapBuf, 0, 4);
+        enc->setBuffer(custRevBuf, 0, 5);
+        enc->setBytes(&liSize, sizeof(liSize), 6);
+        enc->setBytes(&map_size, sizeof(map_size), 7);
+        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (iter == 2) gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+
+    // CPU post: Top 20 by revenue DESC using bounded min-heap
+    auto postStart = std::chrono::high_resolution_clock::now();
+    float* cust_revenue = (float*)custRevBuf->contents();
+
+    struct Q10Result { int custkey; float revenue; };
+    auto cmp = [](const Q10Result& a, const Q10Result& b) { return a.revenue > b.revenue; };
+    std::vector<Q10Result> topHeap;
+    topHeap.reserve(21);
+    for (uint i = 0; i < cust_rev_size; i++) {
+        if (cust_revenue[i] > 0.0f) {
+            if (topHeap.size() < 20) {
+                topHeap.push_back({(int)i, cust_revenue[i]});
+                std::push_heap(topHeap.begin(), topHeap.end(), cmp);
+            } else if (cust_revenue[i] > topHeap.front().revenue) {
+                std::pop_heap(topHeap.begin(), topHeap.end(), cmp);
+                topHeap.back() = {(int)i, cust_revenue[i]};
+                std::push_heap(topHeap.begin(), topHeap.end(), cmp);
+            }
+        }
+    }
+    std::sort_heap(topHeap.begin(), topHeap.end(), cmp);
+
+    printf("\nTPC-H Gen-Q10 Results (Top 20):\n");
+    printf("+---------+------------------+------------+----------+------------------+\n");
+    printf("| custkey |           c_name |    revenue | c_acctbal|           n_name |\n");
+    printf("+---------+------------------+------------+----------+------------------+\n");
+    for (size_t i = 0; i < topHeap.size(); i++) {
+        int ck = topHeap[i].custkey;
+        size_t ci = cust_index[ck];
+        if (ci == SIZE_MAX) continue;
+        printf("| %7d | %-16s | $%10.2f| %8.2f | %-16s |\n",
+               ck, trimFixed(c_name.data(), ci, 18).c_str(),
+               topHeap[i].revenue, c_acctbal[ci],
+               nation_names[c_nationkey[ci]].c_str());
+    }
+    printf("+---------+------------------+------------+----------+------------------+\n");
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q10 | %u orders, %u lineitem\n", ordSize, liSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(ordKeyBuf, ordCustBuf, ordDateBuf, ordersMapBuf,
+               liOrdKeyBuf, liRetFlagBuf, liPriceBuf, liDiscBuf, custRevBuf);
+}
+
+// ===================================================================
+// Q5 EXECUTOR
+// ===================================================================
+
+void executeQ5(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+               const RuntimeCompiler::CompiledQuery& cq,
+               const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto cCols = loadColumnsMulti(dataDir + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
+    auto& c_custkey = cCols.ints(0); auto& c_nationkey = cCols.ints(3);
+
+    auto s = loadSupplierBasic(dataDir);
+    auto& s_suppkey = s.suppkey; auto& s_nationkey = s.nationkey;
+
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
+    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1); auto& o_orderdate = oCols.ints(4);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
+    auto& l_orderkey = lCols.ints(0); auto& l_suppkey = lCols.ints(2);
+    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+
+    auto nat = loadNation(dataDir, true);
+    auto reg = loadRegion(dataDir);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    const uint customer_size = (uint)c_custkey.size();
+    const uint supplier_size = (uint)s_suppkey.size();
+    const uint orders_size = (uint)o_orderkey.size();
+    const uint lineitem_size = (uint)l_orderkey.size();
+
+    int asia_regionkey = findRegionKey(reg.regionkey, reg.name.data(), RegionData::NAME_WIDTH, "ASIA");
+    if (asia_regionkey == -1) { std::cerr << "Error: ASIA region not found" << std::endl; return; }
+    auto nation_names = buildNationNames(nat.nationkey, nat.name.data(), NationData::NAME_WIDTH);
+    uint cpu_nation_bitmap = buildNationBitmap(nat.nationkey, nat.regionkey, asia_regionkey);
+
+    auto* custMapPSO = findPSO(cq, "gen_q5_build_customer_nation_map");
+    auto* suppMapPSO = findPSO(cq, "gen_q5_build_supplier_nation_map");
+    auto* ordMapPSO = findPSO(cq, "gen_q5_build_orders_map");
+    auto* probePSO = findPSO(cq, "gen_q5_probe_and_aggregate");
+    if (!custMapPSO || !suppMapPSO || !ordMapPSO || !probePSO) return;
+
+    int max_custkey = 0, max_suppkey = 0, max_orderkey = 0;
+    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+
+    uint cust_map_size = max_custkey + 1;
+    uint supp_map_size = max_suppkey + 1;
+    uint map_size = max_orderkey + 1;
+
+    auto* pCustKeyBuf = device->newBuffer(c_custkey.data(), customer_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pCustNationBuf = device->newBuffer(c_nationkey.data(), customer_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pCustNationMapBuf = createFilledBuffer(device, cust_map_size * sizeof(int), -1);
+
+    auto* pSuppKeyBuf = device->newBuffer(s_suppkey.data(), supplier_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pSuppNationBuf = device->newBuffer(s_nationkey.data(), supplier_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pSuppNationMapBuf = createFilledBuffer(device, supp_map_size * sizeof(int), -1);
+
+    auto* pNationBitmapBuf = device->newBuffer(&cpu_nation_bitmap, sizeof(uint), MTL::ResourceStorageModeShared);
+
+    auto* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdCustBuf = device->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdDateBuf = device->newBuffer(o_orderdate.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdersMapBuf = createFilledBuffer(device, (size_t)map_size * sizeof(int), -1);
+
+    auto* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLineSuppKeyBuf = device->newBuffer(l_suppkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* pLineDiscBuf = device->newBuffer(l_discount.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* pNationRevenueBuf = device->newBuffer(25 * sizeof(float), MTL::ResourceStorageModeShared);
+
+    const int date_start = 19940101;
+    const int date_end = 19950101;
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(pCustNationMapBuf->contents(), -1, cust_map_size * sizeof(int));
+        memset(pSuppNationMapBuf->contents(), -1, supp_map_size * sizeof(int));
+        memset(pOrdersMapBuf->contents(), -1, (size_t)map_size * sizeof(int));
+        memset(pNationRevenueBuf->contents(), 0, 25 * sizeof(float));
+
+        // Build phase
+        auto* cb = cmdQueue->commandBuffer();
+        auto* enc = cb->computeCommandEncoder();
+
+        enc->setComputePipelineState(custMapPSO);
+        enc->setBuffer(pCustKeyBuf, 0, 0);
+        enc->setBuffer(pCustNationBuf, 0, 1);
+        enc->setBuffer(pCustNationMapBuf, 0, 2);
+        enc->setBuffer(pNationBitmapBuf, 0, 3);
+        enc->setBytes(&customer_size, sizeof(customer_size), 4);
+        enc->dispatchThreads(MTL::Size(customer_size, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->setComputePipelineState(suppMapPSO);
+        enc->setBuffer(pSuppKeyBuf, 0, 0);
+        enc->setBuffer(pSuppNationBuf, 0, 1);
+        enc->setBuffer(pSuppNationMapBuf, 0, 2);
+        enc->setBuffer(pNationBitmapBuf, 0, 3);
+        enc->setBytes(&supplier_size, sizeof(supplier_size), 4);
+        enc->dispatchThreads(MTL::Size(supplier_size, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        enc->setComputePipelineState(ordMapPSO);
+        enc->setBuffer(pOrdKeyBuf, 0, 0);
+        enc->setBuffer(pOrdCustBuf, 0, 1);
+        enc->setBuffer(pOrdDateBuf, 0, 2);
+        enc->setBuffer(pOrdersMapBuf, 0, 3);
+        enc->setBytes(&orders_size, sizeof(orders_size), 4);
+        enc->setBytes(&date_start, sizeof(date_start), 5);
+        enc->setBytes(&date_end, sizeof(date_end), 6);
+        enc->setBytes(&map_size, sizeof(map_size), 7);
+        enc->setBuffer(pCustNationMapBuf, 0, 8);
+        enc->dispatchThreads(MTL::Size(orders_size, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        double buildTime = 0;
+        if (iter == 2) buildTime = cb->GPUEndTime() - cb->GPUStartTime();
+
+        // Probe phase
+        cb = cmdQueue->commandBuffer();
+        enc = cb->computeCommandEncoder();
+
+        enc->setComputePipelineState(probePSO);
+        enc->setBuffer(pLineOrdKeyBuf, 0, 0);
+        enc->setBuffer(pLineSuppKeyBuf, 0, 1);
+        enc->setBuffer(pLinePriceBuf, 0, 2);
+        enc->setBuffer(pLineDiscBuf, 0, 3);
+        enc->setBuffer(pOrdersMapBuf, 0, 4);
+        enc->setBuffer(pSuppNationMapBuf, 0, 5);
+        enc->setBuffer(pNationRevenueBuf, 0, 6);
+        enc->setBytes(&lineitem_size, sizeof(lineitem_size), 7);
+        enc->setBytes(&map_size, sizeof(map_size), 8);
+        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+
+        if (iter == 2) {
+            double probeTime = cb->GPUEndTime() - cb->GPUStartTime();
+            gpuMs = (buildTime + probeTime) * 1000.0;
+        }
+    }
+
+    auto postStart = std::chrono::high_resolution_clock::now();
+    postProcessQ5((float*)pNationRevenueBuf->contents(), nation_names);
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q5 | %u rows (lineitem)\n", lineitem_size);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(pCustKeyBuf, pCustNationBuf, pCustNationMapBuf,
+               pSuppKeyBuf, pSuppNationBuf, pSuppNationMapBuf,
+               pNationBitmapBuf,
+               pOrdKeyBuf, pOrdCustBuf, pOrdDateBuf, pOrdersMapBuf,
+               pLineOrdKeyBuf, pLineSuppKeyBuf, pLinePriceBuf, pLineDiscBuf,
+               pNationRevenueBuf);
+}
+
+// ===================================================================
+// Q7 EXECUTOR
+// ===================================================================
+
+void executeQ7(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+               const RuntimeCompiler::CompiledQuery& cq,
+               const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto s = loadSupplierBasic(dataDir);
+    auto& s_suppkey = s.suppkey; auto& s_nationkey = s.nationkey;
+
+    auto cCols = loadColumnsMulti(dataDir + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
+    auto& c_custkey = cCols.ints(0); auto& c_nationkey = cCols.ints(3);
+
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}});
+    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl",
+        {{0, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
+    auto& l_orderkey = lCols.ints(0); auto& l_suppkey = lCols.ints(2);
+    auto& l_shipdate = lCols.ints(10);
+    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+
+    auto nat = loadNation(dataDir);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    int france_nk = findNationKey(nat, "FRANCE");
+    int germany_nk = findNationKey(nat, "GERMANY");
+    if (france_nk == -1 || germany_nk == -1) {
+        std::cerr << "Error: FRANCE/GERMANY not found" << std::endl;
+        return;
+    }
+
+    uint suppSize = (uint)s_suppkey.size();
+    uint custSize = (uint)c_custkey.size();
+    uint ordSize = (uint)o_orderkey.size();
+    uint liSize = (uint)l_orderkey.size();
+
+    int max_suppkey = 0, max_custkey = 0, max_orderkey = 0;
+    for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
+    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    uint supp_map_size = max_suppkey + 1;
+    uint cust_map_size = max_custkey + 1;
+    uint ord_map_size = max_orderkey + 1;
+
+    auto* suppMapPSO = findPSO(cq, "gen_q7_build_supplier_map");
+    auto* custMapPSO = findPSO(cq, "gen_q7_build_customer_map");
+    auto* ordMapPSO = findPSO(cq, "gen_q7_build_orders_map");
+    auto* probePSO = findPSO(cq, "gen_q7_probe_and_aggregate");
+    if (!suppMapPSO || !custMapPSO || !ordMapPSO || !probePSO) return;
+
+    auto* pSuppKeyBuf = device->newBuffer(s_suppkey.data(), suppSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pSuppNationBuf = device->newBuffer(s_nationkey.data(), suppSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pSuppNationMapBuf = createFilledBuffer(device, supp_map_size * sizeof(int), -1);
+
+    auto* pCustKeyBuf = device->newBuffer(c_custkey.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pCustNationBuf = device->newBuffer(c_nationkey.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pCustNationMapBuf = createFilledBuffer(device, cust_map_size * sizeof(int), -1);
+
+    auto* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdCustBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdMapBuf = createFilledBuffer(device, (size_t)ord_map_size * sizeof(int), -1);
+
+    auto* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLineSuppKeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLineShipDateBuf = device->newBuffer(l_shipdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* pLineDiscBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+
+    auto* pRevenueBinsBuf = device->newBuffer(4 * sizeof(float), MTL::ResourceStorageModeShared);
+
+    int date_start = 19950101, date_end = 19961231;
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(pSuppNationMapBuf->contents(), -1, supp_map_size * sizeof(int));
+        memset(pCustNationMapBuf->contents(), -1, cust_map_size * sizeof(int));
+        memset(pOrdMapBuf->contents(), -1, (size_t)ord_map_size * sizeof(int));
+        memset(pRevenueBinsBuf->contents(), 0, 4 * sizeof(float));
+
+        auto* cb = cmdQueue->commandBuffer();
+        auto* enc = cb->computeCommandEncoder();
+
+        // Build supplier map
+        enc->setComputePipelineState(suppMapPSO);
+        enc->setBuffer(pSuppKeyBuf, 0, 0); enc->setBuffer(pSuppNationBuf, 0, 1);
+        enc->setBuffer(pSuppNationMapBuf, 0, 2);
+        enc->setBytes(&france_nk, sizeof(france_nk), 3);
+        enc->setBytes(&germany_nk, sizeof(germany_nk), 4);
+        enc->setBytes(&suppSize, sizeof(suppSize), 5);
+        enc->dispatchThreads(MTL::Size(suppSize, 1, 1), MTL::Size(256, 1, 1));
+
+        // Build customer map
+        enc->setComputePipelineState(custMapPSO);
+        enc->setBuffer(pCustKeyBuf, 0, 0); enc->setBuffer(pCustNationBuf, 0, 1);
+        enc->setBuffer(pCustNationMapBuf, 0, 2);
+        enc->setBytes(&france_nk, sizeof(france_nk), 3);
+        enc->setBytes(&germany_nk, sizeof(germany_nk), 4);
+        enc->setBytes(&custSize, sizeof(custSize), 5);
+        enc->dispatchThreads(MTL::Size(custSize, 1, 1), MTL::Size(256, 1, 1));
+
+        // Build orders map
+        enc->setComputePipelineState(ordMapPSO);
+        enc->setBuffer(pOrdKeyBuf, 0, 0); enc->setBuffer(pOrdCustBuf, 0, 1);
+        enc->setBuffer(pOrdMapBuf, 0, 2);
+        enc->setBytes(&ordSize, sizeof(ordSize), 3);
+        enc->dispatchThreads(MTL::Size(ordSize, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        // Probe lineitem
+        enc->setComputePipelineState(probePSO);
+        enc->setBuffer(pLineOrdKeyBuf, 0, 0); enc->setBuffer(pLineSuppKeyBuf, 0, 1);
+        enc->setBuffer(pLineShipDateBuf, 0, 2); enc->setBuffer(pLinePriceBuf, 0, 3);
+        enc->setBuffer(pLineDiscBuf, 0, 4);
+        enc->setBuffer(pOrdMapBuf, 0, 5); enc->setBuffer(pCustNationMapBuf, 0, 6);
+        enc->setBuffer(pSuppNationMapBuf, 0, 7); enc->setBuffer(pRevenueBinsBuf, 0, 8);
+        enc->setBytes(&liSize, sizeof(liSize), 9);
+        enc->setBytes(&ord_map_size, sizeof(ord_map_size), 10);
+        enc->setBytes(&france_nk, sizeof(france_nk), 11);
+        enc->setBytes(&germany_nk, sizeof(germany_nk), 12);
+        enc->setBytes(&date_start, sizeof(date_start), 13);
+        enc->setBytes(&date_end, sizeof(date_end), 14);
+        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (iter == 2) gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+
+    auto postStart = std::chrono::high_resolution_clock::now();
+    float* bins = (float*)pRevenueBinsBuf->contents();
+    printf("\nTPC-H Gen-Q7 Results:\n");
+    printf("+----------+----------+--------+-----------------+\n");
+    printf("| supp_nat | cust_nat | l_year |         revenue |\n");
+    printf("+----------+----------+--------+-----------------+\n");
+    const char* pair_supp[] = {"FRANCE", "GERMANY"};
+    const char* pair_cust[] = {"GERMANY", "FRANCE"};
+    for (int p = 0; p < 2; p++)
+        for (int y = 0; y < 2; y++)
+            printf("| %-8s | %-8s | %6d | $%14.2f |\n",
+                   pair_supp[p], pair_cust[p], 1995 + y, bins[p * 2 + y]);
+    printf("+----------+----------+--------+-----------------+\n");
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q7 | %u lineitem\n", liSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(pSuppKeyBuf, pSuppNationBuf, pSuppNationMapBuf,
+               pCustKeyBuf, pCustNationBuf, pCustNationMapBuf,
+               pOrdKeyBuf, pOrdCustBuf, pOrdMapBuf,
+               pLineOrdKeyBuf, pLineSuppKeyBuf, pLineShipDateBuf, pLinePriceBuf, pLineDiscBuf,
+               pRevenueBinsBuf);
+}
+
+// ===================================================================
+// Q8 EXECUTOR
+// ===================================================================
+
+void executeQ8(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+               const RuntimeCompiler::CompiledQuery& cq,
+               const std::string& dataDir) {
+
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto pCols = loadColumnsMulti(dataDir + "part.tbl", {{0, ColType::INT}, {4, ColType::CHAR_FIXED, 25}});
+    auto& p_partkey = pCols.ints(0); auto& p_type = pCols.chars(4);
+
+    auto s = loadSupplierBasic(dataDir);
+    auto& s_suppkey = s.suppkey; auto& s_nationkey = s.nationkey;
+
+    auto cCols = loadColumnsMulti(dataDir + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
+    auto& c_custkey = cCols.ints(0); auto& c_nationkey = cCols.ints(3);
+
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
+    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1); auto& o_orderdate = oCols.ints(4);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl",
+        {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
+    auto& l_orderkey = lCols.ints(0); auto& l_partkey = lCols.ints(1); auto& l_suppkey = lCols.ints(2);
+    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+
+    auto nat = loadNation(dataDir, true);
+    auto reg = loadRegion(dataDir);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    int america_rk = findRegionKey(reg.regionkey, reg.name.data(), RegionData::NAME_WIDTH, "AMERICA");
+    int brazil_nk = findNationKey(nat, "BRAZIL");
+
+    // CPU: Build part bitmap
+    auto part_bm = buildCPUBitmap(p_partkey, [&](size_t i) {
+        return trimFixed(p_type.data(), i, 25) == "ECONOMY ANODIZED STEEL";
+    });
+
+    // CPU: Build customer→nationkey map (AMERICA only)
+    int max_custkey = 0;
+    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    uint cust_map_size = max_custkey + 1;
+    std::vector<int> cust_nation_map(cust_map_size, -1);
+    uint america_bitmap = buildNationBitmap(nat.nationkey, nat.regionkey, america_rk);
+    for (size_t i = 0; i < c_custkey.size(); i++) {
+        int nk = c_nationkey[i];
+        if ((america_bitmap >> nk) & 1)
+            cust_nation_map[c_custkey[i]] = nk;
+    }
+
+    // CPU: Build supplier→nationkey map
+    int max_suppkey = 0;
+    for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
+    uint supp_map_size = max_suppkey + 1;
+    std::vector<int> supp_nation_map(supp_map_size, -1);
+    for (size_t i = 0; i < s_suppkey.size(); i++) supp_nation_map[s_suppkey[i]] = s_nationkey[i];
+
+    uint ordSize = (uint)o_orderkey.size();
+    uint liSize = (uint)l_orderkey.size();
+
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    uint ord_map_size = max_orderkey + 1;
+
+    auto* buildPSO = findPSO(cq, "gen_q8_build_orders_map");
+    auto* probePSO = findPSO(cq, "gen_q8_probe_and_aggregate");
+    if (!buildPSO || !probePSO) return;
+
+    auto* pPartBitmapBuf = uploadBitmap(device, part_bm);
+    auto* pCustNationMapBuf = device->newBuffer(cust_nation_map.data(), cust_map_size * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pSuppNationMapBuf = device->newBuffer(supp_nation_map.data(), supp_map_size * sizeof(int), MTL::ResourceStorageModeShared);
+
+    auto* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdCustBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pOrdCustMapBuf = createFilledBuffer(device, (size_t)ord_map_size * sizeof(int), -1);
+    auto* pOrdYearMapBuf = device->newBuffer((size_t)ord_map_size * sizeof(int), MTL::ResourceStorageModeShared);
+
+    auto* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLinePartKeyBuf = device->newBuffer(l_partkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLineSuppKeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    auto* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    auto* pLineDiscBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+
+    auto* pResultBinsBuf = device->newBuffer(4 * sizeof(float), MTL::ResourceStorageModeShared);
+
+    int date_start = 19950101, date_end = 19961231;
+
+    double gpuMs = 0.0;
+    for (int iter = 0; iter < 3; ++iter) {
+        memset(pOrdCustMapBuf->contents(), -1, (size_t)ord_map_size * sizeof(int));
+        memset(pOrdYearMapBuf->contents(), 0, (size_t)ord_map_size * sizeof(int));
+        memset(pResultBinsBuf->contents(), 0, 4 * sizeof(float));
+
+        auto* cb = cmdQueue->commandBuffer();
+        auto* enc = cb->computeCommandEncoder();
+
+        // Build orders map
+        enc->setComputePipelineState(buildPSO);
+        enc->setBuffer(pOrdKeyBuf, 0, 0); enc->setBuffer(pOrdCustBuf, 0, 1);
+        enc->setBuffer(pOrdDateBuf, 0, 2);
+        enc->setBuffer(pOrdCustMapBuf, 0, 3); enc->setBuffer(pOrdYearMapBuf, 0, 4);
+        enc->setBuffer(pCustNationMapBuf, 0, 5);
+        enc->setBytes(&ordSize, sizeof(ordSize), 6);
+        enc->setBytes(&date_start, sizeof(date_start), 7);
+        enc->setBytes(&date_end, sizeof(date_end), 8);
+        enc->dispatchThreads(MTL::Size(ordSize, 1, 1), MTL::Size(256, 1, 1));
+
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+        // Probe lineitem
+        enc->setComputePipelineState(probePSO);
+        enc->setBuffer(pLineOrdKeyBuf, 0, 0); enc->setBuffer(pLinePartKeyBuf, 0, 1);
+        enc->setBuffer(pLineSuppKeyBuf, 0, 2);
+        enc->setBuffer(pLinePriceBuf, 0, 3); enc->setBuffer(pLineDiscBuf, 0, 4);
+        enc->setBuffer(pPartBitmapBuf, 0, 5);
+        enc->setBuffer(pOrdCustMapBuf, 0, 6); enc->setBuffer(pOrdYearMapBuf, 0, 7);
+        enc->setBuffer(pSuppNationMapBuf, 0, 8);
+        enc->setBuffer(pResultBinsBuf, 0, 9);
+        enc->setBytes(&liSize, sizeof(liSize), 10);
+        enc->setBytes(&ord_map_size, sizeof(ord_map_size), 11);
+        enc->setBytes(&brazil_nk, sizeof(brazil_nk), 12);
+        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (iter == 2) gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+    }
+
+    auto postStart = std::chrono::high_resolution_clock::now();
+    float* bins = (float*)pResultBinsBuf->contents();
+    printf("\nTPC-H Gen-Q8 Results:\n");
+    printf("+--------+------------+\n");
+    printf("| o_year |  mkt_share |\n");
+    printf("+--------+------------+\n");
+    for (int y = 0; y < 2; y++) {
+        float total = bins[2 + y];
+        float mkt_share = (total > 0.0f) ? bins[y] / total : 0.0f;
+        printf("| %6d | %10.6f |\n", 1995 + y, mkt_share);
+    }
+    printf("+--------+------------+\n");
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q8 | %u lineitem\n", liSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(pPartBitmapBuf, pCustNationMapBuf, pSuppNationMapBuf,
+               pOrdKeyBuf, pOrdCustBuf, pOrdDateBuf, pOrdCustMapBuf, pOrdYearMapBuf,
+               pLineOrdKeyBuf, pLinePartKeyBuf, pLineSuppKeyBuf, pLinePriceBuf, pLineDiscBuf,
+               pResultBinsBuf);
+}
+
+// ===================================================================
+// Q17: Small-Quantity-Order Revenue
+// ===================================================================
+static void executeQ17(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                       const RuntimeCompiler::CompiledQuery& compiled,
+                       const std::string& dataDir) {
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto pCols = loadColumnsMulti(dataDir + "part.tbl",
+        {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {6, ColType::CHAR_FIXED, 10}});
+    auto& p_partkey = pCols.ints(0); auto& p_brand = pCols.chars(3); auto& p_container = pCols.chars(6);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl",
+        {{1, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}});
+    auto& l_partkey = lCols.ints(1); auto& l_quantity = lCols.floats(4); auto& l_extendedprice = lCols.floats(5);
+
+    // Build part bitmap: Brand#23, MED BOX
+    auto part_bm = buildCPUBitmap(p_partkey, [&](size_t i) {
+        return trimFixed(p_brand.data(), i, 10) == "Brand#23" &&
+               trimFixed(p_container.data(), i, 10) == "MED BOX";
+    });
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint liSize = (uint)l_partkey.size();
+    uint mapSize = part_bm.max_key + 1;
+
+    MTL::Buffer* pPartBitmapBuf = uploadBitmap(device, part_bm);
+    MTL::Buffer* pLinePartKeyBuf = device->newBuffer(l_partkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineQtyBuf = device->newBuffer(l_quantity.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSumQtyMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCountMapBuf = device->newBuffer((size_t)mapSize * sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pThresholdMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pTotalRevenueBuf = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+
+    memset(pSumQtyMapBuf->contents(), 0, (size_t)mapSize * sizeof(float));
+    memset(pCountMapBuf->contents(), 0, (size_t)mapSize * sizeof(uint));
+    *(float*)pTotalRevenueBuf->contents() = 0.0f;
+
+    // Pass 1: aggregate qty stats
+    MTL::CommandBuffer* cb1 = cmdQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* enc1 = cb1->computeCommandEncoder();
+    enc1->setComputePipelineState(findPSO(compiled, "gen_q17_aggregate_qty_stats"));
+    enc1->setBuffer(pLinePartKeyBuf, 0, 0);
+    enc1->setBuffer(pLineQtyBuf, 0, 1);
+    enc1->setBuffer(pPartBitmapBuf, 0, 2);
+    enc1->setBuffer(pSumQtyMapBuf, 0, 3);
+    enc1->setBuffer(pCountMapBuf, 0, 4);
+    enc1->setBytes(&liSize, sizeof(liSize), 5);
+    enc1->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+    enc1->endEncoding();
+    cb1->commit(); cb1->waitUntilCompleted();
+
+    // CPU: compute threshold = 0.2 * avg per partkey
+    float* sumQty = (float*)pSumQtyMapBuf->contents();
+    uint* countQty = (uint*)pCountMapBuf->contents();
+    float* threshold = (float*)pThresholdMapBuf->contents();
+    for (uint pk = 0; pk < mapSize; pk++) {
+        threshold[pk] = (countQty[pk] > 0) ? 0.2f * (sumQty[pk] / (float)countQty[pk]) : 0.0f;
+    }
+
+    // Pass 2: sum revenue
+    MTL::CommandBuffer* cb2 = cmdQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* enc2 = cb2->computeCommandEncoder();
+    enc2->setComputePipelineState(findPSO(compiled, "gen_q17_sum_revenue"));
+    enc2->setBuffer(pLinePartKeyBuf, 0, 0);
+    enc2->setBuffer(pLineQtyBuf, 0, 1);
+    enc2->setBuffer(pLinePriceBuf, 0, 2);
+    enc2->setBuffer(pPartBitmapBuf, 0, 3);
+    enc2->setBuffer(pThresholdMapBuf, 0, 4);
+    enc2->setBuffer(pTotalRevenueBuf, 0, 5);
+    enc2->setBytes(&liSize, sizeof(liSize), 6);
+    enc2->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+    enc2->endEncoding();
+    cb2->commit(); cb2->waitUntilCompleted();
+
+    double gpuMs = ((cb1->GPUEndTime() - cb1->GPUStartTime()) +
+                    (cb2->GPUEndTime() - cb2->GPUStartTime())) * 1000.0;
+
+    float totalRevenue = *(float*)pTotalRevenueBuf->contents();
+    float avgYearly = totalRevenue / 7.0f;
+    printf("\nTPC-H Gen-Q17 Result:\n");
+    printf("+------------------+\n");
+    printf("|      avg_yearly  |\n");
+    printf("+------------------+\n");
+    printf("| %16.2f |\n", avgYearly);
+    printf("+------------------+\n");
+
+    printf("\nGen-Q17 | %u lineitem\n", liSize);
+    printTimingSummary(parseMs, gpuMs, 0.0);
+
+    releaseAll(pPartBitmapBuf, pLinePartKeyBuf, pLineQtyBuf, pLinePriceBuf,
+               pSumQtyMapBuf, pCountMapBuf, pThresholdMapBuf, pTotalRevenueBuf);
+}
+
+// ===================================================================
+// Q22: Global Sales Opportunity
+// ===================================================================
+static std::vector<int> extractPhonePrefixCodegen(const std::vector<char>& phone_chars, int width, size_t count) {
+    std::vector<int> prefixes(count);
+    for (size_t i = 0; i < count; i++) {
+        const char* p = phone_chars.data() + i * width;
+        prefixes[i] = (p[0] - '0') * 10 + (p[1] - '0');
+    }
+    return prefixes;
+}
+
+static void executeQ22(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                       const RuntimeCompiler::CompiledQuery& compiled,
+                       const std::string& dataDir) {
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto cCols = loadColumnsMulti(dataDir + "customer.tbl",
+        {{0, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT}});
+    auto& c_custkey = cCols.ints(0); auto& c_phone = cCols.chars(4); auto& c_acctbal = cCols.floats(5);
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl", {{1, ColType::INT}});
+    auto& o_custkey = oCols.ints(1);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint custSize = (uint)c_custkey.size();
+    uint ordSize = (uint)o_custkey.size();
+
+    auto c_prefix = extractPhonePrefixCodegen(c_phone, 15, custSize);
+
+    const int valid_prefixes[] = {13, 17, 18, 23, 29, 30, 31};
+    uint valid_prefix_mask = 0;
+    int prefix_to_bin[32];
+    memset(prefix_to_bin, -1, sizeof(prefix_to_bin));
+    for (int i = 0; i < 7; i++) {
+        valid_prefix_mask |= (1u << valid_prefixes[i]);
+        prefix_to_bin[valid_prefixes[i]] = i;
+    }
+
+    int max_custkey = 0;
+    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    uint cust_bitmap_ints = (max_custkey + 31) / 32 + 1;
+
+    MTL::Buffer* pPrefixBuf = device->newBuffer(c_prefix.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pAcctBalBuf = device->newBuffer(c_acctbal.data(), custSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCustKeyBuf = device->newBuffer(c_custkey.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdCustKeyBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSumBalBuf = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCountBalBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCustBitmapBuf = device->newBuffer(cust_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pResultCountBuf = device->newBuffer(7 * sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pResultSumBuf = device->newBuffer(7 * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPrefixToBinBuf = device->newBuffer(prefix_to_bin, 32 * sizeof(int), MTL::ResourceStorageModeShared);
+
+    *(float*)pSumBalBuf->contents() = 0.0f;
+    *(uint*)pCountBalBuf->contents() = 0;
+    memset(pCustBitmapBuf->contents(), 0, cust_bitmap_ints * sizeof(uint));
+    memset(pResultCountBuf->contents(), 0, 7 * sizeof(uint));
+    memset(pResultSumBuf->contents(), 0, 7 * sizeof(float));
+
+    // Phase 1+2: avg balance + orders bitmap (single command buffer)
+    MTL::CommandBuffer* cb1 = cmdQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* enc1 = cb1->computeCommandEncoder();
+    enc1->setComputePipelineState(findPSO(compiled, "gen_q22_avg_balance"));
+    enc1->setBuffer(pPrefixBuf, 0, 0);
+    enc1->setBuffer(pAcctBalBuf, 0, 1);
+    enc1->setBuffer(pSumBalBuf, 0, 2);
+    enc1->setBuffer(pCountBalBuf, 0, 3);
+    enc1->setBytes(&custSize, sizeof(custSize), 4);
+    enc1->setBytes(&valid_prefix_mask, sizeof(valid_prefix_mask), 5);
+    enc1->dispatchThreads(MTL::Size(custSize, 1, 1), MTL::Size(256, 1, 1));
+
+    enc1->memoryBarrier(MTL::BarrierScopeBuffers);
+    enc1->setComputePipelineState(findPSO(compiled, "gen_q22_build_orders_bitmap"));
+    enc1->setBuffer(pOrdCustKeyBuf, 0, 0);
+    enc1->setBuffer(pCustBitmapBuf, 0, 1);
+    enc1->setBytes(&ordSize, sizeof(ordSize), 2);
+    enc1->dispatchThreads(MTL::Size(ordSize, 1, 1), MTL::Size(256, 1, 1));
+    enc1->endEncoding();
+    cb1->commit(); cb1->waitUntilCompleted();
+
+    // CPU: compute avg balance
+    float sumBal = *(float*)pSumBalBuf->contents();
+    uint countBal = *(uint*)pCountBalBuf->contents();
+    float avgBal = (countBal > 0) ? sumBal / countBal : 0.0f;
+
+    // Phase 3: final aggregate
+    MTL::CommandBuffer* cb2 = cmdQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* enc2 = cb2->computeCommandEncoder();
+    enc2->setComputePipelineState(findPSO(compiled, "gen_q22_final_aggregate"));
+    enc2->setBuffer(pPrefixBuf, 0, 0);
+    enc2->setBuffer(pAcctBalBuf, 0, 1);
+    enc2->setBuffer(pCustKeyBuf, 0, 2);
+    enc2->setBuffer(pCustBitmapBuf, 0, 3);
+    enc2->setBuffer(pResultCountBuf, 0, 4);
+    enc2->setBuffer(pResultSumBuf, 0, 5);
+    enc2->setBytes(&custSize, sizeof(custSize), 6);
+    enc2->setBytes(&avgBal, sizeof(avgBal), 7);
+    enc2->setBytes(&valid_prefix_mask, sizeof(valid_prefix_mask), 8);
+    enc2->setBuffer(pPrefixToBinBuf, 0, 9);
+    enc2->dispatchThreads(MTL::Size(custSize, 1, 1), MTL::Size(256, 1, 1));
+    enc2->endEncoding();
+    cb2->commit(); cb2->waitUntilCompleted();
+
+    double gpuMs = ((cb1->GPUEndTime() - cb1->GPUStartTime()) +
+                    (cb2->GPUEndTime() - cb2->GPUStartTime())) * 1000.0;
+
+    uint* counts = (uint*)pResultCountBuf->contents();
+    float* sums = (float*)pResultSumBuf->contents();
+    printf("\nTPC-H Gen-Q22 Results:\n");
+    printf("+----------+----------+---------------+\n");
+    printf("| cntrycode|  numcust |    totacctbal |\n");
+    printf("+----------+----------+---------------+\n");
+    for (int i = 0; i < 7; i++) {
+        if (counts[i] > 0)
+            printf("| %8d | %8u | %13.2f |\n", valid_prefixes[i], counts[i], sums[i]);
+    }
+    printf("+----------+----------+---------------+\n");
+
+    printf("\nGen-Q22 | %u customers | %u orders\n", custSize, ordSize);
+    printTimingSummary(parseMs, gpuMs, 0.0);
+
+    releaseAll(pPrefixBuf, pAcctBalBuf, pCustKeyBuf, pOrdCustKeyBuf,
+               pSumBalBuf, pCountBalBuf, pCustBitmapBuf,
+               pResultCountBuf, pResultSumBuf, pPrefixToBinBuf);
+}
+
+// ===================================================================
+// Q2: Minimum Cost Supplier
+// ===================================================================
+static void executeQ2(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                      const RuntimeCompiler::CompiledQuery& compiled,
+                      const std::string& dataDir) {
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto pCols = loadColumnsMulti(dataDir + "part.tbl",
+        {{0, ColType::INT}, {2, ColType::CHAR_FIXED, 25}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
+    auto& p_partkey = pCols.ints(0); auto& p_mfgr = pCols.chars(2);
+    auto& p_type = pCols.chars(4); auto& p_size = pCols.ints(5);
+
+    auto sCols = loadColumnsMulti(dataDir + "supplier.tbl", {
+        {0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40},
+        {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT}, {6, ColType::CHAR_FIXED, 101}
+    });
+    auto& s_suppkey = sCols.ints(0); auto& s_name = sCols.chars(1); auto& s_address = sCols.chars(2);
+    auto& s_nationkey = sCols.ints(3); auto& s_phone = sCols.chars(4); auto& s_acctbal = sCols.floats(5);
+    auto& s_comment = sCols.chars(6);
+
+    auto psCols = loadColumnsMulti(dataDir + "partsupp.tbl",
+        {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
+    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1); auto& ps_supplycost = psCols.floats(3);
+
+    auto nCols = loadColumnsMulti(dataDir + "nation.tbl",
+        {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::INT}});
+    auto& n_nationkey = nCols.ints(0); auto& n_name = nCols.chars(1); auto& n_regionkey = nCols.ints(2);
+
+    auto rCols = loadColumnsMulti(dataDir + "region.tbl",
+        {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
+    auto& r_regionkey = rCols.ints(0); auto& r_name = rCols.chars(1);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint part_size = (uint)p_partkey.size();
+    uint partsupp_size = (uint)ps_partkey.size();
+
+    // CPU: EUROPE nations and supplier bitmap
+    int europe_regionkey = findRegionKey(r_regionkey, r_name.data(), 25, "EUROPE");
+    if (europe_regionkey == -1) { std::cerr << "EUROPE not found" << std::endl; return; }
+    auto nation_names = buildNationNames(n_nationkey, n_name.data(), 25);
+    auto europe_nation_keys = filterNationsByRegion(n_nationkey, n_regionkey, europe_regionkey);
+    auto suppBitmap = buildSuppBitmapAndIndex(s_suppkey.data(), s_nationkey.data(),
+                                               (size_t)s_suppkey.size(), europe_nation_keys);
+
+    int max_partkey = 0;
+    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    uint part_bitmap_ints = (max_partkey + 31) / 32 + 1;
+
+    MTL::Buffer* pPartKeyBuf = device->newBuffer(p_partkey.data(), part_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartSizeBuf = device->newBuffer(p_size.data(), part_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartTypeBuf = device->newBuffer(p_type.data(), p_type.size() * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartBitmapBuf = device->newBuffer(part_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSuppBitmapBuf = device->newBuffer(suppBitmap.bitmap.data(), suppBitmap.bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsPartKeyBuf = device->newBuffer(ps_partkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsSuppKeyBuf = device->newBuffer(ps_suppkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsSupplyCostBuf = device->newBuffer(ps_supplycost.data(), partsupp_size * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pMinCostBuf = device->newBuffer((max_partkey + 1) * sizeof(uint), MTL::ResourceStorageModeShared);
+    const uint max_results = 10000;
+    // GenQ2MatchResult = {int, int, uint} = 12 bytes
+    MTL::Buffer* pResultsBuf = device->newBuffer(max_results * 12, MTL::ResourceStorageModeShared);
+    MTL::Buffer* pResultCountBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
+
+    memset(pPartBitmapBuf->contents(), 0, part_bitmap_ints * sizeof(uint));
+    memset(pMinCostBuf->contents(), 0xFF, (max_partkey + 1) * sizeof(uint));
+    *(uint*)pResultCountBuf->contents() = 0;
+    int target_size = 15;
+
+    // GPU: 3 stages in single command buffer
+    MTL::CommandBuffer* cb = cmdQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+
+    // Stage 1: filter parts → bitmap
+    enc->setComputePipelineState(findPSO(compiled, "gen_q2_filter_part"));
+    enc->setBuffer(pPartKeyBuf, 0, 0);
+    enc->setBuffer(pPartSizeBuf, 0, 1);
+    enc->setBuffer(pPartTypeBuf, 0, 2);
+    enc->setBuffer(pPartBitmapBuf, 0, 3);
+    enc->setBytes(&part_size, sizeof(part_size), 4);
+    enc->setBytes(&target_size, sizeof(target_size), 5);
+    enc->dispatchThreads(MTL::Size(part_size, 1, 1), MTL::Size(256, 1, 1));
+
+    // Stage 2: find min cost per partkey
+    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+    enc->setComputePipelineState(findPSO(compiled, "gen_q2_find_min_cost"));
+    enc->setBuffer(pPsPartKeyBuf, 0, 0);
+    enc->setBuffer(pPsSuppKeyBuf, 0, 1);
+    enc->setBuffer(pPsSupplyCostBuf, 0, 2);
+    enc->setBuffer(pPartBitmapBuf, 0, 3);
+    enc->setBuffer(pSuppBitmapBuf, 0, 4);
+    enc->setBuffer(pMinCostBuf, 0, 5);
+    enc->setBytes(&partsupp_size, sizeof(partsupp_size), 6);
+    enc->dispatchThreads(MTL::Size(partsupp_size, 1, 1), MTL::Size(256, 1, 1));
+
+    // Stage 3: match suppliers → compact output
+    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+    enc->setComputePipelineState(findPSO(compiled, "gen_q2_match_suppliers"));
+    enc->setBuffer(pPsPartKeyBuf, 0, 0);
+    enc->setBuffer(pPsSuppKeyBuf, 0, 1);
+    enc->setBuffer(pPsSupplyCostBuf, 0, 2);
+    enc->setBuffer(pPartBitmapBuf, 0, 3);
+    enc->setBuffer(pSuppBitmapBuf, 0, 4);
+    enc->setBuffer(pMinCostBuf, 0, 5);
+    enc->setBuffer(pResultsBuf, 0, 6);
+    enc->setBuffer(pResultCountBuf, 0, 7);
+    enc->setBytes(&partsupp_size, sizeof(partsupp_size), 8);
+    enc->setBytes(&max_results, sizeof(max_results), 9);
+    enc->dispatchThreads(MTL::Size(partsupp_size, 1, 1), MTL::Size(256, 1, 1));
+
+    enc->endEncoding();
+    cb->commit(); cb->waitUntilCompleted();
+    double gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+
+    // CPU post-processing
+    auto postStart = std::chrono::high_resolution_clock::now();
+    uint result_count = std::min(*(uint*)pResultCountBuf->contents(), max_results);
+    postProcessQ2((Q2MatchResult_CPU*)pResultsBuf->contents(), result_count,
+                  suppBitmap.index, s_acctbal.data(), s_nationkey.data(),
+                  s_name.data(), s_address.data(), s_phone.data(), s_comment.data(),
+                  nation_names, p_partkey.data(), part_size, p_mfgr.data());
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q2 | %u partsupp\n", partsupp_size);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(pPartKeyBuf, pPartSizeBuf, pPartTypeBuf, pPartBitmapBuf, pSuppBitmapBuf,
+               pPsPartKeyBuf, pPsSuppKeyBuf, pPsSupplyCostBuf,
+               pMinCostBuf, pResultsBuf, pResultCountBuf);
+}
+
+// ===================================================================
+// Q18: Large Volume Customer
+// ===================================================================
+static void executeQ18(MTL::Device* device, MTL::CommandQueue* cmdQueue,
+                       const RuntimeCompiler::CompiledQuery& compiled,
+                       const std::string& dataDir) {
+    auto parseStart = std::chrono::high_resolution_clock::now();
+    auto cCols = loadColumnsMulti(dataDir + "customer.tbl",
+        {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
+    auto& c_custkey = cCols.ints(0); auto& c_name = cCols.chars(1);
+
+    auto oCols = loadColumnsMulti(dataDir + "orders.tbl",
+        {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}});
+    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1);
+    auto& o_totalprice = oCols.floats(3); auto& o_orderdate = oCols.ints(4);
+
+    auto lCols = loadColumnsMulti(dataDir + "lineitem.tbl",
+        {{0, ColType::INT}, {4, ColType::FLOAT}});
+    auto& l_orderkey = lCols.ints(0); auto& l_quantity = lCols.floats(4);
+    auto parseEnd = std::chrono::high_resolution_clock::now();
+    double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
+
+    uint liSize = (uint)l_orderkey.size();
+    uint ordSize = (uint)o_orderkey.size();
+
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    uint qty_map_size = max_orderkey + 1;
+
+    MTL::Buffer* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineQtyBuf = device->newBuffer(l_quantity.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pQtyMapBuf = device->newBuffer((size_t)qty_map_size * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdCustKeyBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdPriceBuf = device->newBuffer(o_totalprice.data(), ordSize * sizeof(float), MTL::ResourceStorageModeShared);
+    // GenQ18OutputRow = {int, int, int, float, float} = 20 bytes
+    MTL::Buffer* pOutputBuf = device->newBuffer((size_t)ordSize * 20, MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOutputCountBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
+
+    memset(pQtyMapBuf->contents(), 0, (size_t)qty_map_size * sizeof(float));
+    *(uint*)pOutputCountBuf->contents() = 0;
+    float threshold = 300.0f;
+
+    // GPU: 2 kernels in single command buffer
+    MTL::CommandBuffer* cb = cmdQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+
+    enc->setComputePipelineState(findPSO(compiled, "gen_q18_aggregate_quantity"));
+    enc->setBuffer(pLineOrdKeyBuf, 0, 0);
+    enc->setBuffer(pLineQtyBuf, 0, 1);
+    enc->setBuffer(pQtyMapBuf, 0, 2);
+    enc->setBytes(&liSize, sizeof(liSize), 3);
+    enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+
+    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+    enc->setComputePipelineState(findPSO(compiled, "gen_q18_filter_orders"));
+    enc->setBuffer(pOrdKeyBuf, 0, 0);
+    enc->setBuffer(pOrdCustKeyBuf, 0, 1);
+    enc->setBuffer(pOrdDateBuf, 0, 2);
+    enc->setBuffer(pOrdPriceBuf, 0, 3);
+    enc->setBuffer(pQtyMapBuf, 0, 4);
+    enc->setBuffer(pOutputBuf, 0, 5);
+    enc->setBuffer(pOutputCountBuf, 0, 6);
+    enc->setBytes(&ordSize, sizeof(ordSize), 7);
+    enc->setBytes(&qty_map_size, sizeof(qty_map_size), 8);
+    enc->setBytes(&threshold, sizeof(threshold), 9);
+    enc->dispatchThreads(MTL::Size(ordSize, 1, 1), MTL::Size(256, 1, 1));
+
+    enc->endEncoding();
+    cb->commit(); cb->waitUntilCompleted();
+    double gpuMs = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+
+    // CPU post: join customer name, sort top-100
+    auto postStart = std::chrono::high_resolution_clock::now();
+    uint outputCount = *(uint*)pOutputCountBuf->contents();
+    struct Q18Row { int o_orderkey; int o_custkey; int o_orderdate; float o_totalprice; float sum_qty; };
+    auto* gpuRows = (Q18Row*)pOutputBuf->contents();
+
+    int max_custkey = 0;
+    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    std::vector<int> cust_index(max_custkey + 1, -1);
+    for (size_t i = 0; i < c_custkey.size(); i++) cust_index[c_custkey[i]] = (int)i;
+
+    struct Q18Result {
+        std::string c_name; int c_custkey; int o_orderkey; int o_orderdate;
+        float o_totalprice; float sum_qty;
+    };
+    std::vector<Q18Result> results;
+    results.reserve(outputCount);
+    for (uint i = 0; i < outputCount; i++) {
+        int ck = gpuRows[i].o_custkey;
+        std::string name;
+        if (ck <= max_custkey && cust_index[ck] >= 0)
+            name = trimFixed(c_name.data(), cust_index[ck], 25);
+        results.push_back({name, ck, gpuRows[i].o_orderkey, gpuRows[i].o_orderdate,
+                           gpuRows[i].o_totalprice, gpuRows[i].sum_qty});
+    }
+
+    size_t topK = std::min((size_t)100, results.size());
+    std::partial_sort(results.begin(), results.begin() + topK, results.end(),
+        [](const Q18Result& a, const Q18Result& b) {
+            if (a.o_totalprice != b.o_totalprice) return a.o_totalprice > b.o_totalprice;
+            return a.o_orderdate < b.o_orderdate;
+        });
+
+    printf("\nTPC-H Gen-Q18 Results (Top 10 of LIMIT 100):\n");
+    printf("+------------------+----------+----------+------------+-------------+---------+\n");
+    printf("| c_name           | c_custkey| o_orderkey| o_orderdate| o_totalprice| sum_qty |\n");
+    printf("+------------------+----------+----------+------------+-------------+---------+\n");
+    size_t show = std::min((size_t)10, topK);
+    for (size_t i = 0; i < show; i++) {
+        printf("| %-16s | %8d | %9d | %10d | %11.2f | %7.2f |\n",
+               results[i].c_name.c_str(), results[i].c_custkey, results[i].o_orderkey,
+               results[i].o_orderdate, results[i].o_totalprice, results[i].sum_qty);
+    }
+    printf("+------------------+----------+----------+------------+-------------+---------+\n");
+    printf("Total qualifying orders: %zu\n", results.size());
+    auto postEnd = std::chrono::high_resolution_clock::now();
+    double postMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
+
+    printf("\nGen-Q18 | %u lineitem\n", liSize);
+    printTimingSummary(parseMs, gpuMs, postMs);
+
+    releaseAll(pLineOrdKeyBuf, pLineQtyBuf, pQtyMapBuf,
+               pOrdKeyBuf, pOrdCustKeyBuf, pOrdDateBuf, pOrdPriceBuf,
+               pOutputBuf, pOutputCountBuf);
+}
+
 } // anonymous namespace
 
 // ===================================================================
@@ -1060,6 +2390,16 @@ void executeQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     else if (plan.name == "Q4")  executeQ4(device, cmdQueue, compiled, dataDir);
     else if (plan.name == "Q12") executeQ12(device, cmdQueue, compiled, dataDir);
     else if (plan.name == "Q19") executeQ19(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q15") executeQ15(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q11") executeQ11(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q10") executeQ10(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q5")  executeQ5(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q7")  executeQ7(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q8")  executeQ8(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q17") executeQ17(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q22") executeQ22(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q2")  executeQ2(device, cmdQueue, compiled, dataDir);
+    else if (plan.name == "Q18") executeQ18(device, cmdQueue, compiled, dataDir);
     else throw std::runtime_error("No executor for plan: " + plan.name);
 }
 

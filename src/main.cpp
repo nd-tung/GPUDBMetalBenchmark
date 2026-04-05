@@ -81,6 +81,25 @@ static void runSQLFile(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     ss << f.rdbuf();
     std::string sql = ss.str();
 
+    // Strip CREATE VIEW / DROP VIEW statements (e.g. Q15) — keep only SELECT
+    {
+        // Remove "CREATE VIEW ... AS" prefix (everything before the first standalone SELECT)
+        auto cvPos = sql.find("CREATE VIEW");
+        if (cvPos == std::string::npos) cvPos = sql.find("create view");
+        if (cvPos != std::string::npos) {
+            // Find the main SELECT (after the VIEW's SELECT ... GROUP BY ...;)
+            // Strategy: find "DROP VIEW" and remove it, find last SELECT that isn't inside the view
+            auto dropPos = sql.find("DROP VIEW");
+            if (dropPos == std::string::npos) dropPos = sql.find("drop view");
+            if (dropPos != std::string::npos) sql.erase(dropPos);
+            // Remove "CREATE VIEW ... AS\n    SELECT ... GROUP BY ...;\n"
+            // Find the closing semicolon of the CREATE VIEW's subquery
+            auto firstSemicolon = sql.find(';', cvPos);
+            if (firstSemicolon != std::string::npos)
+                sql = sql.substr(firstSemicolon + 1);
+        }
+    }
+
     // Derive query name from filename: "sql/q6.sql" → "Q6"
     std::string name = sqlPath;
     auto lastSlash = name.rfind('/');

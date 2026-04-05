@@ -759,6 +759,694 @@ kernel void gen_q19_sum_stage2(
     result.kernels.push_back({"gen_q19_sum_stage2", 1, true});
 }
 
+// ===================================================================
+// Q15 KERNEL GENERATOR
+// ===================================================================
+
+void generateQ15Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q15: Single kernel — lineitem date filter → atomic_add revenue to map[suppkey]
+kernel void gen_q15_aggregate_revenue(
+    const device int*    l_suppkey         [[buffer(0)]],
+    const device int*    l_shipdate        [[buffer(1)]],
+    const device float*  l_extendedprice   [[buffer(2)]],
+    const device float*  l_discount        [[buffer(3)]],
+    device atomic_float* revenue_map       [[buffer(4)]],
+    constant uint& data_size              [[buffer(5)]],
+    constant int&  date_start             [[buffer(6)]],
+    constant int&  date_end               [[buffer(7)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= data_size) return;
+    int date = l_shipdate[tid];
+    if (date < date_start || date >= date_end) return;
+    float revenue = l_extendedprice[tid] * (1.0f - l_discount[tid]);
+    int sk = l_suppkey[tid];
+    atomic_fetch_add_explicit(&revenue_map[sk], revenue, memory_order_relaxed);
+}
+)METAL";
+    result.kernels.push_back({"gen_q15_aggregate_revenue", 256, true});
+}
+
+// ===================================================================
+// Q11 KERNEL GENERATOR
+// ===================================================================
+
+void generateQ11Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q11: Scan partsupp, filter by supplier bitmap (GERMANY), atomic_add value per partkey
+// Also produces threadgroup partial sums for global sum computation
+kernel void gen_q11_aggregate(
+    const device int*    ps_partkey        [[buffer(0)]],
+    const device int*    ps_suppkey        [[buffer(1)]],
+    const device float*  ps_supplycost     [[buffer(2)]],
+    const device int*    ps_availqty       [[buffer(3)]],
+    const device uint*   supp_bitmap       [[buffer(4)]],
+    device atomic_float* value_map         [[buffer(5)]],
+    device float*        partial_sums      [[buffer(6)]],
+    constant uint& data_size              [[buffer(7)]],
+    uint group_id           [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group  [[threads_per_threadgroup]],
+    uint grid_size          [[threads_per_grid]])
+{
+    float local_sum = 0.0f;
+    uint gid = group_id * threads_per_group + thread_id_in_group;
+    for (uint i = gid; i < data_size; i += grid_size) {
+        int sk = ps_suppkey[i];
+        if (!bitmap_test(supp_bitmap, sk)) continue;
+        float val = ps_supplycost[i] * float(ps_availqty[i]);
+        atomic_fetch_add_explicit(&value_map[ps_partkey[i]], val, memory_order_relaxed);
+        local_sum += val;
+    }
+    threadgroup float shared[32];
+    float total = tg_reduce_float(local_sum, thread_id_in_group, threads_per_group, shared);
+    if (thread_id_in_group == 0) {
+        partial_sums[group_id] = total;
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q11_aggregate", 256, true});
+}
+
+// ===================================================================
+// Q10 KERNEL GENERATOR
+// ===================================================================
+
+void generateQ10Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q10 Phase 1: Build orders direct map — orderkey → custkey (date filtered)
+kernel void gen_q10_build_orders_map(
+    const device int* o_orderkey     [[buffer(0)]],
+    const device int* o_custkey      [[buffer(1)]],
+    const device int* o_orderdate    [[buffer(2)]],
+    device int* orders_map           [[buffer(3)]],
+    constant uint& orders_size       [[buffer(4)]],
+    constant int& date_start         [[buffer(5)]],
+    constant int& date_end           [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= orders_size) return;
+    int date = o_orderdate[tid];
+    if (date < date_start || date >= date_end) return;
+    int okey = o_orderkey[tid];
+    orders_map[okey] = o_custkey[tid];
+}
+
+// Q10 Phase 2: Probe lineitem, filter returnflag='R', aggregate revenue per custkey
+kernel void gen_q10_probe_and_aggregate(
+    const device int*    l_orderkey        [[buffer(0)]],
+    const device char*   l_returnflag      [[buffer(1)]],
+    const device float*  l_extendedprice   [[buffer(2)]],
+    const device float*  l_discount        [[buffer(3)]],
+    const device int*    orders_map        [[buffer(4)]],
+    device atomic_float* cust_revenue      [[buffer(5)]],
+    constant uint& lineitem_size          [[buffer(6)]],
+    constant uint& map_size               [[buffer(7)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        if (l_returnflag[i] != 'R') continue;
+        int okey = l_orderkey[i];
+        if ((uint)okey >= map_size) continue;
+        int ck = orders_map[okey];
+        if (ck == -1) continue;
+        float revenue = l_extendedprice[i] * (1.0f - l_discount[i]);
+        atomic_fetch_add_explicit(&cust_revenue[ck], revenue, memory_order_relaxed);
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q10_build_orders_map", 256, true});
+    result.kernels.push_back({"gen_q10_probe_and_aggregate", 1024, false});
+}
+
+// ===================================================================
+// Q5 KERNEL GENERATOR
+// ===================================================================
+
+void generateQ5Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q5 Kernel 1: Build customer->nationkey direct map (ASIA nations only)
+kernel void gen_q5_build_customer_nation_map(
+    const device int* c_custkey     [[buffer(0)]],
+    const device int* c_nationkey   [[buffer(1)]],
+    device int* customer_nation_map [[buffer(2)]],
+    const device uint* nation_bitmap [[buffer(3)]],
+    constant uint& customer_size    [[buffer(4)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= customer_size) return;
+    int nk = c_nationkey[index];
+    if (!bitmap_test(nation_bitmap, nk)) return;
+    customer_nation_map[c_custkey[index]] = nk;
+}
+
+// Q5 Kernel 2: Build supplier->nationkey direct map (ASIA nations only)
+kernel void gen_q5_build_supplier_nation_map(
+    const device int* s_suppkey      [[buffer(0)]],
+    const device int* s_nationkey    [[buffer(1)]],
+    device int* supplier_nation_map  [[buffer(2)]],
+    const device uint* nation_bitmap [[buffer(3)]],
+    constant uint& supplier_size     [[buffer(4)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= supplier_size) return;
+    int nk = s_nationkey[index];
+    if (!bitmap_test(nation_bitmap, nk)) return;
+    supplier_nation_map[s_suppkey[index]] = nk;
+}
+
+// Q5 Kernel 3: Build orders->nationkey direct map (date+customer filter)
+kernel void gen_q5_build_orders_map(
+    const device int* o_orderkey           [[buffer(0)]],
+    const device int* o_custkey            [[buffer(1)]],
+    const device int* o_orderdate          [[buffer(2)]],
+    device int* orders_nation_map          [[buffer(3)]],
+    constant uint& orders_size             [[buffer(4)]],
+    constant int& date_start               [[buffer(5)]],
+    constant int& date_end                 [[buffer(6)]],
+    constant uint& map_size                [[buffer(7)]],
+    const device int* customer_nation_map  [[buffer(8)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= orders_size) return;
+    int date = o_orderdate[index];
+    if (date < date_start || date >= date_end) return;
+    int ck = o_custkey[index];
+    int cust_nk = customer_nation_map[ck];
+    if (cust_nk == -1) return;
+    int key = o_orderkey[index];
+    if ((uint)key < map_size)
+        orders_nation_map[key] = cust_nk;
+}
+
+// Q5 Kernel 4: Probe lineitem, same-nation check, aggregate revenue per nation
+kernel void gen_q5_probe_and_aggregate(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device int* l_suppkey         [[buffer(1)]],
+    const device float* l_extendedprice [[buffer(2)]],
+    const device float* l_discount      [[buffer(3)]],
+    const device int* orders_nation_map [[buffer(4)]],
+    const device int* supplier_nation_map [[buffer(5)]],
+    device atomic_float* nation_revenue [[buffer(6)]],
+    constant uint& lineitem_size        [[buffer(7)]],
+    constant uint& map_size             [[buffer(8)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    const int BATCH_SIZE = 4;
+    for (uint i = global_id; i < lineitem_size; i += grid_size * BATCH_SIZE) {
+        for (int k = 0; k < BATCH_SIZE; k++) {
+            uint idx = i + k * grid_size;
+            if (idx >= lineitem_size) break;
+            int orderkey = l_orderkey[idx];
+            if ((uint)orderkey >= map_size) continue;
+            int cust_nationkey = orders_nation_map[orderkey];
+            if (cust_nationkey == -1) continue;
+            int suppkey = l_suppkey[idx];
+            int supp_nationkey = supplier_nation_map[suppkey];
+            if (supp_nationkey != cust_nationkey) continue;
+            float revenue = l_extendedprice[idx] * (1.0f - l_discount[idx]);
+            atomic_fetch_add_explicit(&nation_revenue[cust_nationkey], revenue, memory_order_relaxed);
+        }
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q5_build_customer_nation_map", 256, true});
+    result.kernels.push_back({"gen_q5_build_supplier_nation_map", 256, true});
+    result.kernels.push_back({"gen_q5_build_orders_map", 256, true});
+    result.kernels.push_back({"gen_q5_probe_and_aggregate", 1024, false});
+}
+
+// ===================================================================
+// Q7 KERNEL GENERATOR
+// ===================================================================
+
+void generateQ7Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q7 Kernel 1: Build supplier->nationkey map (FRANCE/GERMANY only)
+kernel void gen_q7_build_supplier_map(
+    const device int* s_suppkey     [[buffer(0)]],
+    const device int* s_nationkey   [[buffer(1)]],
+    device int* supp_nation_map     [[buffer(2)]],
+    constant int& france_nk         [[buffer(3)]],
+    constant int& germany_nk        [[buffer(4)]],
+    constant uint& supplier_size    [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= supplier_size) return;
+    int nk = s_nationkey[tid];
+    if (nk == france_nk || nk == germany_nk)
+        supp_nation_map[s_suppkey[tid]] = nk;
+}
+
+// Q7 Kernel 2: Build customer->nationkey map (FRANCE/GERMANY only)
+kernel void gen_q7_build_customer_map(
+    const device int* c_custkey     [[buffer(0)]],
+    const device int* c_nationkey   [[buffer(1)]],
+    device int* cust_nation_map     [[buffer(2)]],
+    constant int& france_nk         [[buffer(3)]],
+    constant int& germany_nk        [[buffer(4)]],
+    constant uint& customer_size    [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= customer_size) return;
+    int nk = c_nationkey[tid];
+    if (nk == france_nk || nk == germany_nk)
+        cust_nation_map[c_custkey[tid]] = nk;
+}
+
+// Q7 Kernel 3: Build orders map orderkey->custkey
+kernel void gen_q7_build_orders_map(
+    const device int* o_orderkey    [[buffer(0)]],
+    const device int* o_custkey     [[buffer(1)]],
+    device int* orders_map          [[buffer(2)]],
+    constant uint& orders_size      [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= orders_size) return;
+    orders_map[o_orderkey[tid]] = o_custkey[tid];
+}
+
+// Q7 Kernel 4: Probe lineitem, date+chain checks, aggregate 4 bins
+kernel void gen_q7_probe_and_aggregate(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device int* l_suppkey         [[buffer(1)]],
+    const device int* l_shipdate        [[buffer(2)]],
+    const device float* l_extendedprice [[buffer(3)]],
+    const device float* l_discount      [[buffer(4)]],
+    const device int* orders_map        [[buffer(5)]],
+    const device int* cust_nation_map   [[buffer(6)]],
+    const device int* supp_nation_map   [[buffer(7)]],
+    device atomic_float* revenue_bins   [[buffer(8)]],
+    constant uint& lineitem_size        [[buffer(9)]],
+    constant uint& orders_map_size      [[buffer(10)]],
+    constant int& france_nk             [[buffer(11)]],
+    constant int& germany_nk            [[buffer(12)]],
+    constant int& date_start            [[buffer(13)]],
+    constant int& date_end              [[buffer(14)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int shipdate = l_shipdate[i];
+        if (shipdate < date_start || shipdate > date_end) continue;
+        int okey = l_orderkey[i];
+        if ((uint)okey >= orders_map_size) continue;
+        int ck = orders_map[okey];
+        if (ck == -1) continue;
+        int supp_nk = supp_nation_map[l_suppkey[i]];
+        if (supp_nk == -1) continue;
+        int cust_nk = cust_nation_map[ck];
+        if (cust_nk == -1) continue;
+        int pair_idx;
+        if (supp_nk == france_nk && cust_nk == germany_nk) pair_idx = 0;
+        else if (supp_nk == germany_nk && cust_nk == france_nk) pair_idx = 1;
+        else continue;
+        int year = shipdate / 10000;
+        int year_idx;
+        if (year == 1995) year_idx = 0;
+        else if (year == 1996) year_idx = 1;
+        else continue;
+        float revenue = l_extendedprice[i] * (1.0f - l_discount[i]);
+        atomic_fetch_add_explicit(&revenue_bins[pair_idx * 2 + year_idx], revenue, memory_order_relaxed);
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q7_build_supplier_map", 256, true});
+    result.kernels.push_back({"gen_q7_build_customer_map", 256, true});
+    result.kernels.push_back({"gen_q7_build_orders_map", 256, true});
+    result.kernels.push_back({"gen_q7_probe_and_aggregate", 1024, false});
+}
+
+// ===================================================================
+// Q8 KERNEL GENERATOR
+// ===================================================================
+
+void generateQ8Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q8 Kernel 1: Build orders map (date+AMERICA customer filter) → custkey+year
+kernel void gen_q8_build_orders_map(
+    const device int* o_orderkey        [[buffer(0)]],
+    const device int* o_custkey         [[buffer(1)]],
+    const device int* o_orderdate       [[buffer(2)]],
+    device int* orders_custkey_map      [[buffer(3)]],
+    device int* orders_year_map         [[buffer(4)]],
+    const device int* cust_nation_map   [[buffer(5)]],
+    constant uint& orders_size          [[buffer(6)]],
+    constant int& date_start            [[buffer(7)]],
+    constant int& date_end              [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= orders_size) return;
+    int date = o_orderdate[tid];
+    if (date < date_start || date > date_end) return;
+    int ck = o_custkey[tid];
+    int cust_nk = cust_nation_map[ck];
+    if (cust_nk == -1) return;
+    int okey = o_orderkey[tid];
+    orders_custkey_map[okey] = ck;
+    orders_year_map[okey] = date / 10000;
+}
+
+// Q8 Kernel 2: Probe lineitem, part bitmap check, aggregate 4 bins
+kernel void gen_q8_probe_and_aggregate(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device int* l_partkey         [[buffer(1)]],
+    const device int* l_suppkey         [[buffer(2)]],
+    const device float* l_extendedprice [[buffer(3)]],
+    const device float* l_discount      [[buffer(4)]],
+    const device uint* part_bitmap      [[buffer(5)]],
+    const device int* orders_custkey_map [[buffer(6)]],
+    const device int* orders_year_map   [[buffer(7)]],
+    const device int* supp_nation_map   [[buffer(8)]],
+    device atomic_float* result_bins    [[buffer(9)]],
+    constant uint& lineitem_size        [[buffer(10)]],
+    constant uint& orders_map_size      [[buffer(11)]],
+    constant int& brazil_nk             [[buffer(12)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int pk = l_partkey[i];
+        if (!bitmap_test(part_bitmap, pk)) continue;
+        int okey = l_orderkey[i];
+        if ((uint)okey >= orders_map_size) continue;
+        int ck = orders_custkey_map[okey];
+        if (ck == -1) continue;
+        int year = orders_year_map[okey];
+        int year_idx = year - 1995;
+        if (year_idx < 0 || year_idx > 1) continue;
+        float revenue = l_extendedprice[i] * (1.0f - l_discount[i]);
+        atomic_fetch_add_explicit(&result_bins[2 + year_idx], revenue, memory_order_relaxed);
+        int supp_nk = supp_nation_map[l_suppkey[i]];
+        if (supp_nk == brazil_nk) {
+            atomic_fetch_add_explicit(&result_bins[year_idx], revenue, memory_order_relaxed);
+        }
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q8_build_orders_map", 256, true});
+    result.kernels.push_back({"gen_q8_probe_and_aggregate", 1024, false});
+}
+
+// ===================================================================
+// Q17: Small-Quantity-Order Revenue
+// ===================================================================
+static void generateQ17Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q17 Pass 1: Aggregate quantity stats per qualifying partkey
+kernel void gen_q17_aggregate_qty_stats(
+    const device int* l_partkey          [[buffer(0)]],
+    const device float* l_quantity       [[buffer(1)]],
+    const device uint* part_bitmap       [[buffer(2)]],
+    device atomic_float* sum_qty_map     [[buffer(3)]],
+    device atomic_uint* count_map        [[buffer(4)]],
+    constant uint& lineitem_size         [[buffer(5)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int pk = l_partkey[i];
+        if (!bitmap_test(part_bitmap, pk)) continue;
+        float qty = l_quantity[i];
+        atomic_fetch_add_explicit(&sum_qty_map[pk], qty, memory_order_relaxed);
+        atomic_fetch_add_explicit(&count_map[pk], 1u, memory_order_relaxed);
+    }
+}
+
+// Q17 Pass 2: Sum extendedprice where qty < threshold
+kernel void gen_q17_sum_revenue(
+    const device int* l_partkey          [[buffer(0)]],
+    const device float* l_quantity       [[buffer(1)]],
+    const device float* l_extendedprice  [[buffer(2)]],
+    const device uint* part_bitmap       [[buffer(3)]],
+    const device float* threshold_map    [[buffer(4)]],
+    device atomic_float& total_revenue   [[buffer(5)]],
+    constant uint& lineitem_size         [[buffer(6)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int pk = l_partkey[i];
+        if (!bitmap_test(part_bitmap, pk)) continue;
+        float thresh = threshold_map[pk];
+        if (thresh <= 0.0f) continue;
+        if (l_quantity[i] < thresh) {
+            atomic_fetch_add_explicit(&total_revenue, l_extendedprice[i], memory_order_relaxed);
+        }
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q17_aggregate_qty_stats", 1024, false});
+    result.kernels.push_back({"gen_q17_sum_revenue", 1024, false});
+}
+
+// ===================================================================
+// Q22: Global Sales Opportunity
+// ===================================================================
+static void generateQ22Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q22 Phase 1: Sum + count acctbal for qualifying customers with bal > 0
+kernel void gen_q22_avg_balance(
+    const device int* c_phone_prefix    [[buffer(0)]],
+    const device float* c_acctbal       [[buffer(1)]],
+    device atomic_float& sum_bal        [[buffer(2)]],
+    device atomic_uint& count_bal       [[buffer(3)]],
+    constant uint& cust_size            [[buffer(4)]],
+    constant uint& valid_prefix_mask    [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= cust_size) return;
+    float bal = c_acctbal[tid];
+    if (bal <= 0.0f) return;
+    int prefix = c_phone_prefix[tid];
+    if (prefix < 0 || prefix > 31) return;
+    if (!((valid_prefix_mask >> (uint)prefix) & 1u)) return;
+    atomic_fetch_add_explicit(&sum_bal, bal, memory_order_relaxed);
+    atomic_fetch_add_explicit(&count_bal, 1u, memory_order_relaxed);
+}
+
+// Q22 Phase 2: Build orders custkey bitmap
+kernel void gen_q22_build_orders_bitmap(
+    const device int* o_custkey         [[buffer(0)]],
+    device atomic_uint* cust_bitmap     [[buffer(1)]],
+    constant uint& orders_size          [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= orders_size) return;
+    bitmap_set(cust_bitmap, o_custkey[tid]);
+}
+
+// Q22 Phase 3: Final aggregate — count/sum per country code (7 bins)
+kernel void gen_q22_final_aggregate(
+    const device int* c_phone_prefix    [[buffer(0)]],
+    const device float* c_acctbal       [[buffer(1)]],
+    const device int* c_custkey         [[buffer(2)]],
+    const device uint* cust_bitmap      [[buffer(3)]],
+    device atomic_uint* result_count    [[buffer(4)]],
+    device atomic_float* result_sum     [[buffer(5)]],
+    constant uint& cust_size            [[buffer(6)]],
+    constant float& avg_bal             [[buffer(7)]],
+    constant uint& valid_prefix_mask    [[buffer(8)]],
+    const device int* prefix_to_bin     [[buffer(9)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= cust_size) return;
+    float bal = c_acctbal[tid];
+    if (bal <= avg_bal) return;
+    int prefix = c_phone_prefix[tid];
+    if (prefix < 0 || prefix > 31) return;
+    if (!((valid_prefix_mask >> (uint)prefix) & 1u)) return;
+    int ck = c_custkey[tid];
+    if (bitmap_test(cust_bitmap, ck)) return;
+    int bin = prefix_to_bin[prefix];
+    if (bin < 0 || bin > 6) return;
+    atomic_fetch_add_explicit(&result_count[bin], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&result_sum[bin], bal, memory_order_relaxed);
+}
+)METAL";
+    result.kernels.push_back({"gen_q22_avg_balance", 256, false});
+    result.kernels.push_back({"gen_q22_build_orders_bitmap", 256, false});
+    result.kernels.push_back({"gen_q22_final_aggregate", 256, false});
+}
+
+// ===================================================================
+// Q2: Minimum Cost Supplier
+// ===================================================================
+static void generateQ2Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q2 result struct for compact output
+struct GenQ2MatchResult {
+    int partkey;
+    int suppkey;
+    uint supplycost_cents;
+};
+
+// Q2 Kernel 1: Filter parts by p_size = 15 AND p_type LIKE '%BRASS' → bitmap
+kernel void gen_q2_filter_part(
+    const device int* p_partkey   [[buffer(0)]],
+    const device int* p_size      [[buffer(1)]],
+    const device char* p_type     [[buffer(2)]],
+    device atomic_uint* part_bitmap [[buffer(3)]],
+    constant uint& part_size      [[buffer(4)]],
+    constant int& target_size     [[buffer(5)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= part_size) return;
+    if (p_size[index] != target_size) return;
+
+    const device char* type_str = p_type + index * 25;
+    int len = 0;
+    for (int i = 0; i < 25; i++) {
+        if (type_str[i] != '\0') len = i + 1;
+    }
+    if (len < 5) return;
+    if (type_str[len-5] != 'B' || type_str[len-4] != 'R' ||
+        type_str[len-3] != 'A' || type_str[len-2] != 'S' ||
+        type_str[len-1] != 'S') return;
+
+    int key = p_partkey[index];
+    bitmap_set(part_bitmap, key);
+}
+
+// Q2 Kernel 2: Find minimum supplycost per partkey (atomic_fetch_min on uint cents)
+kernel void gen_q2_find_min_cost(
+    const device int* ps_partkey      [[buffer(0)]],
+    const device int* ps_suppkey      [[buffer(1)]],
+    const device float* ps_supplycost [[buffer(2)]],
+    const device uint* part_bitmap    [[buffer(3)]],
+    const device uint* supplier_bitmap [[buffer(4)]],
+    device atomic_uint* min_cost      [[buffer(5)]],
+    constant uint& partsupp_size      [[buffer(6)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= partsupp_size) return;
+    int pk = ps_partkey[index];
+    if (!bitmap_test(part_bitmap, pk)) return;
+    int sk = ps_suppkey[index];
+    if (!bitmap_test(supplier_bitmap, sk)) return;
+    uint cost_cents = (uint)(ps_supplycost[index] * 100.0f + 0.5f);
+    atomic_fetch_min_explicit(&min_cost[pk], cost_cents, memory_order_relaxed);
+}
+
+// Q2 Kernel 3: Match suppliers with minimum cost → compact output
+kernel void gen_q2_match_suppliers(
+    const device int* ps_partkey      [[buffer(0)]],
+    const device int* ps_suppkey      [[buffer(1)]],
+    const device float* ps_supplycost [[buffer(2)]],
+    const device uint* part_bitmap    [[buffer(3)]],
+    const device uint* supplier_bitmap [[buffer(4)]],
+    const device uint* min_cost       [[buffer(5)]],
+    device GenQ2MatchResult* results  [[buffer(6)]],
+    device atomic_uint& result_count  [[buffer(7)]],
+    constant uint& partsupp_size      [[buffer(8)]],
+    constant uint& max_results        [[buffer(9)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= partsupp_size) return;
+    int pk = ps_partkey[index];
+    if (!bitmap_test(part_bitmap, pk)) return;
+    int sk = ps_suppkey[index];
+    if (!bitmap_test(supplier_bitmap, sk)) return;
+    uint cost_cents = (uint)(ps_supplycost[index] * 100.0f + 0.5f);
+    if (cost_cents != min_cost[pk]) return;
+    uint pos = atomic_fetch_add_explicit(&result_count, 1, memory_order_relaxed);
+    if (pos < max_results) {
+        results[pos].partkey = pk;
+        results[pos].suppkey = sk;
+        results[pos].supplycost_cents = cost_cents;
+    }
+}
+)METAL";
+    result.kernels.push_back({"gen_q2_filter_part", 256, false});
+    result.kernels.push_back({"gen_q2_find_min_cost", 256, false});
+    result.kernels.push_back({"gen_q2_match_suppliers", 256, false});
+}
+
+// ===================================================================
+// Q18: Large Volume Customer
+// ===================================================================
+static void generateQ18Kernels(std::ostringstream& out, GeneratedKernels& result) {
+    out << R"METAL(
+// Q18 Kernel 1: Aggregate SUM(l_quantity) per orderkey
+kernel void gen_q18_aggregate_quantity(
+    const device int* l_orderkey        [[buffer(0)]],
+    const device float* l_quantity      [[buffer(1)]],
+    device atomic_float* qty_map        [[buffer(2)]],
+    constant uint& lineitem_size        [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    uint global_id = (group_id * threads_per_group) + thread_id_in_group;
+    for (uint i = global_id; i < lineitem_size; i += grid_size) {
+        int okey = l_orderkey[i];
+        float qty = l_quantity[i];
+        atomic_fetch_add_explicit(&qty_map[okey], qty, memory_order_relaxed);
+    }
+}
+
+// Q18 output row struct
+struct GenQ18OutputRow {
+    int o_orderkey;
+    int o_custkey;
+    int o_orderdate;
+    float o_totalprice;
+    float sum_qty;
+};
+
+// Q18 Kernel 2: Filter orders with sum(qty) > threshold, compact output
+kernel void gen_q18_filter_orders(
+    const device int* o_orderkey        [[buffer(0)]],
+    const device int* o_custkey         [[buffer(1)]],
+    const device int* o_orderdate       [[buffer(2)]],
+    const device float* o_totalprice    [[buffer(3)]],
+    const device float* qty_map         [[buffer(4)]],
+    device GenQ18OutputRow* output      [[buffer(5)]],
+    device atomic_uint& output_count    [[buffer(6)]],
+    constant uint& orders_size          [[buffer(7)]],
+    constant uint& qty_map_size         [[buffer(8)]],
+    constant float& threshold           [[buffer(9)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= orders_size) return;
+    int okey = o_orderkey[tid];
+    if ((uint)okey >= qty_map_size) return;
+    float sq = qty_map[okey];
+    if (sq <= threshold) return;
+    uint pos = atomic_fetch_add_explicit(&output_count, 1u, memory_order_relaxed);
+    output[pos].o_orderkey = okey;
+    output[pos].o_custkey = o_custkey[tid];
+    output[pos].o_orderdate = o_orderdate[tid];
+    output[pos].o_totalprice = o_totalprice[tid];
+    output[pos].sum_qty = sq;
+}
+)METAL";
+    result.kernels.push_back({"gen_q18_aggregate_quantity", 1024, false});
+    result.kernels.push_back({"gen_q18_filter_orders", 256, false});
+}
+
 } // anonymous namespace
 
 // ===================================================================
@@ -781,6 +1469,16 @@ GeneratedKernels generateMetal(const QueryPlan& plan) {
     else if (plan.name == "Q4") generateQ4Kernels(out, result);
     else if (plan.name == "Q12") generateQ12Kernels(out, result);
     else if (plan.name == "Q19") generateQ19Kernels(out, result);
+    else if (plan.name == "Q15") generateQ15Kernels(out, result);
+    else if (plan.name == "Q11") generateQ11Kernels(out, result);
+    else if (plan.name == "Q10") generateQ10Kernels(out, result);
+    else if (plan.name == "Q5") generateQ5Kernels(out, result);
+    else if (plan.name == "Q7") generateQ7Kernels(out, result);
+    else if (plan.name == "Q8") generateQ8Kernels(out, result);
+    else if (plan.name == "Q17") generateQ17Kernels(out, result);
+    else if (plan.name == "Q22") generateQ22Kernels(out, result);
+    else if (plan.name == "Q2") generateQ2Kernels(out, result);
+    else if (plan.name == "Q18") generateQ18Kernels(out, result);
     else throw std::runtime_error("No Metal codegen for plan: " + plan.name);
 
     result.metalSource = out.str();
