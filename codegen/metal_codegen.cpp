@@ -1,6 +1,7 @@
 #include "metal_codegen.h"
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace codegen {
 
@@ -112,20 +113,20 @@ inline uint sf100_hash_key(int key) {
 )METAL";
 
 // ===================================================================
-// Q1 KERNEL GENERATOR
+// PATTERN: Two-Stage Reduce (Q1 — 6-bin fused reduce)
 // ===================================================================
 
-void generateQ1Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ1_TwoStageReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q1 bin index helpers
-inline int q1_rf_index(char rf) {
+inline int Q1_rf_index(char rf) {
     return (rf == 'A') ? 0 : (rf == 'N') ? 1 : (rf == 'R') ? 2 : -1;
 }
-inline int q1_ls_index(char ls) {
+inline int Q1_ls_index(char ls) {
     return (ls == 'F') ? 0 : (ls == 'O') ? 1 : -1;
 }
 
-kernel void gen_q1_fused(
+kernel void Q1_reduce(
     const device int*   l_shipdate        [[buffer(0)]],
     const device char*  l_returnflag      [[buffer(1)]],
     const device char*  l_linestatus      [[buffer(2)]],
@@ -159,8 +160,8 @@ kernel void gen_q1_fused(
     }
     for (uint i = (group_id * threads_per_group) + thread_id_in_group; i < data_size; i += grid_size) {
         if (l_shipdate[i] > cutoff_date) continue;
-        int rfi = q1_rf_index(l_returnflag[i]); if (rfi < 0) continue;
-        int lsi = q1_ls_index(l_linestatus[i]); if (lsi < 0) continue;
+        int rfi = Q1_rf_index(l_returnflag[i]); if (rfi < 0) continue;
+        int lsi = Q1_ls_index(l_linestatus[i]); if (lsi < 0) continue;
         int bin = rfi * 2 + lsi;
         float base = l_extendedprice[i];
         float qty  = l_quantity[i];
@@ -196,16 +197,16 @@ kernel void gen_q1_fused(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q1_fused", 1024, false});
+    result.kernels.push_back({"Q1_reduce", 1024, false});
 }
 
 // ===================================================================
-// Q6 KERNEL GENERATOR
+// PATTERN: Two-Stage Reduce (Q6 — single-sum filter+reduce)
 // ===================================================================
 
-void generateQ6Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ6_TwoStageReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
-kernel void gen_q6_stage1(
+kernel void Q6_reduce(
     const device int*   l_shipdate        [[buffer(0)]],
     const device float* l_discount        [[buffer(1)]],
     const device float* l_quantity        [[buffer(2)]],
@@ -238,7 +239,7 @@ kernel void gen_q6_stage1(
     if (thread_id_in_group == 0) partial_revenues[group_id] = total;
 }
 
-kernel void gen_q6_stage2(
+kernel void Q6_reduce_final(
     const device float* partial_revenues  [[buffer(0)]],
     device float* final_revenue           [[buffer(1)]],
     constant uint& num_threadgroups       [[buffer(2)]],
@@ -251,15 +252,15 @@ kernel void gen_q6_stage2(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q6_stage1", 1024, false});
-    result.kernels.push_back({"gen_q6_stage2", 1, true});
+    result.kernels.push_back({"Q6_reduce", 1024, false});
+    result.kernels.push_back({"Q6_reduce_final", 1, true});
 }
 
 // ===================================================================
-// Q3 KERNEL GENERATOR
+// PATTERN: Bitmap + Map Build + Probe-Agg + Compact (Q3)
 // ===================================================================
 
-void generateQ3Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ3_BitmapMapProbeCompact(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 struct GenQ3Agg {
     atomic_int key;
@@ -275,7 +276,7 @@ struct GenQ3Result {
     uint shippriority;
 };
 
-kernel void gen_q3_build_customer_bitmap(
+kernel void Q3_bitmap_build(
     const device int* c_custkey           [[buffer(0)]],
     const device char* c_mktsegment      [[buffer(1)]],
     device atomic_uint* customer_bitmap  [[buffer(2)]],
@@ -286,7 +287,7 @@ kernel void gen_q3_build_customer_bitmap(
     if (c_mktsegment[index] == 'B') bitmap_set(customer_bitmap, c_custkey[index]);
 }
 
-kernel void gen_q3_build_orders_map(
+kernel void Q3_map_build(
     const device int* o_orderkey         [[buffer(0)]],
     const device int* o_orderdate        [[buffer(1)]],
     device int* orders_map               [[buffer(2)]],
@@ -303,7 +304,7 @@ kernel void gen_q3_build_orders_map(
     orders_map[o_orderkey[index]] = (int)index;
 }
 
-kernel void gen_q3_probe_agg(
+kernel void Q3_probe_agg(
     const device int* l_orderkey         [[buffer(0)]],
     const device int* l_shipdate         [[buffer(1)]],
     const device float* l_extendedprice  [[buffer(2)]],
@@ -350,7 +351,7 @@ kernel void gen_q3_probe_agg(
     }
 }
 
-kernel void gen_q3_compact(
+kernel void Q3_compact(
     device GenQ3Result* ht               [[buffer(0)]],
     device GenQ3Result* output           [[buffer(1)]],
     device atomic_uint& result_count     [[buffer(2)]],
@@ -364,19 +365,19 @@ kernel void gen_q3_compact(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q3_build_customer_bitmap", 1024, false});
-    result.kernels.push_back({"gen_q3_build_orders_map", 1024, false});
-    result.kernels.push_back({"gen_q3_probe_agg", 1024, false});
-    result.kernels.push_back({"gen_q3_compact", 1024, false});
+    result.kernels.push_back({"Q3_bitmap_build", 1024, false});
+    result.kernels.push_back({"Q3_map_build", 1024, false});
+    result.kernels.push_back({"Q3_probe_agg", 1024, false});
+    result.kernels.push_back({"Q3_compact", 1024, false});
 }
 
 // ===================================================================
-// Q14 KERNEL GENERATOR
+// PATTERN: Two-Stage Reduce with Bitmap Probe (Q14)
 // ===================================================================
 
-void generateQ14Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ14_TwoStageReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
-kernel void gen_q14_stage1(
+kernel void Q14_reduce(
     const device int*   l_partkey         [[buffer(0)]],
     const device int*   l_shipdate        [[buffer(1)]],
     const device float* l_extendedprice   [[buffer(2)]],
@@ -413,7 +414,7 @@ kernel void gen_q14_stage1(
     }
 }
 
-kernel void gen_q14_stage2(
+kernel void Q14_reduce_final(
     const device float* partial_promo     [[buffer(0)]],
     const device float* partial_total     [[buffer(1)]],
     device float* final_result            [[buffer(2)]],
@@ -431,17 +432,17 @@ kernel void gen_q14_stage2(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q14_stage1", 1024, false});
-    result.kernels.push_back({"gen_q14_stage2", 1, true});
+    result.kernels.push_back({"Q14_reduce", 1024, false});
+    result.kernels.push_back({"Q14_reduce_final", 1, true});
 }
 
 // ===================================================================
-// Q13 KERNEL GENERATOR
+// PATTERN: String Match + Histogram (Q13)
 // ===================================================================
 
-void generateQ13Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ13_StrMatchHistogram(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
-kernel void gen_q13_count_orders(
+kernel void Q13_str_match_count(
     const device int*  o_custkey          [[buffer(0)]],
     const device char* o_comment          [[buffer(1)]],
     device atomic_uint* custorder_counts  [[buffer(2)]],
@@ -470,7 +471,7 @@ kernel void gen_q13_count_orders(
     }
 }
 
-kernel void gen_q13_histogram(
+kernel void Q13_histogram(
     const device uint* custorder_counts   [[buffer(0)]],
     device atomic_uint* histogram         [[buffer(1)]],
     constant uint& max_custkey            [[buffer(2)]],
@@ -481,18 +482,18 @@ kernel void gen_q13_histogram(
     atomic_fetch_add_explicit(&histogram[cnt], 1u, memory_order_relaxed);
 }
 )METAL";
-    result.kernels.push_back({"gen_q13_count_orders", 1024, false});
-    result.kernels.push_back({"gen_q13_histogram", 1024, false});
+    result.kernels.push_back({"Q13_str_match_count", 1024, false});
+    result.kernels.push_back({"Q13_histogram", 1024, false});
 }
 
 // ===================================================================
-// Q4 KERNEL GENERATOR
+// PATTERN: Bitmap Build + N-bin Reduce (Q4)
 // ===================================================================
 
-void generateQ4Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ4_BitmapReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q4 Phase 1: Build late-delivery bitmap from lineitem
-kernel void gen_q4_build_late_bitmap(
+kernel void Q4_bitmap_build(
     const device int*  l_orderkey         [[buffer(0)]],
     const device int*  l_commitdate       [[buffer(1)]],
     const device int*  l_receiptdate      [[buffer(2)]],
@@ -507,7 +508,7 @@ kernel void gen_q4_build_late_bitmap(
 }
 
 // Q4 Phase 2: Scan orders, filter by date + bitmap, count by priority
-kernel void gen_q4_count_stage1(
+kernel void Q4_reduce(
     const device int*  o_orderkey         [[buffer(0)]],
     const device int*  o_orderdate        [[buffer(1)]],
     const device char* o_orderpriority    [[buffer(2)]],
@@ -537,7 +538,7 @@ kernel void gen_q4_count_stage1(
     }
 }
 
-kernel void gen_q4_count_stage2(
+kernel void Q4_reduce_final(
     const device uint* partial_counts     [[buffer(0)]],
     device uint* final_counts             [[buffer(1)]],
     constant uint& num_threadgroups       [[buffer(2)]],
@@ -552,19 +553,19 @@ kernel void gen_q4_count_stage2(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q4_build_late_bitmap", 1024, false});
-    result.kernels.push_back({"gen_q4_count_stage1", 1024, false});
-    result.kernels.push_back({"gen_q4_count_stage2", 1, true});
+    result.kernels.push_back({"Q4_bitmap_build", 1024, false});
+    result.kernels.push_back({"Q4_reduce", 1024, false});
+    result.kernels.push_back({"Q4_reduce_final", 1, true});
 }
 
 // ===================================================================
-// Q12 KERNEL GENERATOR
+// PATTERN: Bitmap Build + N-bin Reduce (Q12)
 // ===================================================================
 
-void generateQ12Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ12_BitmapReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q12 Phase 1: Build priority bitmap from orders (orderpriority '1' or '2')
-kernel void gen_q12_build_priority_bitmap(
+kernel void Q12_bitmap_build(
     const device int*   o_orderkey        [[buffer(0)]],
     const device char*  o_orderpriority   [[buffer(1)]],
     device atomic_uint* priority_bitmap   [[buffer(2)]],
@@ -579,7 +580,7 @@ kernel void gen_q12_build_priority_bitmap(
 }
 
 // Q12 Phase 2: Filter lineitem and count by {MAIL,SHIP} x {HIGH,LOW}
-kernel void gen_q12_filter_stage1(
+kernel void Q12_reduce(
     const device int*   l_orderkey        [[buffer(0)]],
     const device char*  l_shipmode        [[buffer(1)]],
     const device int*   l_shipdate        [[buffer(2)]],
@@ -617,7 +618,7 @@ kernel void gen_q12_filter_stage1(
     }
 }
 
-kernel void gen_q12_filter_stage2(
+kernel void Q12_reduce_final(
     const device uint* partial_counts     [[buffer(0)]],
     device uint* final_counts             [[buffer(1)]],
     constant uint& num_threadgroups       [[buffer(2)]],
@@ -632,19 +633,19 @@ kernel void gen_q12_filter_stage2(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q12_build_priority_bitmap", 1024, false});
-    result.kernels.push_back({"gen_q12_filter_stage1", 1024, false});
-    result.kernels.push_back({"gen_q12_filter_stage2", 1, true});
+    result.kernels.push_back({"Q12_bitmap_build", 1024, false});
+    result.kernels.push_back({"Q12_reduce", 1024, false});
+    result.kernels.push_back({"Q12_reduce_final", 1, true});
 }
 
 // ===================================================================
-// Q19 KERNEL GENERATOR
+// PATTERN: Map Classify + String Filter + Reduce (Q19)
 // ===================================================================
 
-void generateQ19Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ19_MapClassifyStrFilterReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q19 Phase 1: Build part group map — classify parts into groups 0/1/2 or 0xFF
-kernel void gen_q19_build_part_group_map(
+kernel void Q19_map_classify(
     const device int*   p_partkey         [[buffer(0)]],
     const device char*  p_brand           [[buffer(1)]],
     const device char*  p_container       [[buffer(2)]],
@@ -686,7 +687,7 @@ kernel void gen_q19_build_part_group_map(
 }
 
 // Q19 Phase 2: Compute lineitem shipmode/shipinstruct qualifies flag
-kernel void gen_q19_shipmode_filter(
+kernel void Q19_str_filter(
     const device char*  l_shipmode        [[buffer(0)]],
     const device char*  l_shipinstruct    [[buffer(1)]],
     device uchar*       l_qualifies       [[buffer(2)]],
@@ -705,7 +706,7 @@ kernel void gen_q19_shipmode_filter(
 }
 
 // Q19 Phase 3: Filter+sum with part group map + quantity range check
-kernel void gen_q19_sum_stage1(
+kernel void Q19_reduce(
     const device int*   l_partkey         [[buffer(0)]],
     const device float* l_quantity        [[buffer(1)]],
     const device float* l_extendedprice   [[buffer(2)]],
@@ -740,7 +741,7 @@ kernel void gen_q19_sum_stage1(
     if (thread_id_in_group == 0) partial_revenue[group_id] = total;
 }
 
-kernel void gen_q19_sum_stage2(
+kernel void Q19_reduce_final(
     const device float* partial_revenue   [[buffer(0)]],
     device float* final_revenue           [[buffer(1)]],
     constant uint& num_threadgroups       [[buffer(2)]],
@@ -753,20 +754,20 @@ kernel void gen_q19_sum_stage2(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q19_build_part_group_map", 1024, false});
-    result.kernels.push_back({"gen_q19_shipmode_filter", 1024, false});
-    result.kernels.push_back({"gen_q19_sum_stage1", 1024, false});
-    result.kernels.push_back({"gen_q19_sum_stage2", 1, true});
+    result.kernels.push_back({"Q19_map_classify", 1024, false});
+    result.kernels.push_back({"Q19_str_filter", 1024, false});
+    result.kernels.push_back({"Q19_reduce", 1024, false});
+    result.kernels.push_back({"Q19_reduce_final", 1, true});
 }
 
 // ===================================================================
-// Q15 KERNEL GENERATOR
+// PATTERN: Atomic Map Aggregate (Q15)
 // ===================================================================
 
-void generateQ15Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ15_AtomicAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q15: Single kernel — lineitem date filter → atomic_add revenue to map[suppkey]
-kernel void gen_q15_aggregate_revenue(
+kernel void Q15_atomic_agg(
     const device int*    l_suppkey         [[buffer(0)]],
     const device int*    l_shipdate        [[buffer(1)]],
     const device float*  l_extendedprice   [[buffer(2)]],
@@ -785,18 +786,18 @@ kernel void gen_q15_aggregate_revenue(
     atomic_fetch_add_explicit(&revenue_map[sk], revenue, memory_order_relaxed);
 }
 )METAL";
-    result.kernels.push_back({"gen_q15_aggregate_revenue", 256, true});
+    result.kernels.push_back({"Q15_atomic_agg", 256, true});
 }
 
 // ===================================================================
-// Q11 KERNEL GENERATOR
+// PATTERN: Atomic Aggregate (Q11)
 // ===================================================================
 
-void generateQ11Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ11_AtomicAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q11: Scan partsupp, filter by supplier bitmap (GERMANY), atomic_add value per partkey
 // Also produces threadgroup partial sums for global sum computation
-kernel void gen_q11_aggregate(
+kernel void Q11_atomic_agg(
     const device int*    ps_partkey        [[buffer(0)]],
     const device int*    ps_suppkey        [[buffer(1)]],
     const device float*  ps_supplycost     [[buffer(2)]],
@@ -826,17 +827,17 @@ kernel void gen_q11_aggregate(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q11_aggregate", 256, true});
+    result.kernels.push_back({"Q11_atomic_agg", 256, true});
 }
 
 // ===================================================================
-// Q10 KERNEL GENERATOR
+// PATTERN: Map Build + Probe-Agg (Q10)
 // ===================================================================
 
-void generateQ10Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ10_MapBuildProbeAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q10 Phase 1: Build orders direct map — orderkey → custkey (date filtered)
-kernel void gen_q10_build_orders_map(
+kernel void Q10_map_build(
     const device int* o_orderkey     [[buffer(0)]],
     const device int* o_custkey      [[buffer(1)]],
     const device int* o_orderdate    [[buffer(2)]],
@@ -854,7 +855,7 @@ kernel void gen_q10_build_orders_map(
 }
 
 // Q10 Phase 2: Probe lineitem, filter returnflag='R', aggregate revenue per custkey
-kernel void gen_q10_probe_and_aggregate(
+kernel void Q10_probe_agg(
     const device int*    l_orderkey        [[buffer(0)]],
     const device char*   l_returnflag      [[buffer(1)]],
     const device float*  l_extendedprice   [[buffer(2)]],
@@ -880,18 +881,18 @@ kernel void gen_q10_probe_and_aggregate(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q10_build_orders_map", 256, true});
-    result.kernels.push_back({"gen_q10_probe_and_aggregate", 1024, false});
+    result.kernels.push_back({"Q10_map_build", 256, true});
+    result.kernels.push_back({"Q10_probe_agg", 1024, false});
 }
 
 // ===================================================================
-// Q5 KERNEL GENERATOR
+// PATTERN: Multi-Map Build + Probe-Agg (Q5)
 // ===================================================================
 
-void generateQ5Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ5_MapBuildProbeAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q5 Kernel 1: Build customer->nationkey direct map (ASIA nations only)
-kernel void gen_q5_build_customer_nation_map(
+kernel void Q5_map_build_cust(
     const device int* c_custkey     [[buffer(0)]],
     const device int* c_nationkey   [[buffer(1)]],
     device int* customer_nation_map [[buffer(2)]],
@@ -906,7 +907,7 @@ kernel void gen_q5_build_customer_nation_map(
 }
 
 // Q5 Kernel 2: Build supplier->nationkey direct map (ASIA nations only)
-kernel void gen_q5_build_supplier_nation_map(
+kernel void Q5_map_build_supp(
     const device int* s_suppkey      [[buffer(0)]],
     const device int* s_nationkey    [[buffer(1)]],
     device int* supplier_nation_map  [[buffer(2)]],
@@ -921,7 +922,7 @@ kernel void gen_q5_build_supplier_nation_map(
 }
 
 // Q5 Kernel 3: Build orders->nationkey direct map (date+customer filter)
-kernel void gen_q5_build_orders_map(
+kernel void Q5_map_build_orders(
     const device int* o_orderkey           [[buffer(0)]],
     const device int* o_custkey            [[buffer(1)]],
     const device int* o_orderdate          [[buffer(2)]],
@@ -945,7 +946,7 @@ kernel void gen_q5_build_orders_map(
 }
 
 // Q5 Kernel 4: Probe lineitem, same-nation check, aggregate revenue per nation
-kernel void gen_q5_probe_and_aggregate(
+kernel void Q5_probe_agg(
     const device int* l_orderkey        [[buffer(0)]],
     const device int* l_suppkey         [[buffer(1)]],
     const device float* l_extendedprice [[buffer(2)]],
@@ -979,20 +980,20 @@ kernel void gen_q5_probe_and_aggregate(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q5_build_customer_nation_map", 256, true});
-    result.kernels.push_back({"gen_q5_build_supplier_nation_map", 256, true});
-    result.kernels.push_back({"gen_q5_build_orders_map", 256, true});
-    result.kernels.push_back({"gen_q5_probe_and_aggregate", 1024, false});
+    result.kernels.push_back({"Q5_map_build_cust", 256, true});
+    result.kernels.push_back({"Q5_map_build_supp", 256, true});
+    result.kernels.push_back({"Q5_map_build_orders", 256, true});
+    result.kernels.push_back({"Q5_probe_agg", 1024, false});
 }
 
 // ===================================================================
-// Q7 KERNEL GENERATOR
+// PATTERN: Multi-Map Build + Probe-Agg (Q7)
 // ===================================================================
 
-void generateQ7Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ7_MapBuildProbeAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q7 Kernel 1: Build supplier->nationkey map (FRANCE/GERMANY only)
-kernel void gen_q7_build_supplier_map(
+kernel void Q7_map_build_supp(
     const device int* s_suppkey     [[buffer(0)]],
     const device int* s_nationkey   [[buffer(1)]],
     device int* supp_nation_map     [[buffer(2)]],
@@ -1008,7 +1009,7 @@ kernel void gen_q7_build_supplier_map(
 }
 
 // Q7 Kernel 2: Build customer->nationkey map (FRANCE/GERMANY only)
-kernel void gen_q7_build_customer_map(
+kernel void Q7_map_build_cust(
     const device int* c_custkey     [[buffer(0)]],
     const device int* c_nationkey   [[buffer(1)]],
     device int* cust_nation_map     [[buffer(2)]],
@@ -1024,7 +1025,7 @@ kernel void gen_q7_build_customer_map(
 }
 
 // Q7 Kernel 3: Build orders map orderkey->custkey
-kernel void gen_q7_build_orders_map(
+kernel void Q7_map_build_orders(
     const device int* o_orderkey    [[buffer(0)]],
     const device int* o_custkey     [[buffer(1)]],
     device int* orders_map          [[buffer(2)]],
@@ -1036,7 +1037,7 @@ kernel void gen_q7_build_orders_map(
 }
 
 // Q7 Kernel 4: Probe lineitem, date+chain checks, aggregate 4 bins
-kernel void gen_q7_probe_and_aggregate(
+kernel void Q7_probe_agg(
     const device int* l_orderkey        [[buffer(0)]],
     const device int* l_suppkey         [[buffer(1)]],
     const device int* l_shipdate        [[buffer(2)]],
@@ -1083,20 +1084,20 @@ kernel void gen_q7_probe_and_aggregate(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q7_build_supplier_map", 256, true});
-    result.kernels.push_back({"gen_q7_build_customer_map", 256, true});
-    result.kernels.push_back({"gen_q7_build_orders_map", 256, true});
-    result.kernels.push_back({"gen_q7_probe_and_aggregate", 1024, false});
+    result.kernels.push_back({"Q7_map_build_supp", 256, true});
+    result.kernels.push_back({"Q7_map_build_cust", 256, true});
+    result.kernels.push_back({"Q7_map_build_orders", 256, true});
+    result.kernels.push_back({"Q7_probe_agg", 1024, false});
 }
 
 // ===================================================================
-// Q8 KERNEL GENERATOR
+// PATTERN: Map Build + Probe-Agg (Q8)
 // ===================================================================
 
-void generateQ8Kernels(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ8_MapBuildProbeAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q8 Kernel 1: Build orders map (date+AMERICA customer filter) → custkey+year
-kernel void gen_q8_build_orders_map(
+kernel void Q8_map_build(
     const device int* o_orderkey        [[buffer(0)]],
     const device int* o_custkey         [[buffer(1)]],
     const device int* o_orderdate       [[buffer(2)]],
@@ -1120,7 +1121,7 @@ kernel void gen_q8_build_orders_map(
 }
 
 // Q8 Kernel 2: Probe lineitem, part bitmap check, aggregate 4 bins
-kernel void gen_q8_probe_and_aggregate(
+kernel void Q8_probe_agg(
     const device int* l_orderkey        [[buffer(0)]],
     const device int* l_partkey         [[buffer(1)]],
     const device int* l_suppkey         [[buffer(2)]],
@@ -1159,17 +1160,17 @@ kernel void gen_q8_probe_and_aggregate(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q8_build_orders_map", 256, true});
-    result.kernels.push_back({"gen_q8_probe_and_aggregate", 1024, false});
+    result.kernels.push_back({"Q8_map_build", 256, true});
+    result.kernels.push_back({"Q8_probe_agg", 1024, false});
 }
 
 // ===================================================================
-// Q17: Small-Quantity-Order Revenue
+// PATTERN: Atomic Agg + Probe-Reduce (Q17 — Small-Qty-Order Revenue)
 // ===================================================================
-static void generateQ17Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ17_AtomicAggProbeReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q17 Pass 1: Aggregate quantity stats per qualifying partkey
-kernel void gen_q17_aggregate_qty_stats(
+kernel void Q17_atomic_agg(
     const device int* l_partkey          [[buffer(0)]],
     const device float* l_quantity       [[buffer(1)]],
     const device uint* part_bitmap       [[buffer(2)]],
@@ -1192,7 +1193,7 @@ kernel void gen_q17_aggregate_qty_stats(
 }
 
 // Q17 Pass 2: Sum extendedprice where qty < threshold
-kernel void gen_q17_sum_revenue(
+kernel void Q17_probe_reduce(
     const device int* l_partkey          [[buffer(0)]],
     const device float* l_quantity       [[buffer(1)]],
     const device float* l_extendedprice  [[buffer(2)]],
@@ -1217,17 +1218,17 @@ kernel void gen_q17_sum_revenue(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q17_aggregate_qty_stats", 1024, false});
-    result.kernels.push_back({"gen_q17_sum_revenue", 1024, false});
+    result.kernels.push_back({"Q17_atomic_agg", 1024, false});
+    result.kernels.push_back({"Q17_probe_reduce", 1024, false});
 }
 
 // ===================================================================
-// Q22: Global Sales Opportunity
+// PATTERN: Scalar Agg + Bitmap Build + Bin Agg (Q22 — Global Sales)
 // ===================================================================
-static void generateQ22Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ22_ScalarAggBitmapBinAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q22 Phase 1: Sum + count acctbal for qualifying customers with bal > 0
-kernel void gen_q22_avg_balance(
+kernel void Q22_scalar_agg(
     const device int* c_phone_prefix    [[buffer(0)]],
     const device float* c_acctbal       [[buffer(1)]],
     device atomic_float& sum_bal        [[buffer(2)]],
@@ -1247,7 +1248,7 @@ kernel void gen_q22_avg_balance(
 }
 
 // Q22 Phase 2: Build orders custkey bitmap
-kernel void gen_q22_build_orders_bitmap(
+kernel void Q22_bitmap_build(
     const device int* o_custkey         [[buffer(0)]],
     device atomic_uint* cust_bitmap     [[buffer(1)]],
     constant uint& orders_size          [[buffer(2)]],
@@ -1258,7 +1259,7 @@ kernel void gen_q22_build_orders_bitmap(
 }
 
 // Q22 Phase 3: Final aggregate — count/sum per country code (7 bins)
-kernel void gen_q22_final_aggregate(
+kernel void Q22_bin_agg(
     const device int* c_phone_prefix    [[buffer(0)]],
     const device float* c_acctbal       [[buffer(1)]],
     const device int* c_custkey         [[buffer(2)]],
@@ -1285,15 +1286,15 @@ kernel void gen_q22_final_aggregate(
     atomic_fetch_add_explicit(&result_sum[bin], bal, memory_order_relaxed);
 }
 )METAL";
-    result.kernels.push_back({"gen_q22_avg_balance", 256, false});
-    result.kernels.push_back({"gen_q22_build_orders_bitmap", 256, false});
-    result.kernels.push_back({"gen_q22_final_aggregate", 256, false});
+    result.kernels.push_back({"Q22_scalar_agg", 256, false});
+    result.kernels.push_back({"Q22_bitmap_build", 256, false});
+    result.kernels.push_back({"Q22_bin_agg", 256, false});
 }
 
 // ===================================================================
-// Q2: Minimum Cost Supplier
+// PATTERN: Bitmap + Atomic Min + Compact (Q2 — Min Cost Supplier)
 // ===================================================================
-static void generateQ2Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ2_BitmapMinCompact(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q2 result struct for compact output
 struct GenQ2MatchResult {
@@ -1303,7 +1304,7 @@ struct GenQ2MatchResult {
 };
 
 // Q2 Kernel 1: Filter parts by p_size = 15 AND p_type LIKE '%BRASS' → bitmap
-kernel void gen_q2_filter_part(
+kernel void Q2_bitmap_build(
     const device int* p_partkey   [[buffer(0)]],
     const device int* p_size      [[buffer(1)]],
     const device char* p_type     [[buffer(2)]],
@@ -1330,7 +1331,7 @@ kernel void gen_q2_filter_part(
 }
 
 // Q2 Kernel 2: Find minimum supplycost per partkey (atomic_fetch_min on uint cents)
-kernel void gen_q2_find_min_cost(
+kernel void Q2_atomic_min(
     const device int* ps_partkey      [[buffer(0)]],
     const device int* ps_suppkey      [[buffer(1)]],
     const device float* ps_supplycost [[buffer(2)]],
@@ -1350,7 +1351,7 @@ kernel void gen_q2_find_min_cost(
 }
 
 // Q2 Kernel 3: Match suppliers with minimum cost → compact output
-kernel void gen_q2_match_suppliers(
+kernel void Q2_compact(
     const device int* ps_partkey      [[buffer(0)]],
     const device int* ps_suppkey      [[buffer(1)]],
     const device float* ps_supplycost [[buffer(2)]],
@@ -1378,18 +1379,18 @@ kernel void gen_q2_match_suppliers(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q2_filter_part", 256, false});
-    result.kernels.push_back({"gen_q2_find_min_cost", 256, false});
-    result.kernels.push_back({"gen_q2_match_suppliers", 256, false});
+    result.kernels.push_back({"Q2_bitmap_build", 256, false});
+    result.kernels.push_back({"Q2_atomic_min", 256, false});
+    result.kernels.push_back({"Q2_compact", 256, false});
 }
 
 // ===================================================================
-// Q18: Large Volume Customer
+// PATTERN: Atomic Agg + Compact (Q18 — Large Volume Customer)
 // ===================================================================
-static void generateQ18Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ18_AtomicAggCompact(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q18 Kernel 1: Aggregate SUM(l_quantity) per orderkey
-kernel void gen_q18_aggregate_quantity(
+kernel void Q18_atomic_agg(
     const device int* l_orderkey        [[buffer(0)]],
     const device float* l_quantity      [[buffer(1)]],
     device atomic_float* qty_map        [[buffer(2)]],
@@ -1417,7 +1418,7 @@ struct GenQ18OutputRow {
 };
 
 // Q18 Kernel 2: Filter orders with sum(qty) > threshold, compact output
-kernel void gen_q18_filter_orders(
+kernel void Q18_compact(
     const device int* o_orderkey        [[buffer(0)]],
     const device int* o_custkey         [[buffer(1)]],
     const device int* o_orderdate       [[buffer(2)]],
@@ -1443,14 +1444,14 @@ kernel void gen_q18_filter_orders(
     output[pos].sum_qty = sq;
 }
 )METAL";
-    result.kernels.push_back({"gen_q18_aggregate_quantity", 1024, false});
-    result.kernels.push_back({"gen_q18_filter_orders", 256, false});
+    result.kernels.push_back({"Q18_atomic_agg", 1024, false});
+    result.kernels.push_back({"Q18_compact", 256, false});
 }
 
 // ===================================================================
-// Q9: Product Type Profit Measure
+// PATTERN: Bitmap + Map + HT Build + Probe-Agg (Q9 — Product Type Profit)
 // ===================================================================
-static void generateQ9Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ9_BitmapMapHTProbeAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q9 structs
 struct GenQ9PartSuppEntry {
@@ -1472,7 +1473,7 @@ struct GenQ9OrdersHTEntry {
 };
 
 // Q9 Kernel 1: Build part bitmap — filter p_name LIKE '%green%' (SWAR)
-kernel void gen_q9_build_part_bitmap(
+kernel void Q9_bitmap_build(
     const device int* p_partkey     [[buffer(0)]],
     const device char* p_name       [[buffer(1)]],
     device atomic_uint* part_bitmap [[buffer(2)]],
@@ -1500,7 +1501,7 @@ kernel void gen_q9_build_part_bitmap(
 }
 
 // Q9 Kernel 2: Build supplier -> nationkey direct map
-kernel void gen_q9_build_supplier_map(
+kernel void Q9_map_build(
     const device int* s_suppkey     [[buffer(0)]],
     const device int* s_nationkey   [[buffer(1)]],
     device int* supplier_nation_map [[buffer(2)]],
@@ -1512,7 +1513,7 @@ kernel void gen_q9_build_supplier_map(
 }
 
 // Q9 Kernel 3: Build partsupp HT (open-addressing with CAS)
-kernel void gen_q9_build_partsupp_ht(
+kernel void Q9_ht_build_partsupp(
     const device int* ps_partkey        [[buffer(0)]],
     const device int* ps_suppkey        [[buffer(1)]],
     device GenQ9PartSuppEntry* ht       [[buffer(2)]],
@@ -1550,7 +1551,7 @@ kernel void gen_q9_build_partsupp_ht(
 }
 
 // Q9 Kernel 4: Build orders HT (orderkey -> year)
-kernel void gen_q9_build_orders_ht(
+kernel void Q9_ht_build_orders(
     const device int* o_orderkey    [[buffer(0)]],
     const device int* o_orderdate   [[buffer(1)]],
     device GenQ9OrdersHTEntry* ht   [[buffer(2)]],
@@ -1575,7 +1576,7 @@ kernel void gen_q9_build_orders_ht(
 }
 
 // Q9 Kernel 5: Probe lineitem + direct global aggregation
-kernel void gen_q9_probe_and_aggregate(
+kernel void Q9_probe_agg(
     const device int* l_suppkey         [[buffer(0)]],
     const device int* l_partkey         [[buffer(1)]],
     const device int* l_orderkey        [[buffer(2)]],
@@ -1667,20 +1668,20 @@ kernel void gen_q9_probe_and_aggregate(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q9_build_part_bitmap", 256, true});
-    result.kernels.push_back({"gen_q9_build_supplier_map", 256, true});
-    result.kernels.push_back({"gen_q9_build_partsupp_ht", 256, true});
-    result.kernels.push_back({"gen_q9_build_orders_ht", 256, true});
-    result.kernels.push_back({"gen_q9_probe_and_aggregate", 1024, false});
+    result.kernels.push_back({"Q9_bitmap_build", 256, true});
+    result.kernels.push_back({"Q9_map_build", 256, true});
+    result.kernels.push_back({"Q9_ht_build_partsupp", 256, true});
+    result.kernels.push_back({"Q9_ht_build_orders", 256, true});
+    result.kernels.push_back({"Q9_probe_agg", 1024, false});
 }
 
 // ===================================================================
-// Q16: Parts/Supplier Relationship
+// PATTERN: Group Bitmap + Popcount (Q16 — Parts/Supplier)
 // ===================================================================
-static void generateQ16Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ16_GroupBitmapPopcount(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q16 Kernel 1: Scan partsupp, set bits in per-group bitmaps
-kernel void gen_q16_scan_and_bitmap(
+kernel void Q16_group_bitmap(
     const device int* ps_partkey        [[buffer(0)]],
     const device int* ps_suppkey        [[buffer(1)]],
     const device int* part_group_map    [[buffer(2)]],
@@ -1704,7 +1705,7 @@ kernel void gen_q16_scan_and_bitmap(
 }
 
 // Q16 Kernel 2: Popcount each group's bitmap
-kernel void gen_q16_popcount(
+kernel void Q16_popcount(
     const device uint* group_bitmaps    [[buffer(0)]],
     device uint* group_counts           [[buffer(1)]],
     constant uint& num_groups           [[buffer(2)]],
@@ -1725,14 +1726,14 @@ kernel void gen_q16_popcount(
     if (tid_in_group == 0) group_counts[gid] = r;
 }
 )METAL";
-    result.kernels.push_back({"gen_q16_scan_and_bitmap", 256, true});
-    result.kernels.push_back({"gen_q16_popcount", 256, false});
+    result.kernels.push_back({"Q16_group_bitmap", 256, true});
+    result.kernels.push_back({"Q16_popcount", 256, false});
 }
 
 // ===================================================================
-// Q20: Potential Part Promotion
+// PATTERN: HT Agg + Probe Check (Q20 — Part Promotion)
 // ===================================================================
-static void generateQ20Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ20_HTAggProbeCheck(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 struct GenQ20HTEntry {
     atomic_int key_hi;
@@ -1741,7 +1742,7 @@ struct GenQ20HTEntry {
 };
 
 // Q20 Kernel 1: Aggregate lineitem quantity into HT keyed by (partkey, suppkey)
-kernel void gen_q20_aggregate_lineitem(
+kernel void Q20_ht_agg(
     const device int* l_partkey     [[buffer(0)]],
     const device int* l_suppkey     [[buffer(1)]],
     const device float* l_quantity  [[buffer(2)]],
@@ -1786,7 +1787,7 @@ kernel void gen_q20_aggregate_lineitem(
 }
 
 // Q20 Kernel 2: Probe partsupp against HT, check threshold, set qualifying bitmap
-kernel void gen_q20_probe_partsupp(
+kernel void Q20_probe_check(
     const device int* ps_partkey        [[buffer(0)]],
     const device int* ps_suppkey        [[buffer(1)]],
     const device int* ps_availqty       [[buffer(2)]],
@@ -1822,17 +1823,17 @@ kernel void gen_q20_probe_partsupp(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q20_aggregate_lineitem", 1024, false});
-    result.kernels.push_back({"gen_q20_probe_partsupp", 256, true});
+    result.kernels.push_back({"Q20_ht_agg", 1024, false});
+    result.kernels.push_back({"Q20_probe_check", 256, true});
 }
 
 // ===================================================================
-// Q21: Suppliers Who Kept Orders Waiting
+// PATTERN: Track Build + Count Qualify (Q21 — Supplier Wait)
 // ===================================================================
-static void generateQ21Kernels(std::ostringstream& out, GeneratedKernels& result) {
+static void emitQ21_TrackBuildCountQualify(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q21 Pass 1: Build per-order supplier tracking (CAS multi-value)
-kernel void gen_q21_build_order_tracking(
+kernel void Q21_track_build(
     const device int* l_orderkey        [[buffer(0)]],
     const device int* l_suppkey         [[buffer(1)]],
     const device int* l_receiptdate     [[buffer(2)]],
@@ -1873,7 +1874,7 @@ kernel void gen_q21_build_order_tracking(
 }
 
 // Q21 Pass 2: Count qualifying lineitems per SAUDI ARABIA supplier
-kernel void gen_q21_count_qualifying(
+kernel void Q21_count_qualify(
     const device int* l_orderkey        [[buffer(0)]],
     const device int* l_suppkey         [[buffer(1)]],
     const device int* l_receiptdate     [[buffer(2)]],
@@ -1908,8 +1909,8 @@ kernel void gen_q21_count_qualifying(
     }
 }
 )METAL";
-    result.kernels.push_back({"gen_q21_build_order_tracking", 1024, false});
-    result.kernels.push_back({"gen_q21_count_qualifying", 1024, false});
+    result.kernels.push_back({"Q21_track_build", 1024, false});
+    result.kernels.push_back({"Q21_count_qualify", 1024, false});
 }
 
 } // anonymous namespace
@@ -1919,36 +1920,71 @@ kernel void gen_q21_count_qualifying(
 // ===================================================================
 
 GeneratedKernels generateMetal(const QueryPlan& plan) {
+    using Emitter = void(*)(std::ostringstream&, GeneratedKernels&);
+
+    // Pattern-grouped emitter registry
+    static const std::unordered_map<std::string, Emitter> registry = {
+        // --- Two-Stage Reduce ---
+        {"Q1",  emitQ1_TwoStageReduce},
+        {"Q6",  emitQ6_TwoStageReduce},
+        {"Q14", emitQ14_TwoStageReduce},
+
+        // --- Bitmap Build + N-bin Reduce ---
+        {"Q4",  emitQ4_BitmapReduce},
+        {"Q12", emitQ12_BitmapReduce},
+
+        // --- Bitmap + Map Build + Probe-Agg + Compact ---
+        {"Q3",  emitQ3_BitmapMapProbeCompact},
+
+        // --- Map Build + Probe-Agg ---
+        {"Q5",  emitQ5_MapBuildProbeAgg},
+        {"Q7",  emitQ7_MapBuildProbeAgg},
+        {"Q8",  emitQ8_MapBuildProbeAgg},
+        {"Q10", emitQ10_MapBuildProbeAgg},
+
+        // --- Bitmap + Map + HT Build + Probe-Agg ---
+        {"Q9",  emitQ9_BitmapMapHTProbeAgg},
+
+        // --- Atomic Aggregate ---
+        {"Q11", emitQ11_AtomicAgg},
+        {"Q15", emitQ15_AtomicAgg},
+
+        // --- Atomic Agg + Probe-Reduce ---
+        {"Q17", emitQ17_AtomicAggProbeReduce},
+
+        // --- Atomic Agg + Compact ---
+        {"Q18", emitQ18_AtomicAggCompact},
+
+        // --- Map Classify + String Filter + Reduce ---
+        {"Q19", emitQ19_MapClassifyStrFilterReduce},
+
+        // --- String Match + Histogram ---
+        {"Q13", emitQ13_StrMatchHistogram},
+
+        // --- Bitmap + Atomic Min + Compact ---
+        {"Q2",  emitQ2_BitmapMinCompact},
+
+        // --- Group Bitmap + Popcount ---
+        {"Q16", emitQ16_GroupBitmapPopcount},
+
+        // --- HT Agg + Probe Check ---
+        {"Q20", emitQ20_HTAggProbeCheck},
+
+        // --- Track Build + Count Qualify ---
+        {"Q21", emitQ21_TrackBuildCountQualify},
+
+        // --- Scalar Agg + Bitmap + Bin Agg ---
+        {"Q22", emitQ22_ScalarAggBitmapBinAgg},
+    };
+
     GeneratedKernels result;
     std::ostringstream out;
-
-    // Common header
     out << METAL_COMMON_HEADER;
 
-    // Dispatch to query-specific generator
-    if (plan.name == "Q1") generateQ1Kernels(out, result);
-    else if (plan.name == "Q6") generateQ6Kernels(out, result);
-    else if (plan.name == "Q3") generateQ3Kernels(out, result);
-    else if (plan.name == "Q14") generateQ14Kernels(out, result);
-    else if (plan.name == "Q13") generateQ13Kernels(out, result);
-    else if (plan.name == "Q4") generateQ4Kernels(out, result);
-    else if (plan.name == "Q12") generateQ12Kernels(out, result);
-    else if (plan.name == "Q19") generateQ19Kernels(out, result);
-    else if (plan.name == "Q15") generateQ15Kernels(out, result);
-    else if (plan.name == "Q11") generateQ11Kernels(out, result);
-    else if (plan.name == "Q10") generateQ10Kernels(out, result);
-    else if (plan.name == "Q5") generateQ5Kernels(out, result);
-    else if (plan.name == "Q7") generateQ7Kernels(out, result);
-    else if (plan.name == "Q8") generateQ8Kernels(out, result);
-    else if (plan.name == "Q17") generateQ17Kernels(out, result);
-    else if (plan.name == "Q22") generateQ22Kernels(out, result);
-    else if (plan.name == "Q2") generateQ2Kernels(out, result);
-    else if (plan.name == "Q18") generateQ18Kernels(out, result);
-    else if (plan.name == "Q9") generateQ9Kernels(out, result);
-    else if (plan.name == "Q16") generateQ16Kernels(out, result);
-    else if (plan.name == "Q20") generateQ20Kernels(out, result);
-    else if (plan.name == "Q21") generateQ21Kernels(out, result);
-    else throw std::runtime_error("No Metal codegen for plan: " + plan.name);
+    auto it = registry.find(plan.name);
+    if (it == registry.end())
+        throw std::runtime_error("No Metal codegen for plan: " + plan.name);
+    it->second(out, result);
 
     result.metalSource = out.str();
     return result;

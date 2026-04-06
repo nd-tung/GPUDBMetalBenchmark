@@ -47,7 +47,7 @@ void executeQ1(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     const uint data_size = (uint)l_shipdate.size();
     if (data_size == 0) { std::cerr << "Q1: no data" << std::endl; return; }
 
-    auto* pso = findPSO(cq, "gen_q1_fused");
+    auto* pso = findPSO(cq, "Q1_reduce");
     if (!pso) return;
 
     // Create column buffers
@@ -197,8 +197,8 @@ void executeQ6(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     uint dataSize = (uint)l_shipdate.size();
     if (dataSize == 0) { std::cerr << "Q6: no data" << std::endl; return; }
 
-    auto* s1pso = findPSO(cq, "gen_q6_stage1");
-    auto* s2pso = findPSO(cq, "gen_q6_stage2");
+    auto* s1pso = findPSO(cq, "Q6_reduce");
+    auto* s2pso = findPSO(cq, "Q6_reduce_final");
     if (!s1pso || !s2pso) return;
 
     const uint numTG = 2048;
@@ -295,10 +295,10 @@ void executeQ3(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     const uint orders_size = (uint)o_orderkey.size();
     const uint lineitem_size = (uint)l_orderkey.size();
 
-    auto* bmPSO = findPSO(cq, "gen_q3_build_customer_bitmap");
-    auto* mapPSO = findPSO(cq, "gen_q3_build_orders_map");
-    auto* probePSO = findPSO(cq, "gen_q3_probe_agg");
-    auto* compactPSO = findPSO(cq, "gen_q3_compact");
+    auto* bmPSO = findPSO(cq, "Q3_bitmap_build");
+    auto* mapPSO = findPSO(cq, "Q3_map_build");
+    auto* probePSO = findPSO(cq, "Q3_probe_agg");
+    auto* compactPSO = findPSO(cq, "Q3_compact");
     if (!bmPSO || !mapPSO || !probePSO || !compactPSO) return;
 
     // Customer bitmap
@@ -459,8 +459,8 @@ void executeQ14(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     });
     auto* promoBmBuf = uploadBitmap(device, promoBm);
 
-    auto* s1pso = findPSO(cq, "gen_q14_stage1");
-    auto* s2pso = findPSO(cq, "gen_q14_stage2");
+    auto* s1pso = findPSO(cq, "Q14_reduce");
+    auto* s2pso = findPSO(cq, "Q14_reduce_final");
     if (!s1pso || !s2pso) return;
 
     const uint numTG = 2048;
@@ -549,8 +549,8 @@ void executeQ13(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     const uint orders_size = (uint)o_custkey.size();
     const uint comment_width = 79;
 
-    auto* countPSO = findPSO(cq, "gen_q13_count_orders");
-    auto* histPSO = findPSO(cq, "gen_q13_histogram");
+    auto* countPSO = findPSO(cq, "Q13_str_match_count");
+    auto* histPSO = findPSO(cq, "Q13_histogram");
     if (!countPSO || !histPSO) return;
 
     auto* oCustBuf = device->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
@@ -661,9 +661,9 @@ void executeQ4(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     uint ordSize = (uint)o_orderkey.size();
     if (liSize == 0 || ordSize == 0) { std::cerr << "Q4: no data" << std::endl; return; }
 
-    auto* bmPSO = findPSO(cq, "gen_q4_build_late_bitmap");
-    auto* s1PSO = findPSO(cq, "gen_q4_count_stage1");
-    auto* s2PSO = findPSO(cq, "gen_q4_count_stage2");
+    auto* bmPSO = findPSO(cq, "Q4_bitmap_build");
+    auto* s1PSO = findPSO(cq, "Q4_reduce");
+    auto* s2PSO = findPSO(cq, "Q4_reduce_final");
     if (!bmPSO || !s1PSO || !s2PSO) return;
 
     int max_orderkey = 0;
@@ -787,9 +787,9 @@ void executeQ12(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     uint ordSize = (uint)o_orderkey.size();
     if (liSize == 0) { std::cerr << "Q12: no data" << std::endl; return; }
 
-    auto* bmPSO = findPSO(cq, "gen_q12_build_priority_bitmap");
-    auto* s1PSO = findPSO(cq, "gen_q12_filter_stage1");
-    auto* s2PSO = findPSO(cq, "gen_q12_filter_stage2");
+    auto* bmPSO = findPSO(cq, "Q12_bitmap_build");
+    auto* s1PSO = findPSO(cq, "Q12_reduce");
+    auto* s2PSO = findPSO(cq, "Q12_reduce_final");
     if (!bmPSO || !s1PSO || !s2PSO) return;
 
     int max_orderkey = 0;
@@ -925,10 +925,10 @@ void executeQ19(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     const uint shipmode_stride = 10;
     const uint shipinstruct_stride = 25;
 
-    auto* mapPSO    = findPSO(cq, "gen_q19_build_part_group_map");
-    auto* filterPSO = findPSO(cq, "gen_q19_shipmode_filter");
-    auto* s1PSO     = findPSO(cq, "gen_q19_sum_stage1");
-    auto* s2PSO     = findPSO(cq, "gen_q19_sum_stage2");
+    auto* mapPSO    = findPSO(cq, "Q19_map_classify");
+    auto* filterPSO = findPSO(cq, "Q19_str_filter");
+    auto* s1PSO     = findPSO(cq, "Q19_reduce");
+    auto* s2PSO     = findPSO(cq, "Q19_reduce_final");
     if (!mapPSO || !filterPSO || !s1PSO || !s2PSO) return;
 
     const uint numTG = 2048;
@@ -1074,7 +1074,7 @@ void executeQ15(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
     uint map_size = max_suppkey + 1;
 
-    auto* pso = findPSO(cq, "gen_q15_aggregate_revenue");
+    auto* pso = findPSO(cq, "Q15_atomic_agg");
     if (!pso) return;
 
     auto* suppkeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
@@ -1178,7 +1178,7 @@ void executeQ11(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto suppBm = buildSuppBitmapAndIndex(s_suppkey.data(), s_nationkey.data(),
                                            supplier_size, germany_keys);
 
-    auto* pso = findPSO(cq, "gen_q11_aggregate");
+    auto* pso = findPSO(cq, "Q11_atomic_agg");
     if (!pso) return;
 
     int max_partkey = 0;
@@ -1302,8 +1302,8 @@ void executeQ10(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     std::vector<size_t> cust_index(max_custkey + 1, SIZE_MAX);
     for (size_t i = 0; i < c_custkey.size(); i++) cust_index[c_custkey[i]] = i;
 
-    auto* buildPSO = findPSO(cq, "gen_q10_build_orders_map");
-    auto* probePSO = findPSO(cq, "gen_q10_probe_and_aggregate");
+    auto* buildPSO = findPSO(cq, "Q10_map_build");
+    auto* probePSO = findPSO(cq, "Q10_probe_agg");
     if (!buildPSO || !probePSO) return;
 
     int max_orderkey = 0;
@@ -1447,10 +1447,10 @@ void executeQ5(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto nation_names = buildNationNames(nat.nationkey, nat.name.data(), NationData::NAME_WIDTH);
     uint cpu_nation_bitmap = buildNationBitmap(nat.nationkey, nat.regionkey, asia_regionkey);
 
-    auto* custMapPSO = findPSO(cq, "gen_q5_build_customer_nation_map");
-    auto* suppMapPSO = findPSO(cq, "gen_q5_build_supplier_nation_map");
-    auto* ordMapPSO = findPSO(cq, "gen_q5_build_orders_map");
-    auto* probePSO = findPSO(cq, "gen_q5_probe_and_aggregate");
+    auto* custMapPSO = findPSO(cq, "Q5_map_build_cust");
+    auto* suppMapPSO = findPSO(cq, "Q5_map_build_supp");
+    auto* ordMapPSO = findPSO(cq, "Q5_map_build_orders");
+    auto* probePSO = findPSO(cq, "Q5_probe_agg");
     if (!custMapPSO || !suppMapPSO || !ordMapPSO || !probePSO) return;
 
     int max_custkey = 0, max_suppkey = 0, max_orderkey = 0;
@@ -1623,10 +1623,10 @@ void executeQ7(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     uint cust_map_size = max_custkey + 1;
     uint ord_map_size = max_orderkey + 1;
 
-    auto* suppMapPSO = findPSO(cq, "gen_q7_build_supplier_map");
-    auto* custMapPSO = findPSO(cq, "gen_q7_build_customer_map");
-    auto* ordMapPSO = findPSO(cq, "gen_q7_build_orders_map");
-    auto* probePSO = findPSO(cq, "gen_q7_probe_and_aggregate");
+    auto* suppMapPSO = findPSO(cq, "Q7_map_build_supp");
+    auto* custMapPSO = findPSO(cq, "Q7_map_build_cust");
+    auto* ordMapPSO = findPSO(cq, "Q7_map_build_orders");
+    auto* probePSO = findPSO(cq, "Q7_probe_agg");
     if (!suppMapPSO || !custMapPSO || !ordMapPSO || !probePSO) return;
 
     auto* pSuppKeyBuf = device->newBuffer(s_suppkey.data(), suppSize * sizeof(int), MTL::ResourceStorageModeShared);
@@ -1800,8 +1800,8 @@ void executeQ8(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
     uint ord_map_size = max_orderkey + 1;
 
-    auto* buildPSO = findPSO(cq, "gen_q8_build_orders_map");
-    auto* probePSO = findPSO(cq, "gen_q8_probe_and_aggregate");
+    auto* buildPSO = findPSO(cq, "Q8_map_build");
+    auto* probePSO = findPSO(cq, "Q8_probe_agg");
     if (!buildPSO || !probePSO) return;
 
     auto* pPartBitmapBuf = uploadBitmap(device, part_bm);
@@ -1932,7 +1932,7 @@ static void executeQ17(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     // Pass 1: aggregate qty stats
     MTL::CommandBuffer* cb1 = cmdQueue->commandBuffer();
     MTL::ComputeCommandEncoder* enc1 = cb1->computeCommandEncoder();
-    enc1->setComputePipelineState(findPSO(compiled, "gen_q17_aggregate_qty_stats"));
+    enc1->setComputePipelineState(findPSO(compiled, "Q17_atomic_agg"));
     enc1->setBuffer(pLinePartKeyBuf, 0, 0);
     enc1->setBuffer(pLineQtyBuf, 0, 1);
     enc1->setBuffer(pPartBitmapBuf, 0, 2);
@@ -1954,7 +1954,7 @@ static void executeQ17(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     // Pass 2: sum revenue
     MTL::CommandBuffer* cb2 = cmdQueue->commandBuffer();
     MTL::ComputeCommandEncoder* enc2 = cb2->computeCommandEncoder();
-    enc2->setComputePipelineState(findPSO(compiled, "gen_q17_sum_revenue"));
+    enc2->setComputePipelineState(findPSO(compiled, "Q17_probe_reduce"));
     enc2->setBuffer(pLinePartKeyBuf, 0, 0);
     enc2->setBuffer(pLineQtyBuf, 0, 1);
     enc2->setBuffer(pLinePriceBuf, 0, 2);
@@ -2047,7 +2047,7 @@ static void executeQ22(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     // Phase 1+2: avg balance + orders bitmap (single command buffer)
     MTL::CommandBuffer* cb1 = cmdQueue->commandBuffer();
     MTL::ComputeCommandEncoder* enc1 = cb1->computeCommandEncoder();
-    enc1->setComputePipelineState(findPSO(compiled, "gen_q22_avg_balance"));
+    enc1->setComputePipelineState(findPSO(compiled, "Q22_scalar_agg"));
     enc1->setBuffer(pPrefixBuf, 0, 0);
     enc1->setBuffer(pAcctBalBuf, 0, 1);
     enc1->setBuffer(pSumBalBuf, 0, 2);
@@ -2057,7 +2057,7 @@ static void executeQ22(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     enc1->dispatchThreads(MTL::Size(custSize, 1, 1), MTL::Size(256, 1, 1));
 
     enc1->memoryBarrier(MTL::BarrierScopeBuffers);
-    enc1->setComputePipelineState(findPSO(compiled, "gen_q22_build_orders_bitmap"));
+    enc1->setComputePipelineState(findPSO(compiled, "Q22_bitmap_build"));
     enc1->setBuffer(pOrdCustKeyBuf, 0, 0);
     enc1->setBuffer(pCustBitmapBuf, 0, 1);
     enc1->setBytes(&ordSize, sizeof(ordSize), 2);
@@ -2073,7 +2073,7 @@ static void executeQ22(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     // Phase 3: final aggregate
     MTL::CommandBuffer* cb2 = cmdQueue->commandBuffer();
     MTL::ComputeCommandEncoder* enc2 = cb2->computeCommandEncoder();
-    enc2->setComputePipelineState(findPSO(compiled, "gen_q22_final_aggregate"));
+    enc2->setComputePipelineState(findPSO(compiled, "Q22_bin_agg"));
     enc2->setBuffer(pPrefixBuf, 0, 0);
     enc2->setBuffer(pAcctBalBuf, 0, 1);
     enc2->setBuffer(pCustKeyBuf, 0, 2);
@@ -2184,7 +2184,7 @@ static void executeQ2(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
 
     // Stage 1: filter parts → bitmap
-    enc->setComputePipelineState(findPSO(compiled, "gen_q2_filter_part"));
+    enc->setComputePipelineState(findPSO(compiled, "Q2_bitmap_build"));
     enc->setBuffer(pPartKeyBuf, 0, 0);
     enc->setBuffer(pPartSizeBuf, 0, 1);
     enc->setBuffer(pPartTypeBuf, 0, 2);
@@ -2195,7 +2195,7 @@ static void executeQ2(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
     // Stage 2: find min cost per partkey
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
-    enc->setComputePipelineState(findPSO(compiled, "gen_q2_find_min_cost"));
+    enc->setComputePipelineState(findPSO(compiled, "Q2_atomic_min"));
     enc->setBuffer(pPsPartKeyBuf, 0, 0);
     enc->setBuffer(pPsSuppKeyBuf, 0, 1);
     enc->setBuffer(pPsSupplyCostBuf, 0, 2);
@@ -2207,7 +2207,7 @@ static void executeQ2(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
     // Stage 3: match suppliers → compact output
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
-    enc->setComputePipelineState(findPSO(compiled, "gen_q2_match_suppliers"));
+    enc->setComputePipelineState(findPSO(compiled, "Q2_compact"));
     enc->setBuffer(pPsPartKeyBuf, 0, 0);
     enc->setBuffer(pPsSuppKeyBuf, 0, 1);
     enc->setBuffer(pPsSupplyCostBuf, 0, 2);
@@ -2290,7 +2290,7 @@ static void executeQ18(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     MTL::CommandBuffer* cb = cmdQueue->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
 
-    enc->setComputePipelineState(findPSO(compiled, "gen_q18_aggregate_quantity"));
+    enc->setComputePipelineState(findPSO(compiled, "Q18_atomic_agg"));
     enc->setBuffer(pLineOrdKeyBuf, 0, 0);
     enc->setBuffer(pLineQtyBuf, 0, 1);
     enc->setBuffer(pQtyMapBuf, 0, 2);
@@ -2299,7 +2299,7 @@ static void executeQ18(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
-    enc->setComputePipelineState(findPSO(compiled, "gen_q18_filter_orders"));
+    enc->setComputePipelineState(findPSO(compiled, "Q18_compact"));
     enc->setBuffer(pOrdKeyBuf, 0, 0);
     enc->setBuffer(pOrdCustKeyBuf, 0, 1);
     enc->setBuffer(pOrdDateBuf, 0, 2);
@@ -2453,7 +2453,7 @@ static void executeQ9(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         auto* enc = cb->computeCommandEncoder();
 
         // K1: build part bitmap
-        enc->setComputePipelineState(findPSO(compiled, "gen_q9_build_part_bitmap"));
+        enc->setComputePipelineState(findPSO(compiled, "Q9_bitmap_build"));
         enc->setBuffer(pPartKeyBuf, 0, 0);
         enc->setBuffer(pPartNameBuf, 0, 1);
         enc->setBuffer(pPartBitmapBuf, 0, 2);
@@ -2461,7 +2461,7 @@ static void executeQ9(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         enc->dispatchThreads(MTL::Size(part_size, 1, 1), MTL::Size(256, 1, 1));
 
         // K2: build supplier map
-        enc->setComputePipelineState(findPSO(compiled, "gen_q9_build_supplier_map"));
+        enc->setComputePipelineState(findPSO(compiled, "Q9_map_build"));
         enc->setBuffer(pSuppKeyBuf, 0, 0);
         enc->setBuffer(pSuppNationBuf, 0, 1);
         enc->setBuffer(pSuppMapBuf, 0, 2);
@@ -2471,7 +2471,7 @@ static void executeQ9(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
         // K3: build partsupp HT (depends on part bitmap)
-        enc->setComputePipelineState(findPSO(compiled, "gen_q9_build_partsupp_ht"));
+        enc->setComputePipelineState(findPSO(compiled, "Q9_ht_build_partsupp"));
         enc->setBuffer(pPsPartKeyBuf, 0, 0);
         enc->setBuffer(pPsSuppKeyBuf, 0, 1);
         enc->setBuffer(pPartSuppHTBuf, 0, 2);
@@ -2481,7 +2481,7 @@ static void executeQ9(MTL::Device* device, MTL::CommandQueue* cmdQueue,
         enc->dispatchThreads(MTL::Size(partsupp_size, 1, 1), MTL::Size(256, 1, 1));
 
         // K4: build orders HT (independent)
-        enc->setComputePipelineState(findPSO(compiled, "gen_q9_build_orders_ht"));
+        enc->setComputePipelineState(findPSO(compiled, "Q9_ht_build_orders"));
         enc->setBuffer(pOrdKeyBuf, 0, 0);
         enc->setBuffer(pOrdDateBuf, 0, 1);
         enc->setBuffer(pOrdersHTBuf, 0, 2);
@@ -2493,7 +2493,7 @@ static void executeQ9(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
         // Probe phase: separate encoder for memory ordering
         auto* enc2 = cb->computeCommandEncoder();
-        enc2->setComputePipelineState(findPSO(compiled, "gen_q9_probe_and_aggregate"));
+        enc2->setComputePipelineState(findPSO(compiled, "Q9_probe_agg"));
         enc2->setBuffer(pLineSuppKeyBuf, 0, 0);
         enc2->setBuffer(pLinePartKeyBuf, 0, 1);
         enc2->setBuffer(pLineOrdKeyBuf, 0, 2);
@@ -2619,7 +2619,7 @@ static void executeQ16(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto* cb = cmdQueue->commandBuffer();
     auto* enc = cb->computeCommandEncoder();
 
-    enc->setComputePipelineState(findPSO(compiled, "gen_q16_scan_and_bitmap"));
+    enc->setComputePipelineState(findPSO(compiled, "Q16_group_bitmap"));
     enc->setBuffer(pPsPartKeyBuf, 0, 0);
     enc->setBuffer(pPsSuppKeyBuf, 0, 1);
     enc->setBuffer(pPartGroupMapBuf, 0, 2);
@@ -2632,7 +2632,7 @@ static void executeQ16(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
-    enc->setComputePipelineState(findPSO(compiled, "gen_q16_popcount"));
+    enc->setComputePipelineState(findPSO(compiled, "Q16_popcount"));
     enc->setBuffer(pGroupBitmapsBuf, 0, 0);
     enc->setBuffer(pGroupCountsBuf, 0, 1);
     enc->setBytes(&numGroups, sizeof(numGroups), 2);
@@ -2759,7 +2759,7 @@ static void executeQ20(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto* cb = cmdQueue->commandBuffer();
 
     auto* enc = cb->computeCommandEncoder();
-    enc->setComputePipelineState(findPSO(compiled, "gen_q20_aggregate_lineitem"));
+    enc->setComputePipelineState(findPSO(compiled, "Q20_ht_agg"));
     enc->setBuffer(pLinePartKeyBuf, 0, 0);
     enc->setBuffer(pLineSuppKeyBuf, 0, 1);
     enc->setBuffer(pLineQtyBuf, 0, 2);
@@ -2774,7 +2774,7 @@ static void executeQ20(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     enc->endEncoding();
 
     auto* enc2 = cb->computeCommandEncoder();
-    enc2->setComputePipelineState(findPSO(compiled, "gen_q20_probe_partsupp"));
+    enc2->setComputePipelineState(findPSO(compiled, "Q20_probe_check"));
     enc2->setBuffer(pPSPartKeyBuf, 0, 0);
     enc2->setBuffer(pPSSuppKeyBuf, 0, 1);
     enc2->setBuffer(pPSAvailQtyBuf, 0, 2);
@@ -2889,7 +2889,7 @@ static void executeQ21(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto* cb = cmdQueue->commandBuffer();
     auto* enc = cb->computeCommandEncoder();
 
-    enc->setComputePipelineState(findPSO(compiled, "gen_q21_build_order_tracking"));
+    enc->setComputePipelineState(findPSO(compiled, "Q21_track_build"));
     enc->setBuffer(pLineOrdKeyBuf, 0, 0);
     enc->setBuffer(pLineSuppKeyBuf, 0, 1);
     enc->setBuffer(pLineReceiptBuf, 0, 2);
@@ -2905,7 +2905,7 @@ static void executeQ21(MTL::Device* device, MTL::CommandQueue* cmdQueue,
 
     enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
-    enc->setComputePipelineState(findPSO(compiled, "gen_q21_count_qualifying"));
+    enc->setComputePipelineState(findPSO(compiled, "Q21_count_qualify"));
     enc->setBuffer(pLineOrdKeyBuf, 0, 0);
     enc->setBuffer(pLineSuppKeyBuf, 0, 1);
     enc->setBuffer(pLineReceiptBuf, 0, 2);
@@ -2989,8 +2989,8 @@ void executeQ6SF100(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     const uint numTG = 2048;
     printf("Gen-Q6 SF100: %zu rows, chunk size: %zu (index %.1f ms)\n", totalRows, chunkRows, indexBuildMs);
 
-    auto* s1pso = findPSO(cq, "gen_q6_stage1");
-    auto* s2pso = findPSO(cq, "gen_q6_stage2");
+    auto* s1pso = findPSO(cq, "Q6_reduce");
+    auto* s2pso = findPSO(cq, "Q6_reduce_final");
     if (!s1pso || !s2pso) return;
 
     struct Q6Slot { MTL::Buffer* shipdate; MTL::Buffer* discount; MTL::Buffer* quantity; MTL::Buffer* extprice; };
@@ -3076,7 +3076,7 @@ void executeQ1SF100(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     const uint bins = 6;
     printf("Gen-Q1 SF100: %zu rows, chunk size: %zu (index %.1f ms)\n", totalRows, chunkRows, indexBuildMs);
 
-    auto* pso = findPSO(cq, "gen_q1_fused");
+    auto* pso = findPSO(cq, "Q1_reduce");
     if (!pso) return;
 
     struct Q1Slot {
@@ -3261,10 +3261,10 @@ void executeQ3SF100(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto bpT1 = std::chrono::high_resolution_clock::now();
     double buildParseMs = std::chrono::duration<double, std::milli>(bpT1 - bpT0).count();
 
-    auto* bmPSO = findPSO(cq, "gen_q3_build_customer_bitmap");
-    auto* mapPSO = findPSO(cq, "gen_q3_build_orders_map");
-    auto* probePSO = findPSO(cq, "gen_q3_probe_agg");
-    auto* compactPSO = findPSO(cq, "gen_q3_compact");
+    auto* bmPSO = findPSO(cq, "Q3_bitmap_build");
+    auto* mapPSO = findPSO(cq, "Q3_map_build");
+    auto* probePSO = findPSO(cq, "Q3_probe_agg");
+    auto* compactPSO = findPSO(cq, "Q3_compact");
     if (!bmPSO || !mapPSO || !probePSO || !compactPSO) return;
 
     const uint customer_size = (uint)custRows;
@@ -3443,8 +3443,8 @@ void executeQ13SF100(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto buildT1 = std::chrono::high_resolution_clock::now();
     double buildMs = std::chrono::duration<double, std::milli>(buildT1 - buildT0).count();
 
-    auto* countPSO = findPSO(cq, "gen_q13_count_orders");
-    auto* histPSO = findPSO(cq, "gen_q13_histogram");
+    auto* countPSO = findPSO(cq, "Q13_str_match_count");
+    auto* histPSO = findPSO(cq, "Q13_histogram");
     if (!countPSO || !histPSO) return;
 
     auto* countsBuf = createFilledBuffer(device, (max_custkey + 1) * sizeof(uint), 0);
@@ -3567,8 +3567,8 @@ void executeQ14SF100(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     auto buildT1 = std::chrono::high_resolution_clock::now();
     double buildMs = std::chrono::duration<double, std::milli>(buildT1 - buildT0).count();
 
-    auto* s1pso = findPSO(cq, "gen_q14_stage1");
-    auto* s2pso = findPSO(cq, "gen_q14_stage2");
+    auto* s1pso = findPSO(cq, "Q14_reduce");
+    auto* s2pso = findPSO(cq, "Q14_reduce_final");
     if (!s1pso || !s2pso) return;
 
     size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 16, liRows);
@@ -3683,7 +3683,7 @@ void executeQ18SF100(MTL::Device* device, MTL::CommandQueue* cmdQueue,
     for (size_t i = 0; i < ordRows; i++) max_orderkey = std::max(max_orderkey, o_orderkey[i]);
     uint qty_map_size = max_orderkey + 1;
 
-    auto* aggPSO = findPSO(cq, "gen_q18_aggregate_quantity");
+    auto* aggPSO = findPSO(cq, "Q18_atomic_agg");
     if (!aggPSO) return;
 
     auto* pQtyMapBuf = device->newBuffer((size_t)qty_map_size * sizeof(float), MTL::ResourceStorageModeShared);
