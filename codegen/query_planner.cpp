@@ -154,7 +154,7 @@ bool matchQ14(const AnalyzedQuery& aq) {
     return sorted[0] == "lineitem" && sorted[1] == "part";
 }
 
-QueryPlan planQ14(const AnalyzedQuery& aq) {
+QueryPlan planQ14(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q14";
 
@@ -373,13 +373,25 @@ bool matchQ15(const AnalyzedQuery& aq) {
 QueryPlan planQ15(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q15";
-    // Single kernel: lineitem date filter → atomic_add revenue to map[suppkey]
-    // Then CPU: find max, print matching supplier(s)
-    // We use a TwoStageReduceOp but codegen treats Q15 specially (direct-map atomic)
-    TwoStageReduceOp op;
-    op.numBins = 0; // dynamic — per-suppkey aggregation
-    op.binExpr = Expr::col("lineitem","l_suppkey",2,DataType::INT);
-    op.aggregations = {
+
+    // Step 1: GPU atomic map agg — lineitem date filter → atomic_add revenue to map[suppkey]
+    ProbeAggOp agg;
+    agg.factTable = "lineitem";
+    agg.factColumns = {
+        bind("lineitem","l_suppkey"), bind("lineitem","l_shipdate"),
+        bind("lineitem","l_extendedprice"), bind("lineitem","l_discount")
+    };
+    agg.factFilter = Predicate::logAnd({
+        Predicate::cmp(CmpOp::GE,
+            Expr::col("lineitem","l_shipdate",10,DataType::DATE),
+            Expr::lit(19960101)),
+        Predicate::cmp(CmpOp::LT,
+            Expr::col("lineitem","l_shipdate",10,DataType::DATE),
+            Expr::lit(19960401)),
+    });
+    agg.groupKeyExpr = Expr::col("lineitem","l_suppkey",2,DataType::INT);
+    agg.numGroups = 0; // per-suppkey atomic map
+    agg.aggregations = {
         {AggFunc::SUM,
          Expr::binary(ExprOp::MUL,
              Expr::col("lineitem","l_extendedprice",5,DataType::FLOAT),
@@ -387,7 +399,9 @@ QueryPlan planQ15(const AnalyzedQuery& /*aq*/) {
                  Expr::col("lineitem","l_discount",6,DataType::FLOAT))),
          "total_revenue"}
     };
-    plan.ops.push_back(std::move(op));
+    plan.ops.push_back(std::move(agg));
+
+    // CPU: find max revenue, print matching supplier(s)
     return plan;
 }
 
@@ -401,15 +415,32 @@ bool matchQ11(const AnalyzedQuery& aq) {
 QueryPlan planQ11(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q11";
-    // Single kernel: partsupp scan, supplier bitmap filter,
-    // atomic_add value to map[partkey] + TG reduce for global sum
-    TwoStageReduceOp op;
-    op.numBins = 0; // dynamic — per-partkey aggregation
-    op.binExpr = Expr::col("partsupp","ps_partkey",0,DataType::INT);
-    op.aggregations = {
+
+    // Step 1 (CPU): bitmap on supplier WHERE s_nationkey = GERMANY
+    CpuBitmapBuildOp suppBm;
+    suppBm.table = "supplier";
+    suppBm.keyCol = bind("supplier", "s_suppkey");
+    suppBm.filter = Predicate::cmp(CmpOp::EQ,
+        Expr::col("supplier","s_nationkey",3,DataType::INT),
+        Expr::lit(0)); // GERMANY nationkey resolved at runtime
+    suppBm.resultName = "supp_bitmap";
+    plan.ops.push_back(std::move(suppBm));
+
+    // Step 2: GPU atomic map agg — per-partkey, bitmap-filtered scan of partsupp
+    ProbeAggOp agg;
+    agg.factTable = "partsupp";
+    agg.factColumns = {
+        bind("partsupp","ps_partkey"), bind("partsupp","ps_suppkey"),
+        bind("partsupp","ps_supplycost"), bind("partsupp","ps_availqty")
+    };
+    agg.lookups = {{0, bind("partsupp","ps_suppkey"), ProbeAggOp::LookupRef::BITMAP_TEST}};
+    agg.groupKeyExpr = Expr::col("partsupp","ps_partkey",0,DataType::INT);
+    agg.numGroups = 0; // per-partkey atomic (+ TG reduce for global sum)
+    agg.aggregations = {
         {AggFunc::SUM, nullptr, "value"}, // ps_supplycost * ps_availqty
     };
-    plan.ops.push_back(std::move(op));
+    plan.ops.push_back(std::move(agg));
+
     CpuSortOp sort;
     sort.keys = {{"value", true}};
     plan.ops.push_back(std::move(sort));
@@ -494,9 +525,48 @@ bool matchQ17(const AnalyzedQuery& aq) {
 QueryPlan planQ17(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q17";
-    // Pass 1: aggregate qty stats per qualifying partkey (Brand#23, MED BOX)
-    // CPU: compute threshold = 0.2 * avg per partkey
-    // Pass 2: sum revenue where qty < threshold
+
+    // Step 1: CPU bitmap on part where p_brand='Brand#23' AND p_container='MED BOX'
+    CpuBitmapBuildOp partBm;
+    partBm.table = "part";
+    partBm.keyCol = bind("part", "p_partkey");
+    partBm.filter = Predicate::logAnd({
+        Predicate::cmp(CmpOp::EQ,
+            Expr::col("part","p_brand",3,DataType::CHAR_FIXED),
+            Expr::lits("Brand#23")),
+        Predicate::cmp(CmpOp::EQ,
+            Expr::col("part","p_container",6,DataType::CHAR_FIXED),
+            Expr::lits("MED BOX")),
+    });
+    partBm.resultName = "part_bitmap";
+    plan.ops.push_back(std::move(partBm));
+
+    // Step 2: GPU atomic agg — sum(qty) and count per partkey (bitmap filtered)
+    ProbeAggOp agg;
+    agg.factTable = "lineitem";
+    agg.factColumns = {
+        bind("lineitem","l_partkey"), bind("lineitem","l_quantity")
+    };
+    agg.lookups = {{0, bind("lineitem","l_partkey"), ProbeAggOp::LookupRef::BITMAP_TEST}};
+    agg.groupKeyExpr = Expr::col("lineitem","l_partkey",1,DataType::INT);
+    agg.numGroups = 0; // per-partkey atomic
+    agg.aggregations = {
+        {AggFunc::SUM, Expr::col("lineitem","l_quantity",4,DataType::FLOAT), "sum_qty"},
+        {AggFunc::COUNT, nullptr, "count_qty"},
+    };
+    plan.ops.push_back(std::move(agg));
+
+    // Step 3 (CPU): compute threshold = 0.2 * sum/count per partkey
+
+    // Step 4: GPU probe reduce — sum extendedprice where qty < threshold
+    TwoStageReduceOp reduce;
+    reduce.numBins = 1;
+    reduce.binExpr = Expr::lit(0);
+    reduce.aggregations = {
+        {AggFunc::SUM, Expr::col("lineitem","l_extendedprice",5,DataType::FLOAT), "total_revenue"},
+    };
+    plan.ops.push_back(std::move(reduce));
+
     return plan;
 }
 
@@ -511,8 +581,55 @@ bool matchQ2(const AnalyzedQuery& aq) {
 QueryPlan planQ2(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q2";
-    // 3 GPU kernels: filter part → bitmap, find min cost per partkey, match suppliers
-    // CPU post: join with string columns, sort, limit 100
+
+    // Step 1: CPU bitmap on supplier WHERE s_nationkey IN (EUROPE nations)
+    CpuBitmapBuildOp suppBm;
+    suppBm.table = "supplier";
+    suppBm.keyCol = bind("supplier", "s_suppkey");
+    suppBm.resultName = "supplier_bitmap";
+    plan.ops.push_back(std::move(suppBm));
+
+    // Step 2: GPU bitmap on part WHERE p_size=15 AND p_type LIKE '%BRASS'
+    BitmapBuildOp partBm;
+    partBm.table = "part";
+    partBm.keyCol = bind("part", "p_partkey");
+    partBm.filter = Predicate::logAnd({
+        Predicate::cmp(CmpOp::EQ,
+            Expr::col("part","p_size",5,DataType::INT),
+            Expr::lit(15)),
+        Predicate::like(
+            Expr::col("part","p_type",4,DataType::CHAR_FIXED),
+            "%BRASS"),
+    });
+    plan.ops.push_back(std::move(partBm));
+
+    // Step 3: GPU atomic min — find min supplycost per partkey
+    ProbeAggOp minAgg;
+    minAgg.factTable = "partsupp";
+    minAgg.factColumns = {
+        bind("partsupp","ps_partkey"), bind("partsupp","ps_suppkey"),
+        bind("partsupp","ps_supplycost")
+    };
+    minAgg.lookups = {
+        {1, bind("partsupp","ps_partkey"), ProbeAggOp::LookupRef::BITMAP_TEST},
+        {0, bind("partsupp","ps_suppkey"), ProbeAggOp::LookupRef::BITMAP_TEST},
+    };
+    minAgg.groupKeyExpr = Expr::col("partsupp","ps_partkey",0,DataType::INT);
+    minAgg.aggregations = {
+        {AggFunc::MIN, Expr::col("partsupp","ps_supplycost",3,DataType::FLOAT), "min_cost"},
+    };
+    plan.ops.push_back(std::move(minAgg));
+
+    // Step 4: GPU compact — match suppliers with min cost
+    CompactOp compact;
+    plan.ops.push_back(std::move(compact));
+
+    // Step 5: CPU sort+limit
+    CpuSortOp sort;
+    sort.keys = {{"s_acctbal", true}, {"n_name", false}, {"s_name", false}, {"p_partkey", false}};
+    sort.limit = 100;
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -536,9 +653,30 @@ bool matchQ18(const AnalyzedQuery& aq) {
 QueryPlan planQ18(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q18";
-    // Kernel 1: aggregate sum(qty) per orderkey
-    // Kernel 2: filter orders with sum > 300, compact output
-    // CPU post: join customer names, top-100 sort
+
+    // Step 1: GPU atomic agg — sum(l_quantity) per orderkey
+    ProbeAggOp agg;
+    agg.factTable = "lineitem";
+    agg.factColumns = {
+        bind("lineitem","l_orderkey"), bind("lineitem","l_quantity")
+    };
+    agg.groupKeyExpr = Expr::col("lineitem","l_orderkey",0,DataType::INT);
+    agg.numGroups = 0; // per-orderkey atomic
+    agg.aggregations = {
+        {AggFunc::SUM, Expr::col("lineitem","l_quantity",4,DataType::FLOAT), "sum_qty"},
+    };
+    plan.ops.push_back(std::move(agg));
+
+    // Step 2: GPU compact — filter orders where sum(qty) > 300
+    CompactOp compact;
+    plan.ops.push_back(std::move(compact));
+
+    // Step 3: CPU sort top-100
+    CpuSortOp sort;
+    sort.keys = {{"o_totalprice", true}, {"o_orderdate", false}};
+    sort.limit = 100;
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -553,10 +691,39 @@ bool matchQ22(const AnalyzedQuery& aq) {
 QueryPlan planQ22(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q22";
-    // Phase 1: avg balance for qualifying prefixes with bal > 0
-    // Phase 2: build orders custkey bitmap
-    // CPU: compute avg
-    // Phase 3: final 7-bin aggregate (count + sum per country code)
+
+    // Step 1: GPU scalar agg — avg balance for qualifying country code prefixes with bal > 0
+    TwoStageReduceOp scalarAgg;
+    scalarAgg.numBins = 1;
+    scalarAgg.binExpr = Expr::lit(0);
+    scalarAgg.aggregations = {
+        {AggFunc::SUM, Expr::col("customer","c_acctbal",5,DataType::FLOAT), "sum_bal"},
+        {AggFunc::COUNT, nullptr, "count_bal"},
+    };
+    plan.ops.push_back(std::move(scalarAgg));
+
+    // Step 2: GPU bitmap on orders (all custkeys that have orders)
+    BitmapBuildOp ordBm;
+    ordBm.table = "orders";
+    ordBm.keyCol = bind("orders", "o_custkey");
+    plan.ops.push_back(std::move(ordBm));
+
+    // Step 3 (CPU): compute avg = sum/count
+
+    // Step 4: GPU 7-bin aggregate — count+sum per country code
+    TwoStageReduceOp binAgg;
+    binAgg.numBins = 7;
+    binAgg.binExpr = Expr::col("customer","c_phone",4,DataType::CHAR_FIXED); // prefix → bin
+    binAgg.aggregations = {
+        {AggFunc::COUNT, nullptr, "numcust"},
+        {AggFunc::SUM, Expr::col("customer","c_acctbal",5,DataType::FLOAT), "totacctbal"},
+    };
+    plan.ops.push_back(std::move(binAgg));
+
+    CpuSortOp sort;
+    sort.keys = {{"cntrycode", false}};
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -576,8 +743,65 @@ bool matchQ9(const AnalyzedQuery& aq) {
 QueryPlan planQ9(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q9";
-    // 5 GPU kernels: build part bitmap, supplier map, partsupp HT, orders HT, probe lineitem
-    // Direct global atomic aggregation by (nation, year) key
+
+    // Step 1: GPU bitmap on part — p_name LIKE '%green%'
+    BitmapBuildOp partBm;
+    partBm.table = "part";
+    partBm.keyCol = bind("part", "p_partkey");
+    partBm.filter = Predicate::like(
+        Expr::col("part","p_name",1,DataType::CHAR_FIXED),
+        "%green%");
+    plan.ops.push_back(std::move(partBm));
+
+    // Step 2: Direct map — supplier → nationkey
+    DirectMapBuildOp suppMap;
+    suppMap.table = "supplier";
+    suppMap.keyCol = bind("supplier", "s_suppkey");
+    suppMap.valueCols = {bind("supplier","s_nationkey")};
+    plan.ops.push_back(std::move(suppMap));
+
+    // Step 3: HT build on partsupp (compound key: partkey+suppkey)
+    HashTableBuildOp pshtBuild;
+    pshtBuild.table = "partsupp";
+    pshtBuild.keyCol = bind("partsupp", "ps_partkey");
+    pshtBuild.valueCols = {bind("partsupp","ps_suppkey"), bind("partsupp","ps_supplycost")};
+    pshtBuild.filter = Predicate::cmp(CmpOp::EQ, Expr::lit(1), Expr::lit(1)); // bitmap-filtered
+    pshtBuild.sizingMultiplier = 4.0f;
+    plan.ops.push_back(std::move(pshtBuild));
+
+    // Step 4: HT build on orders (orderkey → year)
+    HashTableBuildOp ordhtBuild;
+    ordhtBuild.table = "orders";
+    ordhtBuild.keyCol = bind("orders", "o_orderkey");
+    ordhtBuild.valueCols = {bind("orders","o_orderdate")}; // year derived from date
+    ordhtBuild.sizingMultiplier = 4.0f;
+    plan.ops.push_back(std::move(ordhtBuild));
+
+    // Step 5: Probe lineitem + aggregate by (nation, year)
+    ProbeAggOp probe;
+    probe.factTable = "lineitem";
+    probe.factColumns = {
+        bind("lineitem","l_suppkey"), bind("lineitem","l_partkey"),
+        bind("lineitem","l_orderkey"), bind("lineitem","l_extendedprice"),
+        bind("lineitem","l_discount"), bind("lineitem","l_quantity")
+    };
+    probe.lookups = {
+        {0, bind("lineitem","l_partkey"), ProbeAggOp::LookupRef::BITMAP_TEST},
+        {1, bind("lineitem","l_suppkey"), ProbeAggOp::LookupRef::MAP_LOOKUP},
+        {2, bind("lineitem","l_partkey"), ProbeAggOp::LookupRef::HT_PROBE}, // partsupp HT
+        {3, bind("lineitem","l_orderkey"), ProbeAggOp::LookupRef::HT_PROBE}, // orders HT
+    };
+    probe.groupKeyExpr = Expr::lit(0); // (nation << 16 | year) compound key
+    probe.numGroups = 0;
+    probe.aggregations = {
+        {AggFunc::SUM, nullptr, "profit"}, // extprice*(1-disc) - supplycost*qty
+    };
+    plan.ops.push_back(std::move(probe));
+
+    CpuSortOp sort;
+    sort.keys = {{"nation", false}, {"o_year", true}};
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -595,9 +819,45 @@ bool matchQ16(const AnalyzedQuery& aq) {
 QueryPlan planQ16(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q16";
-    // CPU builds complaint bitmap + part group map
-    // GPU kernel 1: scan partsupp, set bits in per-group bitmaps
-    // GPU kernel 2: popcount each group's bitmap
+
+    // Step 1 (CPU): Build complaint bitmap from supplier WHERE s_comment LIKE '%Customer%Complaints%'
+    CpuBitmapBuildOp complaintBm;
+    complaintBm.table = "supplier";
+    complaintBm.keyCol = bind("supplier", "s_suppkey");
+    complaintBm.filter = Predicate::like(
+        Expr::col("supplier","s_comment",6,DataType::CHAR_FIXED),
+        "%Customer%Complaints%");
+    complaintBm.resultName = "complaint_bitmap";
+    plan.ops.push_back(std::move(complaintBm));
+
+    // Step 2 (CPU): Build part group map — classify (brand, type, size) → group ID
+    CpuDirectMapOp partGroupMap;
+    partGroupMap.table = "part";
+    partGroupMap.keyCol = bind("part", "p_partkey");
+    partGroupMap.valueCols = {bind("part","p_brand"), bind("part","p_type"), bind("part","p_size")};
+    partGroupMap.resultName = "part_group_map";
+    plan.ops.push_back(std::move(partGroupMap));
+
+    // Step 3: GPU — scan partsupp, set supplier bits in per-group bitmaps
+    BitmapBuildOp groupBm;
+    groupBm.table = "partsupp";
+    groupBm.keyCol = bind("partsupp", "ps_suppkey");
+    // Filter: part_group_map[ps_partkey] >= 0 AND NOT complaint_bitmap[ps_suppkey]
+    plan.ops.push_back(std::move(groupBm));
+
+    // Step 4: GPU — popcount each group's bitmap → distinct supplier count
+    TwoStageReduceOp popcount;
+    popcount.numBins = 0; // per-group
+    popcount.binExpr = Expr::lit(0);
+    popcount.aggregations = {
+        {AggFunc::COUNT_DISTINCT, nullptr, "supplier_cnt"},
+    };
+    plan.ops.push_back(std::move(popcount));
+
+    CpuSortOp sort;
+    sort.keys = {{"supplier_cnt", true}, {"p_brand", false}, {"p_type", false}, {"p_size", false}};
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -615,8 +875,59 @@ bool matchQ20(const AnalyzedQuery& aq) {
 QueryPlan planQ20(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q20";
-    // GPU kernel 1: aggregate lineitem quantity into HT keyed by (partkey, suppkey)
-    // GPU kernel 2: probe partsupp, check threshold, set qualifying suppkey bitmap
+
+    // Step 1 (CPU): bitmap on part WHERE p_name LIKE 'forest%'
+    CpuBitmapBuildOp partBm;
+    partBm.table = "part";
+    partBm.keyCol = bind("part", "p_partkey");
+    partBm.filter = Predicate::like(
+        Expr::col("part","p_name",1,DataType::CHAR_FIXED),
+        "forest%");
+    partBm.resultName = "part_bitmap";
+    plan.ops.push_back(std::move(partBm));
+
+    // Step 2 (CPU): bitmap on supplier WHERE s_nationkey = CANADA
+    CpuBitmapBuildOp suppBm;
+    suppBm.table = "supplier";
+    suppBm.keyCol = bind("supplier", "s_suppkey");
+    suppBm.resultName = "canada_bitmap";
+    plan.ops.push_back(std::move(suppBm));
+
+    // Step 3: GPU HT agg — sum(l_quantity) into HT keyed by (partkey, suppkey)
+    HashTableBuildOp htAgg;
+    htAgg.table = "lineitem";
+    htAgg.keyCol = bind("lineitem", "l_partkey"); // compound key with l_suppkey
+    htAgg.valueCols = {bind("lineitem","l_suppkey"), bind("lineitem","l_quantity")};
+    htAgg.filter = Predicate::logAnd({
+        Predicate::cmp(CmpOp::GE,
+            Expr::col("lineitem","l_shipdate",10,DataType::DATE),
+            Expr::lit(19940101)),
+        Predicate::cmp(CmpOp::LT,
+            Expr::col("lineitem","l_shipdate",10,DataType::DATE),
+            Expr::lit(19950101)),
+    });
+    htAgg.sizingMultiplier = 4.0f;
+    plan.ops.push_back(std::move(htAgg));
+
+    // Step 4: GPU probe — partsupp against HT, check availqty > 0.5*sum_qty
+    ProbeAggOp probe;
+    probe.factTable = "partsupp";
+    probe.factColumns = {
+        bind("partsupp","ps_partkey"), bind("partsupp","ps_suppkey"),
+        bind("partsupp","ps_availqty")
+    };
+    probe.lookups = {
+        {0, bind("partsupp","ps_partkey"), ProbeAggOp::LookupRef::BITMAP_TEST},
+        {1, bind("partsupp","ps_suppkey"), ProbeAggOp::LookupRef::BITMAP_TEST},
+        {2, bind("partsupp","ps_partkey"), ProbeAggOp::LookupRef::HT_PROBE},
+    };
+    probe.aggregations = {}; // result is a qualifying supplier bitmap
+    plan.ops.push_back(std::move(probe));
+
+    CpuSortOp sort;
+    sort.keys = {{"s_name", false}};
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -638,8 +949,59 @@ bool matchQ21(const AnalyzedQuery& aq) {
 QueryPlan planQ21(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q21";
-    // GPU pass 1: build per-order supplier tracking (CAS multi-value)
-    // GPU pass 2: count qualifying lineitems per SA supplier
+
+    // Step 1 (CPU): Build orders status map (orderkey → 1 if 'F' status)
+    CpuDirectMapOp ordMap;
+    ordMap.table = "orders";
+    ordMap.keyCol = bind("orders", "o_orderkey");
+    ordMap.valueCols = {bind("orders","o_orderstatus")};
+    ordMap.filter = Predicate::cmp(CmpOp::EQ,
+        Expr::col("orders","o_orderstatus",2,DataType::CHAR1),
+        Expr::lits("F"));
+    ordMap.resultName = "orders_status_map";
+    plan.ops.push_back(std::move(ordMap));
+
+    // Step 2 (CPU): bitmap on supplier WHERE s_nationkey = SAUDI ARABIA
+    CpuBitmapBuildOp suppBm;
+    suppBm.table = "supplier";
+    suppBm.keyCol = bind("supplier", "s_suppkey");
+    suppBm.resultName = "sa_supp_bitmap";
+    plan.ops.push_back(std::move(suppBm));
+
+    // Step 3: GPU pass 1 — build per-order supplier tracking via CAS
+    // Records first_supp, multi_supp bitmap, late_supp, multi_late bitmap
+    ProbeAggOp track;
+    track.factTable = "lineitem";
+    track.factColumns = {
+        bind("lineitem","l_orderkey"), bind("lineitem","l_suppkey"),
+        bind("lineitem","l_receiptdate"), bind("lineitem","l_commitdate")
+    };
+    track.lookups = {{0, bind("lineitem","l_orderkey"), ProbeAggOp::LookupRef::MAP_LOOKUP}};
+    track.groupKeyExpr = Expr::col("lineitem","l_orderkey",0,DataType::INT);
+    plan.ops.push_back(std::move(track));
+
+    // Step 4: GPU pass 2 — count qualifying lineitems per SA supplier
+    ProbeAggOp count;
+    count.factTable = "lineitem";
+    count.factColumns = {
+        bind("lineitem","l_orderkey"), bind("lineitem","l_suppkey"),
+        bind("lineitem","l_receiptdate"), bind("lineitem","l_commitdate")
+    };
+    count.lookups = {
+        {0, bind("lineitem","l_orderkey"), ProbeAggOp::LookupRef::MAP_LOOKUP},
+        {1, bind("lineitem","l_suppkey"), ProbeAggOp::LookupRef::BITMAP_TEST},
+    };
+    count.groupKeyExpr = Expr::col("lineitem","l_suppkey",2,DataType::INT);
+    count.aggregations = {
+        {AggFunc::COUNT, nullptr, "numwait"},
+    };
+    plan.ops.push_back(std::move(count));
+
+    CpuSortOp sort;
+    sort.keys = {{"numwait", true}, {"s_name", false}};
+    sort.limit = 100;
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -653,8 +1015,71 @@ bool matchQ5(const AnalyzedQuery& aq) {
 QueryPlan planQ5(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q5";
-    // 4 GPU kernels: build customer/supplier/orders nation maps, probe lineitem
-    // 25-bin atomic float aggregation by nationkey
+
+    // Step 1 (CPU): bitmap on nation WHERE regionkey = ASIA
+    CpuBitmapBuildOp nationBm;
+    nationBm.table = "nation";
+    nationBm.keyCol = bind("nation", "n_nationkey");
+    nationBm.resultName = "nation_bitmap";
+    plan.ops.push_back(std::move(nationBm));
+
+    // Step 2: GPU direct map — customer → nationkey (ASIA nations only)
+    DirectMapBuildOp custMap;
+    custMap.table = "customer";
+    custMap.keyCol = bind("customer", "c_custkey");
+    custMap.valueCols = {bind("customer","c_nationkey")};
+    // Filter: bitmap_test(nation_bitmap, c_nationkey)
+    plan.ops.push_back(std::move(custMap));
+
+    // Step 3: GPU direct map — supplier → nationkey (ASIA nations only)
+    DirectMapBuildOp suppMap;
+    suppMap.table = "supplier";
+    suppMap.keyCol = bind("supplier", "s_suppkey");
+    suppMap.valueCols = {bind("supplier","s_nationkey")};
+    plan.ops.push_back(std::move(suppMap));
+
+    // Step 4: GPU direct map — orders → nationkey (date filter + customer bitmap)
+    DirectMapBuildOp ordMap;
+    ordMap.table = "orders";
+    ordMap.keyCol = bind("orders", "o_orderkey");
+    ordMap.valueCols = {bind("orders","o_custkey")}; // resolves to nationkey via custMap
+    ordMap.filter = Predicate::logAnd({
+        Predicate::cmp(CmpOp::GE,
+            Expr::col("orders","o_orderdate",4,DataType::DATE),
+            Expr::lit(19940101)),
+        Predicate::cmp(CmpOp::LT,
+            Expr::col("orders","o_orderdate",4,DataType::DATE),
+            Expr::lit(19950101)),
+    });
+    plan.ops.push_back(std::move(ordMap));
+
+    // Step 5: GPU probe lineitem — same-nation check, aggregate revenue per nation
+    ProbeAggOp probe;
+    probe.factTable = "lineitem";
+    probe.factColumns = {
+        bind("lineitem","l_orderkey"), bind("lineitem","l_suppkey"),
+        bind("lineitem","l_extendedprice"), bind("lineitem","l_discount")
+    };
+    probe.lookups = {
+        {3, bind("lineitem","l_orderkey"), ProbeAggOp::LookupRef::MAP_LOOKUP},
+        {2, bind("lineitem","l_suppkey"), ProbeAggOp::LookupRef::MAP_LOOKUP},
+    };
+    probe.groupKeyExpr = Expr::col("lineitem","l_suppkey",2,DataType::INT); // nationkey from map
+    probe.numGroups = 25; // max nationkey
+    probe.aggregations = {
+        {AggFunc::SUM,
+         Expr::binary(ExprOp::MUL,
+             Expr::col("lineitem","l_extendedprice",5,DataType::FLOAT),
+             Expr::binary(ExprOp::SUB, Expr::litf(1.0f),
+                 Expr::col("lineitem","l_discount",6,DataType::FLOAT))),
+         "revenue"}
+    };
+    plan.ops.push_back(std::move(probe));
+
+    CpuSortOp sort;
+    sort.keys = {{"revenue", true}};
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -667,8 +1092,64 @@ bool matchQ7(const AnalyzedQuery& aq) {
 QueryPlan planQ7(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q7";
-    // 4 GPU kernels: build supplier/customer/orders maps, probe lineitem
-    // 4-bin atomic float aggregation (FRANCE↔GERMANY × 1995/1996)
+
+    // Step 1: GPU direct map — supplier → nationkey (FRANCE/GERMANY only)
+    DirectMapBuildOp suppMap;
+    suppMap.table = "supplier";
+    suppMap.keyCol = bind("supplier", "s_suppkey");
+    suppMap.valueCols = {bind("supplier","s_nationkey")};
+    plan.ops.push_back(std::move(suppMap));
+
+    // Step 2: GPU direct map — customer → nationkey (FRANCE/GERMANY only)
+    DirectMapBuildOp custMap;
+    custMap.table = "customer";
+    custMap.keyCol = bind("customer", "c_custkey");
+    custMap.valueCols = {bind("customer","c_nationkey")};
+    plan.ops.push_back(std::move(custMap));
+
+    // Step 3: GPU direct map — orders → custkey
+    DirectMapBuildOp ordMap;
+    ordMap.table = "orders";
+    ordMap.keyCol = bind("orders", "o_orderkey");
+    ordMap.valueCols = {bind("orders","o_custkey")};
+    plan.ops.push_back(std::move(ordMap));
+
+    // Step 4: GPU probe lineitem — date+chain checks, aggregate 4 bins
+    ProbeAggOp probe;
+    probe.factTable = "lineitem";
+    probe.factColumns = {
+        bind("lineitem","l_orderkey"), bind("lineitem","l_suppkey"),
+        bind("lineitem","l_shipdate"), bind("lineitem","l_extendedprice"),
+        bind("lineitem","l_discount")
+    };
+    probe.factFilter = Predicate::logAnd({
+        Predicate::cmp(CmpOp::GE,
+            Expr::col("lineitem","l_shipdate",10,DataType::DATE),
+            Expr::lit(19950101)),
+        Predicate::cmp(CmpOp::LE,
+            Expr::col("lineitem","l_shipdate",10,DataType::DATE),
+            Expr::lit(19961231)),
+    });
+    probe.lookups = {
+        {0, bind("lineitem","l_suppkey"), ProbeAggOp::LookupRef::MAP_LOOKUP},
+        {1, bind("lineitem","l_orderkey"), ProbeAggOp::LookupRef::MAP_LOOKUP}, // via orders → custkey
+        {2, bind("lineitem","l_orderkey"), ProbeAggOp::LookupRef::MAP_LOOKUP},
+    };
+    probe.numGroups = 4; // (FRANCE→GERMANY, GERMANY→FRANCE) × (1995, 1996)
+    probe.aggregations = {
+        {AggFunc::SUM,
+         Expr::binary(ExprOp::MUL,
+             Expr::col("lineitem","l_extendedprice",5,DataType::FLOAT),
+             Expr::binary(ExprOp::SUB, Expr::litf(1.0f),
+                 Expr::col("lineitem","l_discount",6,DataType::FLOAT))),
+         "revenue"}
+    };
+    plan.ops.push_back(std::move(probe));
+
+    CpuSortOp sort;
+    sort.keys = {{"supp_nation", false}, {"cust_nation", false}, {"l_year", false}};
+    plan.ops.push_back(std::move(sort));
+
     return plan;
 }
 
@@ -685,9 +1166,71 @@ bool matchQ8(const AnalyzedQuery& aq) {
 QueryPlan planQ8(const AnalyzedQuery& /*aq*/) {
     QueryPlan plan;
     plan.name = "Q8";
-    // CPU: part bitmap + customer/supplier nation maps
-    // 2 GPU kernels: build orders map, probe lineitem
-    // 4-bin atomic float aggregation (brazil/total × 1995/1996)
+
+    // Step 1 (CPU): bitmap on part WHERE p_type = 'ECONOMY ANODIZED STEEL'
+    CpuBitmapBuildOp partBm;
+    partBm.table = "part";
+    partBm.keyCol = bind("part", "p_partkey");
+    partBm.filter = Predicate::cmp(CmpOp::EQ,
+        Expr::col("part","p_type",4,DataType::CHAR_FIXED),
+        Expr::lits("ECONOMY ANODIZED STEEL"));
+    partBm.resultName = "part_bitmap";
+    plan.ops.push_back(std::move(partBm));
+
+    // Step 2 (CPU): direct map — customer → nationkey (AMERICA region nations)
+    CpuDirectMapOp custMap;
+    custMap.table = "customer";
+    custMap.keyCol = bind("customer", "c_custkey");
+    custMap.valueCols = {bind("customer","c_nationkey")};
+    custMap.resultName = "cust_nation_map";
+    plan.ops.push_back(std::move(custMap));
+
+    // Step 3 (CPU): direct map — supplier → nationkey
+    CpuDirectMapOp suppMap;
+    suppMap.table = "supplier";
+    suppMap.keyCol = bind("supplier", "s_suppkey");
+    suppMap.valueCols = {bind("supplier","s_nationkey")};
+    suppMap.resultName = "supp_nation_map";
+    plan.ops.push_back(std::move(suppMap));
+
+    // Step 4: GPU direct map — orders → (custkey, year) with date+AMERICA filter
+    DirectMapBuildOp ordMap;
+    ordMap.table = "orders";
+    ordMap.keyCol = bind("orders", "o_orderkey");
+    ordMap.valueCols = {bind("orders","o_custkey"), bind("orders","o_orderdate")};
+    ordMap.filter = Predicate::logAnd({
+        Predicate::cmp(CmpOp::GE,
+            Expr::col("orders","o_orderdate",4,DataType::DATE),
+            Expr::lit(19950101)),
+        Predicate::cmp(CmpOp::LE,
+            Expr::col("orders","o_orderdate",4,DataType::DATE),
+            Expr::lit(19961231)),
+    });
+    plan.ops.push_back(std::move(ordMap));
+
+    // Step 5: GPU probe lineitem — bitmap+map check, 4-bin aggregate
+    ProbeAggOp probe;
+    probe.factTable = "lineitem";
+    probe.factColumns = {
+        bind("lineitem","l_orderkey"), bind("lineitem","l_partkey"),
+        bind("lineitem","l_suppkey"), bind("lineitem","l_extendedprice"),
+        bind("lineitem","l_discount")
+    };
+    probe.lookups = {
+        {0, bind("lineitem","l_partkey"), ProbeAggOp::LookupRef::BITMAP_TEST},
+        {3, bind("lineitem","l_orderkey"), ProbeAggOp::LookupRef::MAP_LOOKUP},
+    };
+    probe.numGroups = 4; // brazil/total × 1995/1996
+    probe.aggregations = {
+        {AggFunc::SUM,
+         Expr::binary(ExprOp::MUL,
+             Expr::col("lineitem","l_extendedprice",5,DataType::FLOAT),
+             Expr::binary(ExprOp::SUB, Expr::litf(1.0f),
+                 Expr::col("lineitem","l_discount",6,DataType::FLOAT))),
+         "revenue"}
+    };
+    plan.ops.push_back(std::move(probe));
+
     return plan;
 }
 

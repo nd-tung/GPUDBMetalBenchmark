@@ -20,4 +20,7 @@ struct GeneratedKernels {
 
 GeneratedKernels generateMetal(const QueryPlan& plan);
 
+// Derive the execution pattern signature from plan ops (for debugging/logging)
+std::string describePattern(const QueryPlan& plan);
+
 } // namespace codegen

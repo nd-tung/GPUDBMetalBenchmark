@@ -2,6 +2,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <type_traits>
 
 namespace codegen {
 
@@ -113,10 +114,10 @@ inline uint sf100_hash_key(int key) {
 )METAL";
 
 // ===================================================================
-// PATTERN: Two-Stage Reduce (Q1 — 6-bin fused reduce)
+// PATTERN: Fused Atomic Reduce (Q1 — 6-bin TG-reduce + atomic)
 // ===================================================================
 
-void emitQ1_TwoStageReduce(std::ostringstream& out, GeneratedKernels& result) {
+void emitQ1_FusedAtomicReduce(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q1 bin index helpers
 inline int Q1_rf_index(char rf) {
@@ -262,14 +263,14 @@ kernel void Q6_reduce_final(
 
 void emitQ3_BitmapMapProbeCompact(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
-struct GenQ3Agg {
+struct ProbeAggHTSlot {
     atomic_int key;
     atomic_float revenue;
     atomic_uint orderdate;
     atomic_uint shippriority;
 };
 
-struct GenQ3Result {
+struct ProbeAggResult {
     int key;
     float revenue;
     uint orderdate;
@@ -313,7 +314,7 @@ kernel void Q3_probe_agg(
     const device int* o_custkey          [[buffer(5)]],
     const device int* o_orderdate        [[buffer(6)]],
     const device int* o_shippriority     [[buffer(7)]],
-    device GenQ3Agg* final_ht            [[buffer(8)]],
+    device ProbeAggHTSlot* final_ht            [[buffer(8)]],
     constant uint& lineitem_size         [[buffer(9)]],
     constant int& cutoff_date            [[buffer(10)]],
     constant uint& final_ht_size         [[buffer(11)]],
@@ -352,8 +353,8 @@ kernel void Q3_probe_agg(
 }
 
 kernel void Q3_compact(
-    device GenQ3Result* ht               [[buffer(0)]],
-    device GenQ3Result* output           [[buffer(1)]],
+    device ProbeAggResult* ht               [[buffer(0)]],
+    device ProbeAggResult* output           [[buffer(1)]],
     device atomic_uint& result_count     [[buffer(2)]],
     constant uint& ht_size               [[buffer(3)]],
     uint index [[thread_position_in_grid]])
@@ -790,7 +791,7 @@ kernel void Q15_atomic_agg(
 }
 
 // ===================================================================
-// PATTERN: Atomic Aggregate (Q11)
+// PATTERN: Atomic Map Aggregate (Q11 — filtered scan + atomic map)
 // ===================================================================
 
 void emitQ11_AtomicAgg(std::ostringstream& out, GeneratedKernels& result) {
@@ -1297,7 +1298,7 @@ kernel void Q22_bin_agg(
 static void emitQ2_BitmapMinCompact(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q2 result struct for compact output
-struct GenQ2MatchResult {
+struct MinMatchResult {
     int partkey;
     int suppkey;
     uint supplycost_cents;
@@ -1358,7 +1359,7 @@ kernel void Q2_compact(
     const device uint* part_bitmap    [[buffer(3)]],
     const device uint* supplier_bitmap [[buffer(4)]],
     const device uint* min_cost       [[buffer(5)]],
-    device GenQ2MatchResult* results  [[buffer(6)]],
+    device MinMatchResult* results  [[buffer(6)]],
     device atomic_uint& result_count  [[buffer(7)]],
     constant uint& partsupp_size      [[buffer(8)]],
     constant uint& max_results        [[buffer(9)]],
@@ -1409,7 +1410,7 @@ kernel void Q18_atomic_agg(
 }
 
 // Q18 output row struct
-struct GenQ18OutputRow {
+struct CompactOutputRow {
     int o_orderkey;
     int o_custkey;
     int o_orderdate;
@@ -1424,7 +1425,7 @@ kernel void Q18_compact(
     const device int* o_orderdate       [[buffer(2)]],
     const device float* o_totalprice    [[buffer(3)]],
     const device float* qty_map         [[buffer(4)]],
-    device GenQ18OutputRow* output      [[buffer(5)]],
+    device CompactOutputRow* output      [[buffer(5)]],
     device atomic_uint& output_count    [[buffer(6)]],
     constant uint& orders_size          [[buffer(7)]],
     constant uint& qty_map_size         [[buffer(8)]],
@@ -1454,20 +1455,20 @@ kernel void Q18_compact(
 static void emitQ9_BitmapMapHTProbeAgg(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
 // Q9 structs
-struct GenQ9PartSuppEntry {
+struct CompositeHTEntry {
     atomic_int partkey;
     atomic_int suppkey;
     atomic_int idx;
     int _pad;
 };
 
-struct GenQ9Aggregates {
+struct KeyedAggSlot {
     atomic_uint key;
     atomic_float profit;
 };
 
 // Hash table entry for orders (key + value)
-struct GenQ9OrdersHTEntry {
+struct SimpleHTEntry {
     atomic_int key;
     atomic_int value;
 };
@@ -1516,7 +1517,7 @@ kernel void Q9_map_build(
 kernel void Q9_ht_build_partsupp(
     const device int* ps_partkey        [[buffer(0)]],
     const device int* ps_suppkey        [[buffer(1)]],
-    device GenQ9PartSuppEntry* ht       [[buffer(2)]],
+    device CompositeHTEntry* ht       [[buffer(2)]],
     constant uint& partsupp_size        [[buffer(3)]],
     constant uint& ht_size              [[buffer(4)]],
     const device uint* part_bitmap      [[buffer(5)]],
@@ -1554,7 +1555,7 @@ kernel void Q9_ht_build_partsupp(
 kernel void Q9_ht_build_orders(
     const device int* o_orderkey    [[buffer(0)]],
     const device int* o_orderdate   [[buffer(1)]],
-    device GenQ9OrdersHTEntry* ht   [[buffer(2)]],
+    device SimpleHTEntry* ht   [[buffer(2)]],
     constant uint& orders_size      [[buffer(3)]],
     constant uint& ht_size          [[buffer(4)]],
     uint index [[thread_position_in_grid]])
@@ -1586,9 +1587,9 @@ kernel void Q9_probe_agg(
     const device float* ps_supplycost   [[buffer(6)]],
     const device uint* part_bitmap      [[buffer(7)]],
     const device int* supplier_nation_map [[buffer(8)]],
-    const device GenQ9PartSuppEntry* partsupp_ht [[buffer(9)]],
-    const device GenQ9OrdersHTEntry* orders_ht   [[buffer(10)]],
-    device GenQ9Aggregates* global_agg  [[buffer(11)]],
+    const device CompositeHTEntry* partsupp_ht [[buffer(9)]],
+    const device SimpleHTEntry* orders_ht   [[buffer(10)]],
+    device KeyedAggSlot* global_agg  [[buffer(11)]],
     constant uint& lineitem_size        [[buffer(12)]],
     constant uint& partsupp_ht_size     [[buffer(13)]],
     constant uint& orders_ht_size       [[buffer(14)]],
@@ -1735,7 +1736,7 @@ kernel void Q16_popcount(
 // ===================================================================
 static void emitQ20_HTAggProbeCheck(std::ostringstream& out, GeneratedKernels& result) {
     out << R"METAL(
-struct GenQ20HTEntry {
+struct DualKeyHTEntry {
     atomic_int key_hi;
     atomic_int key_lo;
     atomic_float value;
@@ -1748,7 +1749,7 @@ kernel void Q20_ht_agg(
     const device float* l_quantity  [[buffer(2)]],
     const device int* l_shipdate    [[buffer(3)]],
     const device uint* part_bitmap  [[buffer(4)]],
-    device GenQ20HTEntry* ht        [[buffer(5)]],
+    device DualKeyHTEntry* ht        [[buffer(5)]],
     constant uint& lineitem_size    [[buffer(6)]],
     constant uint& ht_mask          [[buffer(7)]],
     constant int& date_start        [[buffer(8)]],
@@ -1793,7 +1794,7 @@ kernel void Q20_probe_check(
     const device int* ps_availqty       [[buffer(2)]],
     const device uint* part_bitmap      [[buffer(3)]],
     const device uint* canada_bitmap    [[buffer(4)]],
-    const device GenQ20HTEntry* ht      [[buffer(5)]],
+    const device DualKeyHTEntry* ht      [[buffer(5)]],
     device atomic_uint* qual_bitmap     [[buffer(6)]],
     constant uint& partsupp_size        [[buffer(7)]],
     constant uint& ht_mask              [[buffer(8)]],
@@ -1919,13 +1920,40 @@ kernel void Q21_count_qualify(
 // PUBLIC: generateMetal
 // ===================================================================
 
+// Derive the execution pattern signature from plan ops (for validation and logging)
+std::string describePattern(const QueryPlan& plan) {
+    std::string sig;
+    for (const auto& op : plan.ops) {
+        if (!sig.empty()) sig += " → ";
+        std::visit([&](const auto& o) {
+            using T = std::decay_t<decltype(o)>;
+            if constexpr (std::is_same_v<T, TableScanOp>)        sig += "Scan(" + o.table + ")";
+            else if constexpr (std::is_same_v<T, BitmapBuildOp>)  sig += "GpuBitmap(" + o.table + ")";
+            else if constexpr (std::is_same_v<T, CpuBitmapBuildOp>) sig += "CpuBitmap(" + o.table + ")";
+            else if constexpr (std::is_same_v<T, DirectMapBuildOp>) sig += "GpuMap(" + o.table + ")";
+            else if constexpr (std::is_same_v<T, CpuDirectMapOp>)  sig += "CpuMap(" + o.table + ")";
+            else if constexpr (std::is_same_v<T, HashTableBuildOp>) sig += "HtBuild(" + o.table + ")";
+            else if constexpr (std::is_same_v<T, ProbeAggOp>)     sig += "ProbeAgg(" + o.factTable + ")";
+            else if constexpr (std::is_same_v<T, TwoStageReduceOp>) sig += "Reduce(" + std::to_string(o.numBins) + "-bin)";
+            else if constexpr (std::is_same_v<T, CompactOp>)      sig += "Compact";
+            else if constexpr (std::is_same_v<T, CpuSortOp>)      sig += "CpuSort";
+            else if constexpr (std::is_same_v<T, SubqueryOp>)     sig += "Subquery";
+            else if constexpr (std::is_same_v<T, HistogramOp>)    sig += "Histogram";
+            else if constexpr (std::is_same_v<T, StringMatchOp>)  sig += "StrMatch(" + o.table + ")";
+        }, op);
+    }
+    return sig.empty() ? "(no ops)" : sig;
+}
+
 GeneratedKernels generateMetal(const QueryPlan& plan) {
     using Emitter = void(*)(std::ostringstream&, GeneratedKernels&);
 
     // Pattern-grouped emitter registry
     static const std::unordered_map<std::string, Emitter> registry = {
+        // --- Fused Atomic Reduce ---
+        {"Q1",  emitQ1_FusedAtomicReduce},
+
         // --- Two-Stage Reduce ---
-        {"Q1",  emitQ1_TwoStageReduce},
         {"Q6",  emitQ6_TwoStageReduce},
         {"Q14", emitQ14_TwoStageReduce},
 
@@ -1945,7 +1973,7 @@ GeneratedKernels generateMetal(const QueryPlan& plan) {
         // --- Bitmap + Map + HT Build + Probe-Agg ---
         {"Q9",  emitQ9_BitmapMapHTProbeAgg},
 
-        // --- Atomic Aggregate ---
+        // --- Atomic Map Aggregate ---
         {"Q11", emitQ11_AtomicAgg},
         {"Q15", emitQ15_AtomicAgg},
 
@@ -1977,9 +2005,18 @@ GeneratedKernels generateMetal(const QueryPlan& plan) {
         {"Q22", emitQ22_ScalarAggBitmapBinAgg},
     };
 
+    // Validate plan has ops
+    if (plan.ops.empty()) {
+        throw std::runtime_error("Plan '" + plan.name + "' has no ops — planner must populate plan.ops");
+    }
+
     GeneratedKernels result;
     std::ostringstream out;
     out << METAL_COMMON_HEADER;
+
+    // Add plan signature as a Metal comment for debugging
+    std::string pattern = describePattern(plan);
+    out << "\n// Plan: " << plan.name << " | Pattern: " << pattern << "\n\n";
 
     auto it = registry.find(plan.name);
     if (it == registry.end())
