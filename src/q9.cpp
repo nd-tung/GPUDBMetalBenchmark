@@ -280,8 +280,8 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     auto pPartBuildPipe = createPipeline(device, library, "q9_build_part_ht_kernel");
     auto pSuppBuildPipe = createPipeline(device, library, "q9_build_supplier_ht_kernel");
     auto pPartSuppBuildPipe = createPipeline(device, library, "q9_build_partsupp_ht_kernel");
-    auto pOrdersBuildPipe = createPipeline(device, library, "q9_build_orders_ht_kernel");
-    auto pProbeAggPipe = createPipeline(device, library, "q9_probe_and_global_agg_kernel");
+    auto pOrdersBuildPipe = createPipeline(device, library, "q9_build_orders_direct_kernel");
+    auto pProbeAggPipe = createPipeline(device, library, "q9_probe_directorders_kernel");
     if (!pPartBuildPipe || !pSuppBuildPipe || !pPartSuppBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe) return;
 
     // Timing accumulators
@@ -329,7 +329,12 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     // Free CPU-side vectors and GPU input buffers
     { std::vector<int>().swap(p_partkey); std::vector<char>().swap(p_name); }
     pPartKeyBuf->release(); pPartNameBuf->release();
-    printf("  Part bitmap built (%u ints, max_partkey=%d)\n", part_bitmap_ints, max_partkey);
+
+    // Count green parts from bitmap for right-sizing partsupp HT
+    uint* bitmap_data = (uint*)pPartBitmapBuf->contents();
+    uint green_parts = 0;
+    for (uint i = 0; i < part_bitmap_ints; i++) green_parts += __builtin_popcount(bitmap_data[i]);
+    printf("  Part bitmap built (%u ints, max_partkey=%d, green_parts=%u)\n", part_bitmap_ints, max_partkey, green_parts);
 
     // --- 1b. Supplier Direct Map ---
     t0 = std::chrono::high_resolution_clock::now();
@@ -366,9 +371,9 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     }
     { std::vector<int>().swap(s_suppkey); std::vector<int>().swap(s_nationkey); }
     pSuppKeyBuf->release(); pSuppNatBuf->release();
-    printf("  Supplier direct map built (size=%u)\n", supp_map_size);
+    printf("  Supplier direct map built (size=%u, gpu=%.2f ms)\n", supp_map_size, totalGpuMs);
 
-    // --- 1c. Orders Hash Table ---
+    // --- 1c. Orders Direct Map ---
     t0 = std::chrono::high_resolution_clock::now();
     std::vector<int> o_orderkey(ordRows), o_orderdate(ordRows);
     parseIntColumnChunk(ordFile, ordIdx, 0, ordRows, 0, o_orderkey.data());
@@ -376,11 +381,14 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     t1 = std::chrono::high_resolution_clock::now();
     totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    const uint orders_ht_size = nextPow2((uint)ordRows * 2);
+    int max_orderkey = 0;
+    for (size_t i = 0; i < ordRows; i++) max_orderkey = std::max(max_orderkey, o_orderkey[i]);
+    const uint orders_map_size = (uint)max_orderkey + 1;
+    const uint orders_ht_size = orders_map_size; // for parameter compatibility
     MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordRows * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordRows * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdersHTBuf = device->newBuffer(orders_ht_size * sizeof(int) * 2, MTL::ResourceStorageModeShared);
-    memset(pOrdersHTBuf->contents(), 0xFF, orders_ht_size * sizeof(int) * 2);
+    MTL::Buffer* pOrdersHTBuf = device->newBuffer(orders_map_size * sizeof(int), MTL::ResourceStorageModeShared);
+    memset(pOrdersHTBuf->contents(), 0xFF, orders_map_size * sizeof(int)); // -1 = unset
 
     {
         uint os = (uint)ordRows;
@@ -391,16 +399,15 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
         enc->setBuffer(pOrdDateBuf, 0, 1);
         enc->setBuffer(pOrdersHTBuf, 0, 2);
         enc->setBytes(&os, sizeof(os), 3);
-        enc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 4);
-        NS::UInteger tgs = std::min((NS::UInteger)256, pOrdersBuildPipe->maxTotalThreadsPerThreadgroup());
-        enc->dispatchThreadgroups(MTL::Size((ordRows + tgs - 1) / tgs, 1, 1), MTL::Size(tgs, 1, 1));
+        enc->dispatchThreads(MTL::Size(ordRows, 1, 1), MTL::Size(256, 1, 1));
         enc->endEncoding();
         cb->commit(); cb->waitUntilCompleted();
         totalGpuMs += (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
     }
     { std::vector<int>().swap(o_orderkey); std::vector<int>().swap(o_orderdate); }
     pOrdKeyBuf->release(); pOrdDateBuf->release();
-    printf("  Orders HT built (ht_size=%u)\n", orders_ht_size);
+    printf("  Orders direct map built (size=%u, %.1f MB, cumul gpu=%.2f ms)\n",
+           orders_map_size, orders_map_size * 4.0 / (1024*1024), totalGpuMs);
 
     // --- 1d. PartSupp Hash Table ---
     t0 = std::chrono::high_resolution_clock::now();
@@ -412,7 +419,7 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     t1 = std::chrono::high_resolution_clock::now();
     totalCpuParseMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    const uint partsupp_ht_size = nextPow2((uint)psRows * 4);
+    const uint partsupp_ht_size = nextPow2(std::max(green_parts * 4, (uint)1024) * 2); // sized for filtered rows only
     MTL::Buffer* pPsPartKeyBuf = device->newBuffer(ps_partkey.data(), psRows * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pPsSuppKeyBuf = device->newBuffer(ps_suppkey.data(), psRows * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pPsSupplyCostBuf = device->newBuffer(ps_supplycost.data(), psRows * sizeof(float), MTL::ResourceStorageModeShared);
@@ -439,11 +446,12 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     { std::vector<int>().swap(ps_partkey); std::vector<int>().swap(ps_suppkey); }
     // Keep ps_supplycost — needed by probe kernel
     pPsPartKeyBuf->release(); pPsSuppKeyBuf->release();
-    printf("  PartSupp HT built (ht_size=%u)\n", partsupp_ht_size);
+    printf("  PartSupp HT built (ht_size=%u, cumul gpu=%.2f ms)\n", partsupp_ht_size, totalGpuMs);
 
-    printf("Phase 1 complete. GPU HTs resident: bitmap(%.1f MB) + suppmap(%.1f MB) + orders_ht(%.1f MB) + partsupp_ht(%.1f MB)\n",
+    printf("Phase 1 complete (total Phase 1 GPU: %.2f ms). GPU HTs resident: bitmap(%.1f MB) + suppmap(%.1f MB) + orders_map(%.1f MB) + partsupp_ht(%.1f MB)\n",
+           totalGpuMs,
            part_bitmap_ints * 4.0 / (1024*1024), supp_map_size * 4.0 / (1024*1024),
-           orders_ht_size * 8.0 / (1024*1024), partsupp_ht_size * 16.0 / (1024*1024));
+           orders_map_size * 4.0 / (1024*1024), partsupp_ht_size * 16.0 / (1024*1024));
 
     // ══════════════════════════════════════════════════════════════
     // PHASE 2: Stream lineitem in chunks through Probe + Merge
@@ -473,7 +481,6 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     }
 
     // Intermediate + final aggregation buffers (persistent across chunks)
-    const uint num_threadgroups = 2048;
     const uint final_ht_size = nextPow2(25 * 10); // 25 nations * ~10 years, rounded to power-of-2
     MTL::Buffer* pFinalHTBuf = device->newBuffer(final_ht_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
     memset(pFinalHTBuf->contents(), 0, final_ht_size * sizeof(Q9Aggregates_CPU));
@@ -511,7 +518,9 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
             enc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 15);
             enc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 16);
             enc->setBytes(&final_ht_size, sizeof(final_ht_size), 17);
-            enc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
+            // Dispatch one thread per BATCH of 4 lineitem rows, threadgroup size 256
+            uint totalThreads = (chunkSize + 3) / 4;
+            enc->dispatchThreads(MTL::Size(totalThreads, 1, 1), MTL::Size(256, 1, 1));
             enc->endEncoding();
             cmdBuf->commit();
         },
@@ -534,6 +543,7 @@ void runQ9BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, M
     double allCpuParseMs = indexBuildMs + totalCpuParseMs + timing.parseMs;
     double allGpuMs = totalGpuMs + timing.gpuMs;
     printf("\nSF100 Q9 | %zu chunks | %zu rows\n", timing.chunkCount, liRows);
+    printf("  Phase 1 GPU (builds): %.2f ms | Phase 2 GPU (probe): %.2f ms\n", totalGpuMs, timing.gpuMs);
     printTimingSummary(allCpuParseMs, allGpuMs, cpuPostMs);
 
     // Cleanup

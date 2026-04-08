@@ -287,3 +287,108 @@ kernel void q9_probe_and_global_agg_kernel(
         }
     }
 }
+
+
+// KERNEL 5b: Build Direct Map on ORDERS, storing year as value.
+// Replaces the hash table build for orders when direct map approach is used.
+kernel void q9_build_orders_direct_kernel(
+    const device int* o_orderkey [[buffer(0)]],
+    const device int* o_orderdate [[buffer(1)]],
+    device int* orders_year_map [[buffer(2)]],
+    constant uint& orders_size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= orders_size) return;
+    orders_year_map[o_orderkey[gid]] = o_orderdate[gid] / 10000; // Extract year
+}
+
+
+// KERNEL 6: Optimized probe kernel for SF100.
+// Uses non-atomic R/O structs for HTs (enables L2 caching) and direct map for orders.
+kernel void q9_probe_directorders_kernel(
+    // lineitem columns
+    const device int* l_suppkey [[buffer(0)]],
+    const device int* l_partkey [[buffer(1)]],
+    const device int* l_orderkey [[buffer(2)]],
+    const device float* l_extendedprice [[buffer(3)]],
+    const device float* l_discount [[buffer(4)]],
+    const device float* l_quantity [[buffer(5)]],
+    // partsupp supplycost array
+    const device float* ps_supplycost [[buffer(6)]],
+    // Pre-built lookups
+    const device uint* part_bitmap [[buffer(7)]],
+    const device int* supplier_nation_map [[buffer(8)]],
+    const device PartSuppEntryRO* partsupp_ht [[buffer(9)]],
+    const device int* orders_year_map [[buffer(10)]],
+    // Direct global aggregation output
+    device Q9Aggregates* global_agg [[buffer(11)]],
+    // Parameters
+    constant uint& lineitem_size [[buffer(12)]],
+    constant uint& part_ht_size [[buffer(13)]],
+    constant uint& supplier_ht_size [[buffer(14)]],
+    constant uint& partsupp_ht_size [[buffer(15)]],
+    constant uint& orders_map_size [[buffer(16)]],
+    constant uint& global_agg_size [[buffer(17)]],
+    // Thread IDs
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    const uint global_tid = (group_id * threads_per_group) + thread_id_in_group;
+    const uint BATCH = 4;
+    const uint stride = grid_size * BATCH;
+    const uint agg_mask = global_agg_size - 1;
+    const uint ps_mask = partsupp_ht_size - 1;
+
+    for (uint base = global_tid * BATCH; base < lineitem_size; base += stride) {
+        for (uint k = 0; k < BATCH; ++k) {
+            uint i = base + k;
+            if (i >= lineitem_size) break;
+
+            int partkey = l_partkey[i];
+            if (!bitmap_test(part_bitmap, partkey)) continue;
+
+            int suppkey = l_suppkey[i];
+            int nationkey = supplier_nation_map[suppkey];
+            if (nationkey == -1) continue;
+
+            // Probe partsupp_ht (non-atomic reads)
+            int ps_idx = -1;
+            uint ps_hash = ((uint)partkey * 0x9E3779B1u ^ (uint)suppkey * 0x85EBCA77u) & ps_mask;
+            for (uint j = 0; j <= ps_mask; ++j) {
+                uint probe_idx = (ps_hash + j) & ps_mask;
+                int pk2 = partsupp_ht[probe_idx].partkey;
+                if (pk2 == -1) break;
+                if (pk2 == partkey && partsupp_ht[probe_idx].suppkey == suppkey) {
+                    ps_idx = partsupp_ht[probe_idx].idx;
+                    break;
+                }
+            }
+            if (ps_idx == -1) continue;
+
+            // Direct map lookup for orders (no hashing, no probing)
+            int orderkey = l_orderkey[i];
+            int year = (uint)orderkey < orders_map_size ? orders_year_map[orderkey] : -1;
+            if (year == -1) continue;
+
+            // Direct global atomic aggregation
+            float profit = l_extendedprice[i] * (1.0f - l_discount[i]) - ps_supplycost[ps_idx] * l_quantity[i];
+            uint agg_key = (uint)(nationkey << 16) | year;
+            uint agg_hash = agg_key & agg_mask;
+
+            for (uint m = 0; m <= agg_mask; ++m) {
+                uint probe_idx = (agg_hash + m) & agg_mask;
+                uint expected = 0;
+                if (atomic_compare_exchange_weak_explicit(&global_agg[probe_idx].key, &expected, agg_key, memory_order_relaxed, memory_order_relaxed)) {
+                    atomic_fetch_add_explicit(&global_agg[probe_idx].profit, profit, memory_order_relaxed);
+                    break;
+                }
+                if (atomic_load_explicit(&global_agg[probe_idx].key, memory_order_relaxed) == agg_key) {
+                    atomic_fetch_add_explicit(&global_agg[probe_idx].profit, profit, memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+    }
+}

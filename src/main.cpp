@@ -138,6 +138,7 @@ int main(int argc, const char * argv[]) {
         if (allFilesRead && !metalSource.empty()) {
             NS::String* sourceStr = NS::String::string(metalSource.c_str(), NS::UTF8StringEncoding);
             MTL::CompileOptions* opts = MTL::CompileOptions::alloc()->init();
+            opts->setFastMathEnabled(true);
             library = device->newLibrary(sourceStr, opts, &error);
             opts->release();
             if (library) {

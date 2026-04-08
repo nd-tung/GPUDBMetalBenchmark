@@ -262,19 +262,29 @@ void runQ16BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     double buildParseMs = indexBuildMs + std::chrono::duration<double, std::milli>(bpT1 - bpT0).count();
 
     uint partMapSize = (uint)(max_partkey + 1);
+    uint numGroups = (uint)groups.size();
 
-    auto pScanPipe = createPipeline(device, library, "q16_scan_partsupp_kernel");
-    if (!pScanPipe) return;
+    // Use max_suppkey from supplier table for bitmap sizing
+    uint bv_ints = (max_suppkey + 32) / 32;
+
+    auto pScanPipe = createPipeline(device, library, "q16_scan_and_bitmap_kernel");
+    auto pPopcountPipe = createPipeline(device, library, "q16_popcount_kernel");
+    if (!pScanPipe || !pPopcountPipe) return;
 
     MTL::Buffer* pPartGroupMapBuf = device->newBuffer(part_group_map.data(), partMapSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pComplaintBitmapBuf = device->newBuffer(complaint_bitmap.data(), complaint_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOutputCountBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
-    *(uint*)pOutputCountBuf->contents() = 0;
-    // Max output = psRows
-    MTL::Buffer* pOutGroupIdBuf = device->newBuffer(psRows * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOutSuppKeyBuf = device->newBuffer(psRows * sizeof(int), MTL::ResourceStorageModeShared);
 
-    // Stream partsupp
+    // Per-group suppkey bitmaps (flat array): numGroups × bv_ints uint words
+    size_t bitmapBytes = (size_t)numGroups * bv_ints * sizeof(uint);
+    MTL::Buffer* pGroupBitmapsBuf = device->newBuffer(bitmapBytes, MTL::ResourceStorageModeShared);
+    memset(pGroupBitmapsBuf->contents(), 0, bitmapBytes);
+    MTL::Buffer* pGroupCountsBuf = device->newBuffer(numGroups * sizeof(uint), MTL::ResourceStorageModeShared);
+    memset(pGroupCountsBuf->contents(), 0, numGroups * sizeof(uint));
+
+    printf("Q16 SF100: %u groups, bv_ints=%u, bitmap=%.1f MB\n",
+           numGroups, bv_ints, bitmapBytes / (1024.0 * 1024.0));
+
+    // Stream partsupp chunks through bitmap-set kernel
     size_t chunkRows = ChunkConfig::adaptiveChunkSize(device, 8, psRows);
     struct Q16Slot { MTL::Buffer* partkey; MTL::Buffer* suppkey; };
     Q16Slot slots[2];
@@ -296,11 +306,10 @@ void runQ16BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
             enc->setBuffer(slot.suppkey, 0, 1);
             enc->setBuffer(pPartGroupMapBuf, 0, 2);
             enc->setBuffer(pComplaintBitmapBuf, 0, 3);
-            enc->setBuffer(pOutputCountBuf, 0, 4);
-            enc->setBuffer(pOutGroupIdBuf, 0, 5);
-            enc->setBuffer(pOutSuppKeyBuf, 0, 6);
-            enc->setBytes(&chunkSize, sizeof(chunkSize), 7);
-            enc->setBytes(&partMapSize, sizeof(partMapSize), 8);
+            enc->setBuffer(pGroupBitmapsBuf, 0, 4);
+            enc->setBytes(&chunkSize, sizeof(chunkSize), 5);
+            enc->setBytes(&partMapSize, sizeof(partMapSize), 6);
+            enc->setBytes(&bv_ints, sizeof(bv_ints), 7);
             enc->dispatchThreads(MTL::Size(chunkSize, 1, 1), MTL::Size(256, 1, 1));
             enc->endEncoding();
             cmdBuf->commit();
@@ -308,29 +317,31 @@ void runQ16BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
         [&]([[maybe_unused]] uint chunkSize, [[maybe_unused]] size_t chunkNum) {}
     );
 
-    // CPU post: count distinct suppkeys per group using flat bitset
-    uint outputCount = *(uint*)pOutputCountBuf->contents();
-    int* outGroupIds = (int*)pOutGroupIdBuf->contents();
-    int* outSuppKeys = (int*)pOutSuppKeyBuf->contents();
+    // After all chunks: run popcount kernel to count distinct suppkeys per group
+    MTL::CommandBuffer* cbPop = commandQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* encPop = cbPop->computeCommandEncoder();
+    encPop->setComputePipelineState(pPopcountPipe);
+    encPop->setBuffer(pGroupBitmapsBuf, 0, 0);
+    encPop->setBuffer(pGroupCountsBuf, 0, 1);
+    encPop->setBytes(&numGroups, sizeof(numGroups), 2);
+    encPop->setBytes(&bv_ints, sizeof(bv_ints), 3);
+    uint tgSizePop = std::min((uint)256, bv_ints);
+    if (tgSizePop < 1) tgSizePop = 1;
+    encPop->dispatchThreadgroups(MTL::Size(numGroups, 1, 1), MTL::Size(tgSizePop, 1, 1));
+    encPop->endEncoding();
+    cbPop->commit(); cbPop->waitUntilCompleted();
+    double popcountGpuMs = (cbPop->GPUEndTime() - cbPop->GPUStartTime()) * 1000.0;
 
-    int max_sk = 0;
-    for (uint i = 0; i < outputCount; i++) max_sk = std::max(max_sk, outSuppKeys[i]);
-    uint bv_ints = (max_sk + 32) / 32;
-
-    std::vector<uint> all_bitmaps(groups.size() * bv_ints, 0);
-    std::vector<int> group_counts(groups.size(), 0);
-    for (uint i = 0; i < outputCount; i++) {
-        int gid = outGroupIds[i], sk = outSuppKeys[i];
-        uint* bv = all_bitmaps.data() + (size_t)gid * bv_ints;
-        uint word = bv[sk / 32], bit = 1u << (sk % 32);
-        if (!(word & bit)) { bv[sk / 32] = word | bit; group_counts[gid]++; }
-    }
+    // Read GPU results
+    uint* gpuGroupCounts = (uint*)pGroupCountsBuf->contents();
+    uint outputCount = 0;
+    for (uint i = 0; i < numGroups; i++) outputCount += gpuGroupCounts[i];
 
     struct Q16Result { std::string brand; std::string type; int size; int supplier_cnt; };
     std::vector<Q16Result> results;
     for (size_t i = 0; i < groups.size(); i++) {
-        if (group_counts[i] > 0)
-            results.push_back({groups[i].brand, groups[i].type, groups[i].size, group_counts[i]});
+        if (gpuGroupCounts[i] > 0)
+            results.push_back({groups[i].brand, groups[i].type, groups[i].size, (int)gpuGroupCounts[i]});
     }
     std::sort(results.begin(), results.end(), [](const Q16Result& a, const Q16Result& b) {
         if (a.supplier_cnt != b.supplier_cnt) return a.supplier_cnt > b.supplier_cnt;
@@ -350,8 +361,9 @@ void runQ16BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     printf("+----------+---------------------------+------+--------------+\n");
     printf("Total groups: %zu | %u qualifying pairs\n", results.size(), outputCount);
 
-    printTimingSummary(buildParseMs + timing.parseMs, timing.gpuMs, 0.0);
+    printTimingSummary(buildParseMs + timing.parseMs, timing.gpuMs + popcountGpuMs, 0.0);
 
-    releaseAll(pScanPipe, pPartGroupMapBuf, pComplaintBitmapBuf, pOutputCountBuf, pOutGroupIdBuf, pOutSuppKeyBuf);
+    releaseAll(pScanPipe, pPopcountPipe, pPartGroupMapBuf, pComplaintBitmapBuf,
+              pGroupBitmapsBuf, pGroupCountsBuf);
     for (int s = 0; s < 2; s++) releaseAll(slots[s].partkey, slots[s].suppkey);
 }

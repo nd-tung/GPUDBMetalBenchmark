@@ -92,6 +92,19 @@ struct HashTableEntry {
     atomic_int value; // Row ID (payload)
 };
 
+// Non-atomic read-only aliases for probe-phase reads (enables L2 caching on Apple GPUs)
+struct HashTableEntryRO {
+    int key;
+    int value;
+};
+
+struct PartSuppEntryRO {
+    int partkey;
+    int suppkey;
+    int idx;
+    int _pad;
+};
+
 // ===================================================================
 // DATE RANGE HELPERS (YYYYMMDD integer dates)
 // ===================================================================
