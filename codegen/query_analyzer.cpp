@@ -131,7 +131,105 @@ ExprPtr walkTypeCast(const json& node, const std::vector<std::string>& tables) {
             }
         }
     }
+    // INTERVAL cast: return raw integer value (NOT scaled to YYYYMMDD offset).
+    // The unit (YEAR/MONTH/DAY) is resolved at the point of use in walkAExpr
+    // by re-inspecting the AST node's typmods.
+    if (typStr == "interval") {
+        int intervalValue = 0;
+        if (auto* lit = std::get_if<Literal>(&arg->node)) {
+            if (auto* iv = std::get_if<int>(&lit->value))
+                intervalValue = *iv;
+            else if (auto* sv = std::get_if<std::string>(&lit->value))
+                intervalValue = std::stoi(*sv);
+        }
+        return Expr::lit(intervalValue);
+    }
     return arg; // For other casts, pass through
+}
+
+// Helper: proper date arithmetic in YYYYMMDD format for DAY intervals
+static int computeDateArithDays(int yyyymmdd, int days, bool isAdd) {
+    int dir = isAdd ? 1 : -1;
+    int y = yyyymmdd / 10000;
+    int m = (yyyymmdd / 100) % 100;
+    int d = yyyymmdd % 100;
+
+    auto isLeap = [](int yr) { return (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0; };
+    auto daysInMonth = [&](int yr, int mo) -> int {
+        static const int dim[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+        if (mo == 2 && isLeap(yr)) return 29;
+        return dim[mo];
+    };
+
+    d += dir * days;
+    while (d > daysInMonth(y, m)) {
+        d -= daysInMonth(y, m);
+        m++;
+        if (m > 12) { m = 1; y++; }
+    }
+    while (d < 1) {
+        m--;
+        if (m < 1) { m = 12; y--; }
+        d += daysInMonth(y, m);
+    }
+
+    return y * 10000 + m * 100 + d;
+}
+
+// Interval unit enum
+enum class IntervalUnit { UNKNOWN, YEAR, MONTH, DAY };
+
+// Extract interval unit from a TypeCast AST node's typmods
+static IntervalUnit extractIntervalUnit(const json& typeCastNode) {
+    if (!typeCastNode.contains("typeName")) return IntervalUnit::UNKNOWN;
+    auto& tn = typeCastNode["typeName"];
+    bool isInterval = false;
+    if (tn.contains("names")) {
+        for (auto& n : tn["names"]) {
+            if (n.contains("String") && n["String"]["sval"] == "interval")
+                isInterval = true;
+        }
+    }
+    if (!isInterval) return IntervalUnit::UNKNOWN;
+
+    int typmods = 0;
+    if (tn.contains("typmods")) {
+        for (auto& tm : tn["typmods"]) {
+            if (tm.contains("Integer"))
+                typmods = tm["Integer"]["ival"].get<int>();
+            else if (tm.contains("A_Const") && tm["A_Const"].contains("ival"))
+                typmods = tm["A_Const"]["ival"]["ival"].get<int>();
+        }
+    }
+    // PostgreSQL datetime.h: YEAR=2, MONTH=1, DAY=3
+    // INTERVAL_MASK(X) = 1 << X → YEAR=4, MONTH=2, DAY=8
+    if (typmods & 4) return IntervalUnit::YEAR;
+    if (typmods & 2) return IntervalUnit::MONTH;
+    if (typmods & 8) return IntervalUnit::DAY;
+    return IntervalUnit::UNKNOWN;
+}
+
+// Compute DATE ± INTERVAL with proper unit handling (YEAR/MONTH/DAY)
+static int computeDateArith(int yyyymmdd, int intervalVal, bool isAdd, IntervalUnit unit) {
+    int dir = isAdd ? 1 : -1;
+    int y = yyyymmdd / 10000;
+    int m = (yyyymmdd / 100) % 100;
+    int d = yyyymmdd % 100;
+
+    switch (unit) {
+        case IntervalUnit::YEAR:
+            y += dir * intervalVal;
+            return y * 10000 + m * 100 + d;
+        case IntervalUnit::MONTH: {
+            m += dir * intervalVal;
+            while (m > 12) { m -= 12; y++; }
+            while (m < 1)  { m += 12; y--; }
+            return y * 10000 + m * 100 + d;
+        }
+        case IntervalUnit::DAY:
+        default:
+            return computeDateArithDays(yyyymmdd, intervalVal, isAdd);
+    }
 }
 
 ExprPtr walkFuncCall(const json& node, const std::vector<std::string>& tables) {
@@ -182,6 +280,26 @@ ExprPtr walkAExpr(const json& node, const std::vector<std::string>& tables) {
         }
         auto left = node.contains("lexpr") ? walkExpr(node["lexpr"], tables) : Expr::lit(0);
         auto right = node.contains("rexpr") ? walkExpr(node["rexpr"], tables) : Expr::lit(0);
+
+        // Pre-compute date ± interval when both sides are literals
+        if (exOp == ExprOp::ADD || exOp == ExprOp::SUB) {
+            auto* litL = std::get_if<Literal>(&left->node);
+            auto* litR = std::get_if<Literal>(&right->node);
+            if (litL && litR) {
+                auto* dateVal = std::get_if<int>(&litL->value);
+                auto* intVal  = std::get_if<int>(&litR->value);
+                if (dateVal && intVal && *dateVal > 19000101 && *dateVal < 21001231) {
+                    bool isAdd = (exOp == ExprOp::ADD);
+                    // Determine interval unit from the original AST rexpr
+                    IntervalUnit unit = IntervalUnit::DAY; // default
+                    if (node.contains("rexpr") && node["rexpr"].contains("TypeCast"))
+                        unit = extractIntervalUnit(node["rexpr"]["TypeCast"]);
+                    int result = computeDateArith(*dateVal, *intVal, isAdd, unit);
+                    return Expr::lit(result);
+                }
+            }
+        }
+
         return Expr::binary(exOp, left, right);
     }
     // Non-arithmetic A_Expr types (LIKE, BETWEEN, IN) in expression context

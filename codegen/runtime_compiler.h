@@ -1,5 +1,4 @@
 #pragma once
-#include "metal_codegen.h"
 #include <Metal/Metal.hpp>
 #include <string>
 #include <unordered_map>
@@ -18,13 +17,12 @@ public:
     // Get or create a pipeline state for a kernel name from a compiled library.
     MTL::ComputePipelineState* getPipeline(MTL::Library* lib, const std::string& kernelName);
 
-    // Compile a GeneratedKernels bundle and return all pipeline states.
+    // Compiled query: library + pipeline states for each phase
     struct CompiledQuery {
         MTL::Library* library = nullptr;
         std::vector<MTL::ComputePipelineState*> pipelines;
         std::vector<std::string> kernelNames;
     };
-    CompiledQuery compileQuery(const GeneratedKernels& gen);
 
 private:
     MTL::Device* device_;

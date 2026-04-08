@@ -1,11 +1,4 @@
 #include "infra.h"
-#include "../codegen/query_analyzer.h"
-#include "../codegen/query_planner.h"
-#include "../codegen/metal_codegen.h"
-#include "../codegen/runtime_compiler.h"
-#include "../codegen/query_executor.h"
-#include <fstream>
-#include <sstream>
 
 static void showHelp() {
     std::cout << "GPU Database Metal Benchmark" << std::endl;
@@ -50,72 +43,6 @@ static void showHelp() {
     std::cout << "  GPUDBMetalBenchmark q1     # Run only TPC-H Query 1" << std::endl;
     std::cout << "  GPUDBMetalBenchmark sf100 q1  # Run Q1 on SF-100 (chunked)" << std::endl;
     std::cout << "  GPUDBMetalBenchmark sf100 q6  # Run Q6 on SF-100 (chunked)" << std::endl;
-}
-
-// Run a query through the codegen pipeline: SQL → analyze → plan → Metal codegen → compile → execute
-static void runCodegenQuery(MTL::Device* device, MTL::CommandQueue* cmdQueue,
-                            const std::string& sql, const std::string& queryName) {
-    printf("\n=== Codegen: %s ===\n", queryName.c_str());
-    try {
-        auto analyzed = codegen::analyzeSQL(sql);
-        auto plan = codegen::buildPlan(analyzed);
-        plan.name = queryName; // override with canonical name
-        auto gen = codegen::generateMetal(plan);
-        codegen::RuntimeCompiler compiler(device);
-        auto compiled = compiler.compileQuery(gen);
-        codegen::executeQuery(device, cmdQueue, plan, compiled, gen, g_dataset_path);
-    } catch (const std::exception& e) {
-        std::cerr << "Codegen error (" << queryName << "): " << e.what() << std::endl;
-    }
-}
-
-// Read SQL file and run through codegen
-static void runSQLFile(MTL::Device* device, MTL::CommandQueue* cmdQueue,
-                       MTL::Library* /*lib*/, const std::string& sqlPath) {
-    std::ifstream f(sqlPath);
-    if (!f.is_open()) {
-        std::cerr << "Cannot open SQL file: " << sqlPath << std::endl;
-        return;
-    }
-    std::stringstream ss;
-    ss << f.rdbuf();
-    std::string sql = ss.str();
-
-    // Strip CREATE VIEW / DROP VIEW statements (e.g. Q15) — keep only SELECT
-    {
-        // Remove "CREATE VIEW ... AS" prefix (everything before the first standalone SELECT)
-        auto cvPos = sql.find("CREATE VIEW");
-        if (cvPos == std::string::npos) cvPos = sql.find("create view");
-        if (cvPos != std::string::npos) {
-            // Find the main SELECT (after the VIEW's SELECT ... GROUP BY ...;)
-            // Strategy: find "DROP VIEW" and remove it, find last SELECT that isn't inside the view
-            auto dropPos = sql.find("DROP VIEW");
-            if (dropPos == std::string::npos) dropPos = sql.find("drop view");
-            if (dropPos != std::string::npos) sql.erase(dropPos);
-            // Remove "CREATE VIEW ... AS\n    SELECT ... GROUP BY ...;\n"
-            // Find the closing semicolon of the CREATE VIEW's subquery
-            auto firstSemicolon = sql.find(';', cvPos);
-            if (firstSemicolon != std::string::npos)
-                sql = sql.substr(firstSemicolon + 1);
-        }
-    }
-
-    // Derive query name from filename: "sql/q6.sql" → "Q6"
-    std::string name = sqlPath;
-    auto lastSlash = name.rfind('/');
-    if (lastSlash != std::string::npos) name = name.substr(lastSlash + 1);
-    auto dot = name.rfind('.');
-    if (dot != std::string::npos) name = name.substr(0, dot);
-    // Uppercase first char
-    if (!name.empty() && name[0] == 'q') name[0] = 'Q';
-
-    runCodegenQuery(device, cmdQueue, sql, name);
-}
-
-// Wrapper: gen_qN reads sql/qN.sql and runs through codegen
-static void makeGenBench(int qNum, MTL::Device* device, MTL::CommandQueue* cmdQueue, MTL::Library* lib) {
-    std::string path = "sql/q" + std::to_string(qNum) + ".sql";
-    runSQLFile(device, cmdQueue, lib, path);
 }
 
 int main(int argc, const char * argv[]) {
@@ -211,6 +138,7 @@ int main(int argc, const char * argv[]) {
         if (allFilesRead && !metalSource.empty()) {
             NS::String* sourceStr = NS::String::string(metalSource.c_str(), NS::UTF8StringEncoding);
             MTL::CompileOptions* opts = MTL::CompileOptions::alloc()->init();
+            opts->setFastMathEnabled(true);
             library = device->newLibrary(sourceStr, opts, &error);
             opts->release();
             if (library) {
@@ -262,24 +190,6 @@ int main(int argc, const char * argv[]) {
     auto& benchmarks = g_sf100_mode ? sf100_benchmarks : std_benchmarks;
     if (query == "all") {
         for (auto& [name, fn] : benchmarks) fn(device, commandQueue, library);
-    } else if (query.substr(0, 4) == "gen_") {
-        // Codegen path: gen_q1 ... gen_q22
-        std::string qPart = query.substr(4); // "q1" ... "q22"
-        if (qPart.size() >= 2 && qPart[0] == 'q') {
-            int qNum = std::stoi(qPart.substr(1));
-            if (qNum >= 1 && qNum <= 22) {
-                makeGenBench(qNum, device, commandQueue, library);
-            } else {
-                std::cerr << "Unknown codegen query: " << query << std::endl;
-                return 1;
-            }
-        } else {
-            std::cerr << "Unknown codegen query: " << query << std::endl;
-            return 1;
-        }
-    } else if (query.size() > 4 && query.substr(query.size()-4) == ".sql") {
-        // Direct SQL file path
-        runSQLFile(device, commandQueue, library, query);
     } else {
         auto it = std::find_if(benchmarks.begin(), benchmarks.end(),
                                [&](const BenchEntry& e) { return e.first == query; });

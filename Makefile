@@ -1,10 +1,13 @@
 # GPU Database Metal Benchmark Makefile
-# Builds C++ project using metal-cpp library
+# Builds two binaries:
+#   GPUDBMetalBenchmark  – hand-written GPU benchmarks (src/*.cpp + codegen library)
+#   GPUDBCodegen         – codegen pipeline (codegen/codegen_main.cpp + codegen library + infra)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 PROJECT_NAME = GPUDBMetalBenchmark
+CODEGEN_NAME = GPUDBCodegen
 SOURCE_DIR   = src
 KERNEL_DIR   = kernels
 METAL_CPP_DIR = third_party/metal-cpp
@@ -21,12 +24,15 @@ FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore -L/opt
 SOURCES = $(wildcard $(SOURCE_DIR)/*.cpp)
 OBJECTS = $(SOURCES:$(SOURCE_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
-# Codegen sources
+# Codegen sources (exclude codegen_main.cpp from shared library objects)
 CODEGEN_DIR = codegen
-CODEGEN_SOURCES = $(wildcard $(CODEGEN_DIR)/*.cpp)
-CODEGEN_OBJECTS = $(CODEGEN_SOURCES:$(CODEGEN_DIR)/%.cpp=$(OBJ_DIR)/codegen_%.o)
+CODEGEN_ALL_SOURCES = $(wildcard $(CODEGEN_DIR)/*.cpp)
+CODEGEN_LIB_SOURCES = $(filter-out $(CODEGEN_DIR)/codegen_main.cpp, $(CODEGEN_ALL_SOURCES))
+CODEGEN_LIB_OBJECTS = $(CODEGEN_LIB_SOURCES:$(CODEGEN_DIR)/%.cpp=$(OBJ_DIR)/codegen_%.o)
+CODEGEN_MAIN_OBJ    = $(OBJ_DIR)/codegen_codegen_main.o
 
-TARGET  = $(BIN_DIR)/$(PROJECT_NAME)
+BENCH_TARGET  = $(BIN_DIR)/$(PROJECT_NAME)
+CODEGEN_TARGET = $(BIN_DIR)/$(CODEGEN_NAME)
 
 # libpg_query
 PG_QUERY_DIR = third_party/libpg_query
@@ -52,17 +58,24 @@ SCALE_FACTORS = sf1 sf10 sf100
 METAL_AVAILABLE := $(shell xcrun --find metal >/dev/null 2>/dev/null && echo 1)
 
 ifeq ($(METAL_AVAILABLE),1)
-  all: $(TARGET) $(KERNEL_METALLIB)
+  all: $(BENCH_TARGET) $(CODEGEN_TARGET) $(KERNEL_METALLIB)
 else
-  all: $(TARGET)
+  all: $(BENCH_TARGET) $(CODEGEN_TARGET)
 	@echo "Note: Metal compiler not found (Xcode required). Shaders will be compiled at runtime."
 endif
 
 rebuild: clean all
 
-$(TARGET): $(OBJECTS) $(CODEGEN_OBJECTS) | $(BIN_DIR)
+# Benchmark binary: src/*.o only (no codegen dependency)
+$(BENCH_TARGET): $(OBJECTS) | $(BIN_DIR)
 	@echo "Linking $(PROJECT_NAME)..."
-	$(CXX) $(OBJECTS) $(CODEGEN_OBJECTS) $(PG_QUERY_LIB) $(FRAMEWORKS) -o $@
+	$(CXX) $(OBJECTS) $(FRAMEWORKS) -o $@
+	@echo "Build complete: $@"
+
+# Codegen binary: codegen_main.o + codegen library objects + infra.o (no src/main.o)
+$(CODEGEN_TARGET): $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(OBJ_DIR)/infra.o | $(BIN_DIR)
+	@echo "Linking $(CODEGEN_NAME)..."
+	$(CXX) $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(OBJ_DIR)/infra.o $(PG_QUERY_LIB) $(FRAMEWORKS) -o $@
 	@echo "Build complete: $@"
 
 $(KERNEL_AIR): $(KERNEL_DIR)/DatabaseKernels.metal $(wildcard $(KERNEL_DIR)/*.metal $(KERNEL_DIR)/*.h) | $(BUILD_DIR)
@@ -97,21 +110,26 @@ clean:
 SF ?=
 Q  ?=
 run: all
-	@./$(TARGET) $(SF) $(Q)
+	@./$(BENCH_TARGET) $(SF) $(Q)
+
+# Run codegen binary:  make codegen SF=sf1 Q=q6
+.PHONY: codegen
+codegen: all
+	@./$(CODEGEN_TARGET) $(SF) $(Q)
 
 # ---------------------------------------------------------------------------
 # Convenience per-scale-factor targets
 # ---------------------------------------------------------------------------
 .PHONY: run-sf1 run-sf10 run-sf100
 run-sf1 run-sf10 run-sf100: run-%: all
-	@./$(TARGET) $*
+	@./$(BENCH_TARGET) $*
 
 # ---------------------------------------------------------------------------
 # Convenience per-query targets  (run-q1 … run-q19)
 # ---------------------------------------------------------------------------
 .PHONY: $(addprefix run-,$(QUERIES))
 $(addprefix run-,$(QUERIES)): run-%: all
-	@./$(TARGET) $*
+	@./$(BENCH_TARGET) $*
 
 # ---------------------------------------------------------------------------
 # Verify project structure

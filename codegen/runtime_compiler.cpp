@@ -59,24 +59,4 @@ MTL::ComputePipelineState* RuntimeCompiler::getPipeline(MTL::Library* lib, const
     return pso;
 }
 
-RuntimeCompiler::CompiledQuery RuntimeCompiler::compileQuery(const GeneratedKernels& gen) {
-    CompiledQuery cq;
-    cq.library = compile(gen.metalSource);
-    if (!cq.library) return cq;
-
-    for (auto& ki : gen.kernels) {
-        auto* pso = getPipeline(cq.library, ki.name);
-        if (!pso) {
-            cq.library->release();
-            cq.library = nullptr;
-            cq.pipelines.clear();
-            cq.kernelNames.clear();
-            return cq;
-        }
-        cq.pipelines.push_back(pso);
-        cq.kernelNames.push_back(ki.name);
-    }
-    return cq;
-}
-
 } // namespace codegen
