@@ -28,7 +28,6 @@ void runQ22Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
     uint custSize = (uint)c_custkey.size();
-    uint ordSize = (uint)o_custkey.size();
 
     auto c_prefix = extractPhonePrefix(c_phone, 15, custSize);
 
@@ -42,84 +41,61 @@ void runQ22Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         prefix_to_bin[valid_prefixes[i]] = i;
     }
 
+    // CPU pre-compute: avg balance for valid-prefix customers with bal > 0
+    double sumBal = 0.0;
+    int countBal = 0;
+    for (uint i = 0; i < custSize; i++) {
+        if (c_acctbal[i] > 0.0f) {
+            int prefix = c_prefix[i];
+            if (prefix >= 0 && prefix <= 31 && ((valid_prefix_mask >> (uint)prefix) & 1u))
+            { sumBal += c_acctbal[i]; countBal++; }
+        }
+    }
+    float avgBal = (countBal > 0) ? (float)(sumBal / countBal) : 0.0f;
+
+    // CPU pre-build: orders custkey bitmap
     int max_custkey = 0;
     for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
     uint cust_bitmap_ints = (max_custkey + 31) / 32 + 1;
+    std::vector<uint32_t> custBitmap(cust_bitmap_ints, 0);
+    for (int ck : o_custkey)
+        if (ck >= 0 && ck <= max_custkey)
+            custBitmap[ck / 32] |= (1u << (ck % 32));
 
-    auto pAvgPipe = createPipeline(device, library, "q22_avg_balance_kernel");
-    auto pBitmapPipe = createPipeline(device, library, "q22_build_orders_bitmap_kernel");
     auto pFinalPipe = createPipeline(device, library, "q22_final_aggregate_kernel");
-    if (!pAvgPipe || !pBitmapPipe || !pFinalPipe) return;
+    if (!pFinalPipe) return;
 
     MTL::Buffer* pPrefixBuf = device->newBuffer(c_prefix.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pAcctBalBuf = device->newBuffer(c_acctbal.data(), custSize * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pCustKeyBuf = device->newBuffer(c_custkey.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCustKeyBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pSumBalBuf = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pCountBalBuf = device->newBuffer(sizeof(uint), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pCustBitmapBuf = device->newBuffer(cust_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCustBitmapBuf = device->newBuffer(custBitmap.data(), cust_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pResultCountBuf = device->newBuffer(7 * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pResultSumBuf = device->newBuffer(7 * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pPrefixToBinBuf = device->newBuffer(prefix_to_bin, 32 * sizeof(int), MTL::ResourceStorageModeShared);
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
-        *(float*)pSumBalBuf->contents() = 0.0f;
-        *(uint*)pCountBalBuf->contents() = 0;
-        memset(pCustBitmapBuf->contents(), 0, cust_bitmap_ints * sizeof(uint));
         memset(pResultCountBuf->contents(), 0, 7 * sizeof(uint));
         memset(pResultSumBuf->contents(), 0, 7 * sizeof(float));
 
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
-
-        // Phase 1: avg balance
-        enc->setComputePipelineState(pAvgPipe);
+        enc->setComputePipelineState(pFinalPipe);
         enc->setBuffer(pPrefixBuf, 0, 0);
         enc->setBuffer(pAcctBalBuf, 0, 1);
-        enc->setBuffer(pSumBalBuf, 0, 2);
-        enc->setBuffer(pCountBalBuf, 0, 3);
-        enc->setBytes(&custSize, sizeof(custSize), 4);
-        enc->setBytes(&valid_prefix_mask, sizeof(valid_prefix_mask), 5);
+        enc->setBuffer(pCustKeyBuf, 0, 2);
+        enc->setBuffer(pCustBitmapBuf, 0, 3);
+        enc->setBuffer(pResultCountBuf, 0, 4);
+        enc->setBuffer(pResultSumBuf, 0, 5);
+        enc->setBytes(&custSize, sizeof(custSize), 6);
+        enc->setBytes(&avgBal, sizeof(avgBal), 7);
+        enc->setBytes(&valid_prefix_mask, sizeof(valid_prefix_mask), 8);
+        enc->setBuffer(pPrefixToBinBuf, 0, 9);
         enc->dispatchThreads(MTL::Size(custSize, 1, 1), MTL::Size(256, 1, 1));
-
-        // Phase 2: orders bitmap
-        enc->memoryBarrier(MTL::BarrierScopeBuffers);
-        enc->setComputePipelineState(pBitmapPipe);
-        enc->setBuffer(pOrdCustKeyBuf, 0, 0);
-        enc->setBuffer(pCustBitmapBuf, 0, 1);
-        enc->setBytes(&ordSize, sizeof(ordSize), 2);
-        enc->dispatchThreads(MTL::Size(ordSize, 1, 1), MTL::Size(256, 1, 1));
-
         enc->endEncoding();
         cb->commit(); cb->waitUntilCompleted();
-
-        // Compute avg on CPU between passes
-        float sumBal = *(float*)pSumBalBuf->contents();
-        uint countBal = *(uint*)pCountBalBuf->contents();
-        float avgBal = (countBal > 0) ? sumBal / countBal : 0.0f;
-
-        // Phase 3: final aggregate
-        MTL::CommandBuffer* cb2 = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* enc2 = cb2->computeCommandEncoder();
-        enc2->setComputePipelineState(pFinalPipe);
-        enc2->setBuffer(pPrefixBuf, 0, 0);
-        enc2->setBuffer(pAcctBalBuf, 0, 1);
-        enc2->setBuffer(pCustKeyBuf, 0, 2);
-        enc2->setBuffer(pCustBitmapBuf, 0, 3);
-        enc2->setBuffer(pResultCountBuf, 0, 4);
-        enc2->setBuffer(pResultSumBuf, 0, 5);
-        enc2->setBytes(&custSize, sizeof(custSize), 6);
-        enc2->setBytes(&avgBal, sizeof(avgBal), 7);
-        enc2->setBytes(&valid_prefix_mask, sizeof(valid_prefix_mask), 8);
-        enc2->setBuffer(pPrefixToBinBuf, 0, 9);
-        enc2->dispatchThreads(MTL::Size(custSize, 1, 1), MTL::Size(256, 1, 1));
-        enc2->endEncoding();
-        cb2->commit(); cb2->waitUntilCompleted();
-        if (iter == 2) {
-            gpuSec = (cb->GPUEndTime() - cb->GPUStartTime()) +
-                     (cb2->GPUEndTime() - cb2->GPUStartTime());
-        }
+        if (iter == 2)
+            gpuSec = cb->GPUEndTime() - cb->GPUStartTime();
     }
 
     auto postStart = std::chrono::high_resolution_clock::now();
@@ -138,12 +114,11 @@ void runQ22Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     auto postEnd = std::chrono::high_resolution_clock::now();
     double cpuPostMs = std::chrono::duration<double, std::milli>(postEnd - postStart).count();
 
-    printf("\nQ22 | %u customers | %u orders\n", custSize, ordSize);
+    printf("\nQ22 | %u customers\n", custSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(pAvgPipe, pBitmapPipe, pFinalPipe, pPrefixBuf, pAcctBalBuf, pCustKeyBuf,
-              pOrdCustKeyBuf, pSumBalBuf, pCountBalBuf, pCustBitmapBuf,
-              pResultCountBuf, pResultSumBuf, pPrefixToBinBuf);
+    releaseAll(pFinalPipe, pPrefixBuf, pAcctBalBuf, pCustKeyBuf,
+              pCustBitmapBuf, pResultCountBuf, pResultSumBuf, pPrefixToBinBuf);
 }
 
 // --- SF100 Chunked ---

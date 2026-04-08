@@ -26,20 +26,17 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
     std::cout << "Loaded " << orders_size << " orders and " << customer_size << " customers." << std::endl;
 
     // 2. Setup kernels
-    auto pPatternPipe = createPipeline(pDevice, pLibrary, "q13_pattern_match_kernel");
-    auto pCountPipe = createPipeline(pDevice, pLibrary, "q13_count_prefiltered_kernel");
+    auto pFusedCountPipe = createPipeline(pDevice, pLibrary, "q13_fused_count_kernel");
     auto pHistPipe = createPipeline(pDevice, pLibrary, "q13_build_histogram_kernel");
-    if (!pPatternPipe || !pCountPipe || !pHistPipe) return;
+    if (!pFusedCountPipe || !pHistPipe) return;
 
     // 3. Create Buffers
     const uint num_threadgroups = 2048;
     MTL::Buffer* pOrdCustKeyBuffer = pDevice->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pOrdCommentBuffer = pDevice->newBuffer(o_comment.data(), (size_t)orders_size * comment_stride * sizeof(char), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdQualifiesBuffer = pDevice->newBuffer(orders_size * sizeof(uint8_t), MTL::ResourceStorageModeShared);
 
     // Direct mapping output: per-customer order counts (index = custkey - 1).
-    std::vector<uint> cpu_counts_per_customer(customer_size, 0u);
-    MTL::Buffer* pCountsPerCustomerBuffer = pDevice->newBuffer(cpu_counts_per_customer.data(), customer_size * sizeof(uint), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCountsPerCustomerBuffer = pDevice->newBuffer(customer_size * sizeof(uint), MTL::ResourceStorageModeShared);
 
     // Histogram buffer for GPU histogram kernel
     const uint hist_max_bins = 256;
@@ -55,41 +52,27 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
         
         MTL::CommandBuffer* pCommandBuffer = pCommandQueue->commandBuffer();
         
-        // Encoder 0: pattern match kernel (GPU-side)
+        // Encoder 0: fused pattern match + count kernel
         MTL::ComputeCommandEncoder* enc0 = pCommandBuffer->computeCommandEncoder();
-        enc0->setComputePipelineState(pPatternPipe);
-        enc0->setBuffer(pOrdCommentBuffer, 0, 0);
-        enc0->setBuffer(pOrdQualifiesBuffer, 0, 1);
-        enc0->setBytes(&orders_size, sizeof(orders_size), 2);
-        enc0->setBytes(&comment_stride, sizeof(comment_stride), 3);
-        {
-            NS::UInteger tgSize = pPatternPipe->maxTotalThreadsPerThreadgroup();
-            if (tgSize > 1024) tgSize = 1024;
-            uint numGroups = (orders_size + (uint)tgSize - 1) / (uint)tgSize;
-            enc0->dispatchThreadgroups(MTL::Size(numGroups, 1, 1), MTL::Size(tgSize, 1, 1));
-        }
+        enc0->setComputePipelineState(pFusedCountPipe);
+        enc0->setBuffer(pOrdCustKeyBuffer, 0, 0);
+        enc0->setBuffer(pOrdCommentBuffer, 0, 1);
+        enc0->setBuffer(pCountsPerCustomerBuffer, 0, 2);
+        enc0->setBytes(&orders_size, sizeof(orders_size), 3);
+        enc0->setBytes(&comment_stride, sizeof(comment_stride), 4);
+        enc0->setBytes(&customer_size, sizeof(customer_size), 5);
+        enc0->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
         enc0->endEncoding();
 
-        // Encoder 1: count kernel (prefiltered — no comment processing)
+        // Encoder 1: histogram kernel (encoder boundary provides memory barrier)
         MTL::ComputeCommandEncoder* enc1 = pCommandBuffer->computeCommandEncoder();
-        enc1->setComputePipelineState(pCountPipe);
-        enc1->setBuffer(pOrdCustKeyBuffer, 0, 0);
-        enc1->setBuffer(pOrdQualifiesBuffer, 0, 1);
-        enc1->setBuffer(pCountsPerCustomerBuffer, 0, 2);
-        enc1->setBytes(&orders_size, sizeof(orders_size), 3);
-        enc1->setBytes(&customer_size, sizeof(customer_size), 4);
+        enc1->setComputePipelineState(pHistPipe);
+        enc1->setBuffer(pCountsPerCustomerBuffer, 0, 0);
+        enc1->setBuffer(pHistogramBuf, 0, 1);
+        enc1->setBytes(&customer_size, sizeof(customer_size), 2);
+        enc1->setBytes(&hist_max_bins, sizeof(hist_max_bins), 3);
         enc1->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
         enc1->endEncoding();
-
-        // Encoder 2: histogram kernel (encoder boundary provides memory barrier)
-        MTL::ComputeCommandEncoder* enc2 = pCommandBuffer->computeCommandEncoder();
-        enc2->setComputePipelineState(pHistPipe);
-        enc2->setBuffer(pCountsPerCustomerBuffer, 0, 0);
-        enc2->setBuffer(pHistogramBuf, 0, 1);
-        enc2->setBytes(&customer_size, sizeof(customer_size), 2);
-        enc2->setBytes(&hist_max_bins, sizeof(hist_max_bins), 3);
-        enc2->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
-        enc2->endEncoding();
 
         // 5. Execute GPU work
         pCommandBuffer->commit();
@@ -111,8 +94,8 @@ void runQ13Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL
     printf("\nQ13 | %u orders | %u customers\n", orders_size, customer_size);
     printTimingSummary(q13CpuParseMs, q13GpuMs, q13CpuPostMs);
 
-    releaseAll(pPatternPipe, pCountPipe, pHistPipe,
-              pOrdCustKeyBuffer, pOrdCommentBuffer, pOrdQualifiesBuffer, pCountsPerCustomerBuffer, pHistogramBuf);
+    releaseAll(pFusedCountPipe, pHistPipe,
+              pOrdCustKeyBuffer, pOrdCommentBuffer, pCountsPerCustomerBuffer, pHistogramBuf);
 }
 
 

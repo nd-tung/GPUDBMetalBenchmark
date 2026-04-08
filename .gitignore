@@ -29,3 +29,6 @@ results/old_format/
 
 # Tooling
 temp_tpch/
+
+# Debug codegen output
+codegen_debug_*.metal

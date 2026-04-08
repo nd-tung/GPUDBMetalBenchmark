@@ -287,3 +287,65 @@ kernel void q9_probe_and_global_agg_kernel(
         }
     }
 }
+
+
+// ===================================================================
+// OPTIMIZED Q9: CPU-built direct maps + single probe kernel
+// ===================================================================
+// All hash tables / direct maps are pre-built on CPU.
+// GPU only runs the lineitem scan with O(1) direct-map lookups
+// and a tiny flat HT probe for partsupp.
+// Aggregation uses direct-mapped bins: profit[nation*8 + (year-1992)].
+
+kernel void q9_probe_direct_maps(
+    // lineitem columns
+    const device int* l_partkey [[buffer(0)]],
+    const device int* l_suppkey [[buffer(1)]],
+    const device int* l_orderkey [[buffer(2)]],
+    const device float* l_quantity [[buffer(3)]],
+    const device float* l_extendedprice [[buffer(4)]],
+    const device float* l_discount [[buffer(5)]],
+    // CPU pre-built lookups
+    const device uint* part_bitmap [[buffer(6)]],       // bitmap[partkey] -> green?
+    const device int* supp_nation_map [[buffer(7)]],    // direct: suppkey -> nationkey (-1 = missing)
+    const device int* order_year_map [[buffer(8)]],     // direct: orderkey -> year (0 = missing)
+    const device uint* ps_ht_keys [[buffer(9)]],        // flat HT keys (0xFFFFFFFF = empty)
+    const device float* ps_ht_vals [[buffer(10)]],      // flat HT values (supplycost)
+    // output
+    device atomic_float* profit_bins [[buffer(11)]],    // 25*8=200 bins
+    // params
+    constant uint& lineitem_size [[buffer(12)]],
+    constant uint& ps_ht_mask [[buffer(13)]],
+    constant uint& supp_mul [[buffer(14)]],
+    // thread ids
+    uint tid [[thread_position_in_grid]],
+    uint tpg [[threads_per_grid]])
+{
+    for (uint i = tid; i < lineitem_size; i += tpg) {
+        int partkey = l_partkey[i];
+        if (!bitmap_test(part_bitmap, partkey)) continue;
+
+        int suppkey = l_suppkey[i];
+        int nationkey = supp_nation_map[suppkey];
+        if (nationkey == -1) continue;
+
+        int year = order_year_map[l_orderkey[i]];
+        if (year == 0) continue;
+
+        // Probe partsupp flat HT: key = partkey * supp_mul + suppkey
+        uint pskey = (uint)partkey * supp_mul + (uint)suppkey;
+        uint h = (pskey * 2654435769u) & ps_ht_mask;
+        float supplycost = -1.0f;
+        for (uint step = 0; step <= 64u; ++step) {
+            uint slot = (h + step) & ps_ht_mask;
+            uint k = ps_ht_keys[slot];
+            if (k == pskey) { supplycost = ps_ht_vals[slot]; break; }
+            if (k == 0xFFFFFFFFu) break;
+        }
+        if (supplycost < 0.0f) continue;
+
+        float profit = l_extendedprice[i] * (1.0f - l_discount[i]) - supplycost * l_quantity[i];
+        int bin = nationkey * 8 + (year - 1992);
+        atomic_fetch_add_explicit(&profit_bins[bin], profit, memory_order_relaxed);
+    }
+}

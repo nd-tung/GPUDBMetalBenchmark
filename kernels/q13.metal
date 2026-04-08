@@ -166,3 +166,43 @@ kernel void q13_build_histogram_kernel(
         }
     }
 }
+
+// ===================================================================
+// Fused pattern-match + count kernel: eliminates intermediate qualifies
+// array and one kernel dispatch. Inline pattern check, directly atomic
+// increment per-customer count.
+// ===================================================================
+kernel void q13_fused_count_kernel(
+    const device int* o_custkey           [[buffer(0)]],
+    const device char* o_comment          [[buffer(1)]],
+    device atomic_uint* customer_order_counts [[buffer(2)]],
+    constant uint& orders_size            [[buffer(3)]],
+    constant uint& comment_stride         [[buffer(4)]],
+    constant uint& customer_size          [[buffer(5)]],
+    uint tid [[thread_position_in_grid]],
+    uint tpg [[threads_per_grid]])
+{
+    for (uint i = tid; i < orders_size; i += tpg) {
+        // Inline pattern match for NOT LIKE '%special%requests%'
+        const device char* s = o_comment + (uint64_t)i * comment_stride;
+        bool match = false;
+        for (uint p = 0; p + 7 <= comment_stride && s[p] != '\0'; p++) {
+            if (s[p]=='s' && s[p+1]=='p' && s[p+2]=='e' && s[p+3]=='c' &&
+                s[p+4]=='i' && s[p+5]=='a' && s[p+6]=='l') {
+                for (uint q = p + 7; q + 8 <= comment_stride && s[q] != '\0'; q++) {
+                    if (s[q]=='r' && s[q+1]=='e' && s[q+2]=='q' && s[q+3]=='u' &&
+                        s[q+4]=='e' && s[q+5]=='s' && s[q+6]=='t' && s[q+7]=='s') {
+                        match = true;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        if (!match) {
+            int ck = o_custkey[i];
+            if (ck >= 1 && (uint)ck <= customer_size)
+                atomic_fetch_add_explicit(&customer_order_counts[ck - 1], 1u, memory_order_relaxed);
+        }
+    }
+}
