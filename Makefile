@@ -1,13 +1,10 @@
 # GPU Database Metal Benchmark Makefile
-# Builds two binaries:
-#   GPUDBMetalBenchmark  – hand-written GPU benchmarks (src/*.cpp + codegen library)
-#   GPUDBCodegen         – codegen pipeline (codegen/codegen_main.cpp + codegen library + infra)
+# Builds: GPUDBMetalBenchmark – hand-written GPU benchmarks (src/*.cpp)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 PROJECT_NAME = GPUDBMetalBenchmark
-CODEGEN_NAME = GPUDBCodegen
 SOURCE_DIR   = src
 KERNEL_DIR   = kernels
 METAL_CPP_DIR = third_party/metal-cpp
@@ -18,25 +15,13 @@ OBJ_DIR      = $(BUILD_DIR)/obj
 
 CXX      = clang++
 CXXFLAGS = -std=c++20 -Wall -Wextra -O3
-INCLUDES = -I$(METAL_CPP_DIR) -I$(PG_QUERY_DIR) -Icodegen
+INCLUDES = -I$(METAL_CPP_DIR)
 FRAMEWORKS = -framework Metal -framework Foundation -framework QuartzCore -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++
 
 SOURCES = $(wildcard $(SOURCE_DIR)/*.cpp)
 OBJECTS = $(SOURCES:$(SOURCE_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
-# Codegen sources (exclude codegen_main.cpp from shared library objects)
-CODEGEN_DIR = codegen
-CODEGEN_ALL_SOURCES = $(wildcard $(CODEGEN_DIR)/*.cpp)
-CODEGEN_LIB_SOURCES = $(filter-out $(CODEGEN_DIR)/codegen_main.cpp, $(CODEGEN_ALL_SOURCES))
-CODEGEN_LIB_OBJECTS = $(CODEGEN_LIB_SOURCES:$(CODEGEN_DIR)/%.cpp=$(OBJ_DIR)/codegen_%.o)
-CODEGEN_MAIN_OBJ    = $(OBJ_DIR)/codegen_codegen_main.o
-
 BENCH_TARGET  = $(BIN_DIR)/$(PROJECT_NAME)
-CODEGEN_TARGET = $(BIN_DIR)/$(CODEGEN_NAME)
-
-# libpg_query
-PG_QUERY_DIR = third_party/libpg_query
-PG_QUERY_LIB = $(PG_QUERY_DIR)/libpg_query.a
 
 METAL    = xcrun -sdk macosx metal
 METALLIB = xcrun -sdk macosx metallib
@@ -58,24 +43,18 @@ SCALE_FACTORS = sf1 sf10 sf100
 METAL_AVAILABLE := $(shell xcrun --find metal >/dev/null 2>/dev/null && echo 1)
 
 ifeq ($(METAL_AVAILABLE),1)
-  all: $(BENCH_TARGET) $(CODEGEN_TARGET) $(KERNEL_METALLIB)
+  all: $(BENCH_TARGET) $(KERNEL_METALLIB)
 else
-  all: $(BENCH_TARGET) $(CODEGEN_TARGET)
+  all: $(BENCH_TARGET)
 	@echo "Note: Metal compiler not found (Xcode required). Shaders will be compiled at runtime."
 endif
 
 rebuild: clean all
 
-# Benchmark binary: src/*.o only (no codegen dependency)
+# Benchmark binary: src/*.o
 $(BENCH_TARGET): $(OBJECTS) | $(BIN_DIR)
 	@echo "Linking $(PROJECT_NAME)..."
 	$(CXX) $(OBJECTS) $(FRAMEWORKS) -o $@
-	@echo "Build complete: $@"
-
-# Codegen binary: codegen_main.o + codegen library objects + infra.o (no src/main.o)
-$(CODEGEN_TARGET): $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(OBJ_DIR)/infra.o | $(BIN_DIR)
-	@echo "Linking $(CODEGEN_NAME)..."
-	$(CXX) $(CODEGEN_MAIN_OBJ) $(CODEGEN_LIB_OBJECTS) $(OBJ_DIR)/infra.o $(PG_QUERY_LIB) $(FRAMEWORKS) -o $@
 	@echo "Build complete: $@"
 
 $(KERNEL_AIR): $(KERNEL_DIR)/DatabaseKernels.metal $(wildcard $(KERNEL_DIR)/*.metal $(KERNEL_DIR)/*.h) | $(BUILD_DIR)
@@ -89,10 +68,6 @@ $(KERNEL_METALLIB): $(KERNEL_AIR)
 $(OBJ_DIR)/%.o: $(SOURCE_DIR)/%.cpp | $(OBJ_DIR)
 	@echo "Compiling $<..."
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJ_DIR)/codegen_%.o: $(CODEGEN_DIR)/%.cpp | $(OBJ_DIR)
-	@echo "Compiling codegen/$<..."
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -Isrc -c $< -o $@
 
 $(BIN_DIR) $(OBJ_DIR) $(BUILD_DIR):
 	@mkdir -p $@
@@ -111,11 +86,6 @@ SF ?=
 Q  ?=
 run: all
 	@./$(BENCH_TARGET) $(SF) $(Q)
-
-# Run codegen binary:  make codegen SF=sf1 Q=q6
-.PHONY: codegen
-codegen: all
-	@./$(CODEGEN_TARGET) $(SF) $(Q)
 
 # ---------------------------------------------------------------------------
 # Convenience per-scale-factor targets

@@ -32,3 +32,8 @@ temp_tpch/
 
 # Debug codegen output
 codegen_debug_*.metal
+
+# Codegen dependencies (moved to GPUDBMetalCodeGen)
+codegen/
+third_party/libpg_query/
+third_party/nlohmann/
