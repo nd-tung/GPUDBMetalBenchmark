@@ -26,7 +26,7 @@ kernel void q12_filter_and_count_stage1(
     const device int*   l_commitdate      [[buffer(3)]],
     const device int*   l_receiptdate     [[buffer(4)]],
     const device uint*  priority_bitmap   [[buffer(5)]],
-    device uint* partial_counts           [[buffer(6)]],  // 4 bins per TG
+    device atomic_uint* final_counts      [[buffer(6)]],
     constant uint& data_size              [[buffer(7)]],
     constant int&  receipt_start          [[buffer(8)]],
     constant int&  receipt_end            [[buffer(9)]],
@@ -35,9 +35,6 @@ kernel void q12_filter_and_count_stage1(
     uint threads_per_group  [[threads_per_threadgroup]],
     uint grid_size          [[threads_per_grid]])
 {
-    // 4 bins: 0=MAIL-HIGH, 1=MAIL-LOW, 2=SHIP-HIGH, 3=SHIP-LOW
-    uint local_counts[4] = {0, 0, 0, 0};
-
     for (uint i = (group_id * threads_per_group) + thread_id_in_group;
          i < data_size; i += grid_size) {
         char sm = l_shipmode[i];
@@ -52,15 +49,8 @@ kernel void q12_filter_and_count_stage1(
         if (l_shipdate[i] >= l_commitdate[i]) continue; // l_shipdate < l_commitdate
 
         bool is_high = bitmap_test(priority_bitmap, l_orderkey[i]);
-        local_counts[mode_idx + (is_high ? 0 : 1)] += 1;
-    }
-
-    threadgroup uint shared[32];
-    for (int b = 0; b < 4; b++) {
-        uint r = tg_reduce_uint(local_counts[b], thread_id_in_group, threads_per_group, shared);
-        if (thread_id_in_group == 0) {
-            partial_counts[group_id * 4 + b] = r;
-        }
+        uint bucket = (uint)(mode_idx + (is_high ? 0 : 1));
+        atomic_fetch_add_explicit(&final_counts[bucket], 1u, memory_order_relaxed);
     }
 }
 

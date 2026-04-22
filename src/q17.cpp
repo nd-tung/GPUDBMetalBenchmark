@@ -32,18 +32,28 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     auto pRevPipe = createPipeline(device, library, "q17_sum_revenue_kernel");
     if (!pStatsPipe || !pRevPipe) return;
 
+    auto chooseLaunch = [](MTL::ComputePipelineState* pso, uint rows) {
+        NS::UInteger tg = pso->maxTotalThreadsPerThreadgroup();
+        if (tg > 1024) tg = 1024;
+        if (tg == 0) tg = 256;
+        uint groups = (rows + (uint)tg - 1) / (uint)tg;
+        if (groups == 0) groups = 1;
+        if (groups > 65535) groups = 65535;
+        return std::make_pair(groups, tg);
+    };
+
     MTL::Buffer* pPartBitmapBuf = uploadBitmap(device, part_bm);
     MTL::Buffer* pLinePartKeyBuf = device->newBuffer(l_partkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pLineQtyBuf = device->newBuffer(l_quantity.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pSumQtyMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSumQtyMapBuf = device->newBuffer((size_t)mapSize * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pCountMapBuf = device->newBuffer((size_t)mapSize * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pThresholdMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pTotalRevenueBuf = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
-        memset(pSumQtyMapBuf->contents(), 0, (size_t)mapSize * sizeof(float));
+        memset(pSumQtyMapBuf->contents(), 0, (size_t)mapSize * sizeof(uint));
         memset(pCountMapBuf->contents(), 0, (size_t)mapSize * sizeof(uint));
         *(float*)pTotalRevenueBuf->contents() = 0.0f;
 
@@ -57,17 +67,19 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc1->setBuffer(pSumQtyMapBuf, 0, 3);
         enc1->setBuffer(pCountMapBuf, 0, 4);
         enc1->setBytes(&liSize, sizeof(liSize), 5);
-        enc1->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+        auto statsLaunch = chooseLaunch(pStatsPipe, liSize);
+        enc1->dispatchThreadgroups(MTL::Size(statsLaunch.first, 1, 1), MTL::Size(statsLaunch.second, 1, 1));
         enc1->endEncoding();
         cb1->commit(); cb1->waitUntilCompleted();
 
         // CPU: compute threshold = 0.2 * avg per partkey
-        float* sumQty = (float*)pSumQtyMapBuf->contents();
+        uint* sumQtyCents = (uint*)pSumQtyMapBuf->contents();
         uint* countQty = (uint*)pCountMapBuf->contents();
         float* threshold = (float*)pThresholdMapBuf->contents();
         for (uint pk = 0; pk < mapSize; pk++) {
             if (countQty[pk] > 0) {
-                threshold[pk] = 0.2f * (sumQty[pk] / (float)countQty[pk]);
+                float avgQty = ((float)sumQtyCents[pk] / 100.0f) / (float)countQty[pk];
+                threshold[pk] = 0.2f * avgQty;
             } else {
                 threshold[pk] = 0.0f;
             }
@@ -84,7 +96,8 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc2->setBuffer(pThresholdMapBuf, 0, 4);
         enc2->setBuffer(pTotalRevenueBuf, 0, 5);
         enc2->setBytes(&liSize, sizeof(liSize), 6);
-        enc2->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+        auto revLaunch = chooseLaunch(pRevPipe, liSize);
+        enc2->dispatchThreadgroups(MTL::Size(revLaunch.first, 1, 1), MTL::Size(revLaunch.second, 1, 1));
         enc2->endEncoding();
         cb2->commit(); cb2->waitUntilCompleted();
 
@@ -157,10 +170,20 @@ void runQ17BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     auto pRevPipe = createPipeline(device, library, "q17_sum_revenue_kernel");
     if (!pStatsPipe || !pRevPipe) return;
 
+    auto chooseLaunch = [](MTL::ComputePipelineState* pso, uint rows) {
+        NS::UInteger tg = pso->maxTotalThreadsPerThreadgroup();
+        if (tg > 1024) tg = 1024;
+        if (tg == 0) tg = 256;
+        uint groups = (rows + (uint)tg - 1) / (uint)tg;
+        if (groups == 0) groups = 1;
+        if (groups > 65535) groups = 65535;
+        return std::make_pair(groups, tg);
+    };
+
     MTL::Buffer* pPartBitmapBuf = device->newBuffer(part_bitmap.data(), part_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pSumQtyMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSumQtyMapBuf = device->newBuffer((size_t)mapSize * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pCountMapBuf = device->newBuffer((size_t)mapSize * sizeof(uint), MTL::ResourceStorageModeShared);
-    memset(pSumQtyMapBuf->contents(), 0, (size_t)mapSize * sizeof(float));
+    memset(pSumQtyMapBuf->contents(), 0, (size_t)mapSize * sizeof(uint));
     memset(pCountMapBuf->contents(), 0, (size_t)mapSize * sizeof(uint));
 
     // Pass 1: Stream lineitem for stats
@@ -191,7 +214,8 @@ void runQ17BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
             enc->setBuffer(pSumQtyMapBuf, 0, 3);
             enc->setBuffer(pCountMapBuf, 0, 4);
             enc->setBytes(&chunkSize, sizeof(chunkSize), 5);
-            enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+            auto statsLaunch = chooseLaunch(pStatsPipe, chunkSize);
+            enc->dispatchThreadgroups(MTL::Size(statsLaunch.first, 1, 1), MTL::Size(statsLaunch.second, 1, 1));
             enc->endEncoding();
             cmdBuf->commit();
         },
@@ -199,12 +223,17 @@ void runQ17BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
     );
 
     // CPU: compute thresholds
-    float* sumQty = (float*)pSumQtyMapBuf->contents();
+    uint* sumQtyCents = (uint*)pSumQtyMapBuf->contents();
     uint* countQty = (uint*)pCountMapBuf->contents();
     MTL::Buffer* pThresholdMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
     float* threshold = (float*)pThresholdMapBuf->contents();
     for (uint pk = 0; pk < mapSize; pk++) {
-        threshold[pk] = (countQty[pk] > 0) ? 0.2f * (sumQty[pk] / (float)countQty[pk]) : 0.0f;
+        if (countQty[pk] > 0) {
+            float avgQty = ((float)sumQtyCents[pk] / 100.0f) / (float)countQty[pk];
+            threshold[pk] = 0.2f * avgQty;
+        } else {
+            threshold[pk] = 0.0f;
+        }
     }
 
     // Pass 2: Stream lineitem for revenue
@@ -224,7 +253,8 @@ void runQ17BenchmarkSF100(MTL::Device* device, MTL::CommandQueue* commandQueue, 
             enc->setBuffer(pThresholdMapBuf, 0, 4);
             enc->setBuffer(pTotalRevenueBuf, 0, 5);
             enc->setBytes(&chunkSize, sizeof(chunkSize), 6);
-            enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+            auto revLaunch = chooseLaunch(pRevPipe, chunkSize);
+            enc->dispatchThreadgroups(MTL::Size(revLaunch.first, 1, 1), MTL::Size(revLaunch.second, 1, 1));
             enc->endEncoding();
             cmdBuf->commit();
         },

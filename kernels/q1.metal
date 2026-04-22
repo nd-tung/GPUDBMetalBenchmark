@@ -72,19 +72,18 @@ kernel void q1_fused_kernel(
 
     for (uint i = (group_id * threads_per_group) + thread_id_in_group; i < data_size; i += grid_size) {
         if (l_shipdate[i] > cutoff_date) continue;
-        int rfi = q1_rf_index(l_returnflag[i]); if (rfi < 0) continue;
-        int lsi = q1_ls_index(l_linestatus[i]); if (lsi < 0) continue;
-        int bin = rfi * 2 + lsi;
+        int bin = ((l_returnflag[i] == 'A' ? 0 : (l_returnflag[i] == 'N' ? 2 : 4))
+               + (l_linestatus[i] == 'F' ? 0 : 1));
 
         float base = l_extendedprice[i];
         float qty  = l_quantity[i];
         float d    = l_discount[i];
         float t    = l_tax[i];
 
-        long base_c = (long)floor(base * 100.0f + 0.5f);
-        long qty_c  = (long)floor(qty  * 100.0f + 0.5f);
-        int  d_bp   = (int)floor(d * 100.0f + 0.5f);
-        int  t_bp   = (int)floor(t * 100.0f + 0.5f);
+        long base_c = (long)((uint)(base * 100.0f));
+        long qty_c  = (long)((uint)(qty  * 100.0f));
+        uint d_bp   = (uint)(d * 100.0f);
+        uint t_bp   = (uint)(t * 100.0f);
         long disc_c   = (base_c * (long)(100 - d_bp) + 50) / 100;
         long charge_c = (disc_c * (long)(100 + t_bp) + 50) / 100;
 
@@ -100,23 +99,23 @@ kernel void q1_fused_kernel(
     for (int b = 0; b < BINS; ++b) {
         long r;
         r = tg_reduce_long(sum_qty_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_qty_lo[b], &out_qty_hi[b], r);
+        if (thread_id_in_group == 0 && r != 0) atomic_add_long_pair(&out_qty_lo[b], &out_qty_hi[b], r);
 
         r = tg_reduce_long(sum_base_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_base_lo[b], &out_base_hi[b], r);
+        if (thread_id_in_group == 0 && r != 0) atomic_add_long_pair(&out_base_lo[b], &out_base_hi[b], r);
 
         r = tg_reduce_long(sum_disc_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_disc_lo[b], &out_disc_hi[b], r);
+        if (thread_id_in_group == 0 && r != 0) atomic_add_long_pair(&out_disc_lo[b], &out_disc_hi[b], r);
 
         r = tg_reduce_long(sum_charge_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_charge_lo[b], &out_charge_hi[b], r);
+        if (thread_id_in_group == 0 && r != 0) atomic_add_long_pair(&out_charge_lo[b], &out_charge_hi[b], r);
 
         uint u;
         u = tg_reduce_uint(sum_disc_bp[b], thread_id_in_group, threads_per_group, tg32);
-        if (thread_id_in_group == 0) atomic_fetch_add_explicit(&out_discount_bp[b], u, memory_order_relaxed);
+        if (thread_id_in_group == 0 && u != 0u) atomic_fetch_add_explicit(&out_discount_bp[b], u, memory_order_relaxed);
 
         u = tg_reduce_uint(cnt[b], thread_id_in_group, threads_per_group, tg32);
-        if (thread_id_in_group == 0) atomic_fetch_add_explicit(&out_count[b], u, memory_order_relaxed);
+        if (thread_id_in_group == 0 && u != 0u) atomic_fetch_add_explicit(&out_count[b], u, memory_order_relaxed);
     }
 }
 
@@ -154,20 +153,16 @@ kernel void q1_chunked_stage1(
         sum_disc_bp[b]=0u; cnt[b]=0u;
     }
 
-    auto rf_index = [](char rf) -> int { return (rf=='A')?0:(rf=='N')?1:(rf=='R')?2:-1; };
-    auto ls_index = [](char ls) -> int { return (ls=='F')?0:(ls=='O')?1:-1; };
-
     for (uint i = (group_id * threads_per_group) + thread_id_in_group;
          i < chunk_size; i += grid_size) {
         if (l_shipdate[i] > cutoff_date) continue;
-        int rfi = rf_index(l_returnflag[i]); if (rfi < 0) continue;
-        int lsi = ls_index(l_linestatus[i]); if (lsi < 0) continue;
-        int bin = rfi * 2 + lsi;
+        int bin = ((l_returnflag[i] == 'A' ? 0 : (l_returnflag[i] == 'N' ? 2 : 4))
+               + (l_linestatus[i] == 'F' ? 0 : 1));
         float base = l_extendedprice[i], qty = l_quantity[i], d = l_discount[i], t = l_tax[i];
-        long base_c = (long)floor(base * 100.0f + 0.5f);
-        long qty_c  = (long)floor(qty  * 100.0f + 0.5f);
-        int  d_bp   = (int)floor(d * 100.0f + 0.5f);
-        int  t_bp   = (int)floor(t * 100.0f + 0.5f);
+        long base_c = (long)((uint)(base * 100.0f));
+        long qty_c  = (long)((uint)(qty  * 100.0f));
+        uint d_bp   = (uint)(d * 100.0f);
+        uint t_bp   = (uint)(t * 100.0f);
         long disc_c   = (base_c * (long)(100 - d_bp) + 50) / 100;
         long charge_c = (disc_c * (long)(100 + t_bp) + 50) / 100;
         sum_qty_c[bin] += qty_c; sum_base_c[bin] += base_c;

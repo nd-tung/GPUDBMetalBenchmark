@@ -29,8 +29,7 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 
     auto bitmapPSO = createPipeline(device, library, "q12_build_priority_bitmap");
     auto s1PSO = createPipeline(device, library, "q12_filter_and_count_stage1");
-    auto s2PSO = createPipeline(device, library, "q12_final_count_stage2");
-    if (!bitmapPSO || !s1PSO || !s2PSO) return;
+    if (!bitmapPSO || !s1PSO) return;
 
     int max_orderkey = 0;
     for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
@@ -47,12 +46,12 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     MTL::Buffer* shipdateBuf   = device->newBuffer(l_shipdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* commitdateBuf = device->newBuffer(l_commitdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* receiptBuf    = device->newBuffer(l_receiptdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* partialBuf    = device->newBuffer(numTG * 4 * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* finalBuf      = device->newBuffer(4 * sizeof(uint), MTL::ResourceStorageModeShared);
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
         memset(bitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
+        memset(finalBuf->contents(), 0, 4 * sizeof(uint));
 
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
@@ -80,21 +79,13 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc->setBuffer(commitdateBuf, 0, 3);
         enc->setBuffer(receiptBuf, 0, 4);
         enc->setBuffer(bitmapBuf, 0, 5);
-        enc->setBuffer(partialBuf, 0, 6);
+        enc->setBuffer(finalBuf, 0, 6);
         enc->setBytes(&dataSize, sizeof(dataSize), 7);
         enc->setBytes(&receipt_start, sizeof(receipt_start), 8);
         enc->setBytes(&receipt_end, sizeof(receipt_end), 9);
         NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
         if (tgSize > 1024) tgSize = 1024;
         enc->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1), MTL::Size::Make(tgSize, 1, 1));
-
-        enc->memoryBarrier(MTL::BarrierScopeBuffers);
-        const uint numTGs = numTG;
-        enc->setComputePipelineState(s2PSO);
-        enc->setBuffer(partialBuf, 0, 0);
-        enc->setBuffer(finalBuf, 0, 1);
-        enc->setBytes(&numTGs, sizeof(numTGs), 2);
-        enc->dispatchThreads(MTL::Size::Make(1,1,1), MTL::Size::Make(1,1,1));
         enc->endEncoding();
 
         cb->commit();
@@ -119,8 +110,8 @@ void runQ12Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ12 | %u rows\n", dataSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(bitmapPSO, s1PSO, s2PSO, ordKeyBuf, ordPrioBuf, orderkeyBuf, shipmodeBuf, shipdateBuf,
-               commitdateBuf, receiptBuf, bitmapBuf, partialBuf, finalBuf);
+    releaseAll(bitmapPSO, s1PSO, ordKeyBuf, ordPrioBuf, orderkeyBuf, shipmodeBuf, shipdateBuf,
+               commitdateBuf, receiptBuf, bitmapBuf, finalBuf);
 }
 
 // --- SF100 Chunked ---
