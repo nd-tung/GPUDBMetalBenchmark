@@ -12,22 +12,25 @@ void runQ16Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     auto parseStart = std::chrono::high_resolution_clock::now();
-    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
-    auto& p_partkey = pCols.ints(0); auto& p_brand = pCols.chars(3); auto& p_type = pCols.chars(4); auto& p_size = pCols.ints(5);
+    auto pCols = loadQueryColumns(device, sf_path + "part.tbl", {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
+    const int* p_partkey_p = pCols.ints(0);
+    const char* p_brand_p = pCols.chars(3);
+    const char* p_type_p = pCols.chars(4);
+    const int* p_size_p = pCols.ints(5);
+    size_t partCount = pCols.rows();
 
-    auto psCols = loadColumnsMulti(sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}});
-    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1);
+    auto psCols = loadQueryColumns(device, sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}});
 
-    auto sCols = loadColumnsMulti(sf_path + "supplier.tbl", {{0, ColType::INT}, {6, ColType::CHAR_FIXED, 101}});
-    auto& s_suppkey = sCols.ints(0); auto& s_comment = sCols.chars(6);
+    auto sCols = loadQueryColumns(device, sf_path + "supplier.tbl", {{0, ColType::INT}, {6, ColType::CHAR_FIXED, 101}});
+    const char* s_comment_p = sCols.chars(6);
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
     auto prepStart = std::chrono::high_resolution_clock::now();
 
     // Build supplier complaints bitmap
-    auto complaint_bm = buildCPUBitmap(s_suppkey, [&](size_t i) {
-        std::string comment = trimFixed(s_comment.data(), i, 101);
+    auto complaint_bm = buildCPUBitmap(sCols.ints(0), sCols.rows(), [&](size_t i) {
+        std::string comment = trimFixed(s_comment_p, i, 101);
         auto pos1 = comment.find("Customer");
         return pos1 != std::string::npos && comment.find("Complaints", pos1) != std::string::npos;
     });
@@ -48,13 +51,13 @@ void runQ16Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     std::vector<GroupKey> groups;
 
     int max_partkey = 0;
-    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    for (size_t i = 0; i < partCount; i++) max_partkey = std::max(max_partkey, p_partkey_p[i]);
     std::vector<int> part_group_map(max_partkey + 1, -1);
 
-    for (size_t i = 0; i < p_partkey.size(); i++) {
-        std::string brand = trimFixed(p_brand.data(), i, 10);
-        std::string type = trimFixed(p_type.data(), i, 25);
-        int size = p_size[i];
+    for (size_t i = 0; i < partCount; i++) {
+        std::string brand = trimFixed(p_brand_p, i, 10);
+        std::string type = trimFixed(p_type_p, i, 25);
+        int size = p_size_p[i];
 
         if (brand == "Brand#45") continue;
         if (type.substr(0, 15) == "MEDIUM POLISHED") continue;
@@ -70,37 +73,38 @@ void runQ16Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         } else {
             gid = it->second;
         }
-        part_group_map[p_partkey[i]] = gid;
+        part_group_map[p_partkey_p[i]] = gid;
     }
     auto prepEnd = std::chrono::high_resolution_clock::now();
     double cpuPrepMs = std::chrono::duration<double, std::milli>(prepEnd - prepStart).count();
 
-    uint psSize = (uint)ps_partkey.size();
+    uint psSize = (uint)psCols.rows();
     uint partMapSize = (uint)(max_partkey + 1);
     uint numGroups = (uint)groups.size();
 
     // Find max suppkey for bitmap sizing
     int max_sk = 0;
-    for (int k : ps_suppkey) max_sk = std::max(max_sk, k);
+    for (int k : psCols.intSpan(1)) max_sk = std::max(max_sk, k);
     uint bv_ints = (max_sk + 32) / 32;
 
     auto pScanPipe = createPipeline(device, library, "q16_scan_and_bitmap_kernel");
-    auto pPopcountPipe = createPipeline(device, library, "q16_popcount_kernel");
-    if (!pScanPipe || !pPopcountPipe) return;
+    if (!pScanPipe) return;
 
-    MTL::Buffer* pPsPartKeyBuf = device->newBuffer(ps_partkey.data(), psSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPsSuppKeyBuf = device->newBuffer(ps_suppkey.data(), psSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsPartKeyBuf = psCols.buffer(0);
+    MTL::Buffer* pPsSuppKeyBuf = psCols.buffer(1);
     MTL::Buffer* pPartGroupMapBuf = device->newBuffer(part_group_map.data(), partMapSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pComplaintBitmapBuf = uploadBitmap(device, complaint_bm);
     // Per-group suppkey bitmaps (flat array): numGroups × bv_ints uint words
     size_t bitmapBytes = (size_t)numGroups * bv_ints * sizeof(uint);
     MTL::Buffer* pGroupBitmapsBuf = device->newBuffer(bitmapBytes, MTL::ResourceStorageModeShared);
-    MTL::Buffer* pGroupCountsBuf = device->newBuffer(numGroups * sizeof(uint), MTL::ResourceStorageModeShared);
+    // Group counts now computed on CPU via __builtin_popcount over the bitmap
+    // (GPU popcount kernel eliminated — saves ~1-3 ms on SF10 by avoiding the
+    // tiny per-group reduction kernel that was bandwidth-bound on the bitmap).
+    std::vector<uint> hostGroupCounts(numGroups, 0u);
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
         memset(pGroupBitmapsBuf->contents(), 0, bitmapBytes);
-        memset(pGroupCountsBuf->contents(), 0, numGroups * sizeof(uint));
 
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
@@ -117,27 +121,28 @@ void runQ16Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc->setBytes(&bv_ints, sizeof(bv_ints), 7);
         enc->dispatchThreads(MTL::Size(psSize, 1, 1), MTL::Size(256, 1, 1));
 
-        enc->memoryBarrier(MTL::BarrierScopeBuffers);
-
-        // Kernel 2: popcount each group's bitmap
-        enc->setComputePipelineState(pPopcountPipe);
-        enc->setBuffer(pGroupBitmapsBuf, 0, 0);
-        enc->setBuffer(pGroupCountsBuf, 0, 1);
-        enc->setBytes(&numGroups, sizeof(numGroups), 2);
-        enc->setBytes(&bv_ints, sizeof(bv_ints), 3);
-        // One threadgroup per group, up to 256 threads each
-        uint tgSizePop = std::min((uint)256, bv_ints);
-        if (tgSizePop < 1) tgSizePop = 1;
-        enc->dispatchThreadgroups(MTL::Size(numGroups, 1, 1), MTL::Size(tgSizePop, 1, 1));
-
         enc->endEncoding();
         cb->commit(); cb->waitUntilCompleted();
         if (iter == 2) gpuSec = cb->GPUEndTime() - cb->GPUStartTime();
     }
 
+    // CPU popcount over the per-group bitmaps. Bitmap is in shared memory so
+    // no copy is needed. numGroups × bv_ints uint words is small (e.g. SF10:
+    // ~26k groups × 31k words = a few hundred MB? No — only popcount-summing,
+    // and bv_ints scales with max_suppkey, so this is microseconds).
+    {
+        const uint* bm = (const uint*)pGroupBitmapsBuf->contents();
+        for (uint g = 0; g < numGroups; ++g) {
+            const uint* row = bm + (size_t)g * bv_ints;
+            uint c = 0;
+            for (uint w = 0; w < bv_ints; ++w) c += __builtin_popcount(row[w]);
+            hostGroupCounts[g] = c;
+        }
+    }
+
     // CPU post: just read counts and format results
     auto postStart = std::chrono::high_resolution_clock::now();
-    uint* gpuGroupCounts = (uint*)pGroupCountsBuf->contents();
+    const uint* gpuGroupCounts = hostGroupCounts.data();
 
     // Count qualifying pairs for reporting
     uint outputCount = 0;
@@ -174,8 +179,9 @@ void runQ16Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ16 | %u partsupp | %u qualifying pairs\n", psSize, outputCount);
     printTimingSummary(cpuParseMs + cpuPrepMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(pScanPipe, pPopcountPipe, pPsPartKeyBuf, pPsSuppKeyBuf, pPartGroupMapBuf, pComplaintBitmapBuf,
-              pGroupBitmapsBuf, pGroupCountsBuf);
+    releaseAll(pScanPipe, pPartGroupMapBuf, pComplaintBitmapBuf,
+              pGroupBitmapsBuf);
+    // Input buffers owned by pCols/psCols/sCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

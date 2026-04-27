@@ -13,15 +13,10 @@ void runQ7Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     auto s = loadSupplierBasic(sf_path);
     auto& s_suppkey = s.suppkey;
     auto& s_nationkey = s.nationkey;
-    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
-    auto& c_custkey = cCols.ints(0); auto& c_nationkey = cCols.ints(3);
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}});
-    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1);
+    auto cCols = loadQueryColumns(device, sf_path + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
+    auto oCols = loadQueryColumns(device, sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
-    auto& l_orderkey = lCols.ints(0); auto& l_suppkey = lCols.ints(2);
-    auto& l_shipdate = lCols.ints(10);
-    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
 
     auto nat = loadNation(sf_path);
     auto parseEnd = std::chrono::high_resolution_clock::now();
@@ -36,14 +31,14 @@ void runQ7Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     }
 
     uint suppSize = (uint)s_suppkey.size();
-    uint custSize = (uint)c_custkey.size();
-    uint ordSize = (uint)o_orderkey.size();
-    uint liSize = (uint)l_orderkey.size();
+    uint custSize = (uint)cCols.rows();
+    uint ordSize = (uint)oCols.rows();
+    uint liSize = (uint)lCols.rows();
 
     int max_suppkey = 0, max_custkey = 0, max_orderkey = 0;
     for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
-    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : cCols.intSpan(0)) max_custkey = std::max(max_custkey, k);
+    for (int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     uint supp_map_size = max_suppkey + 1;
     uint cust_map_size = max_custkey + 1;
     uint ord_map_size = max_orderkey + 1;
@@ -58,19 +53,19 @@ void runQ7Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     MTL::Buffer* pSuppNationBuf = device->newBuffer(s_nationkey.data(), suppSize * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pSuppNationMapBuf = device->newBuffer(supp_map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pCustKeyBuf = device->newBuffer(c_custkey.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pCustNationBuf = device->newBuffer(c_nationkey.data(), custSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCustKeyBuf = cCols.buffer(0);
+    MTL::Buffer* pCustNationBuf = cCols.buffer(3);
     MTL::Buffer* pCustNationMapBuf = device->newBuffer(cust_map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCustBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdKeyBuf = oCols.buffer(0);
+    MTL::Buffer* pOrdCustBuf = oCols.buffer(1);
     MTL::Buffer* pOrdMapBuf = device->newBuffer((size_t)ord_map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineSuppKeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineShipDateBuf = device->newBuffer(l_shipdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineDiscBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineOrdKeyBuf = lCols.buffer(0);
+    MTL::Buffer* pLineSuppKeyBuf = lCols.buffer(2);
+    MTL::Buffer* pLineShipDateBuf = lCols.buffer(10);
+    MTL::Buffer* pLinePriceBuf = lCols.buffer(5);
+    MTL::Buffer* pLineDiscBuf = lCols.buffer(6);
 
     MTL::Buffer* pRevenueBinsBuf = device->newBuffer(4 * sizeof(float), MTL::ResourceStorageModeShared);
 
@@ -155,10 +150,10 @@ void runQ7Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     releaseAll(pSuppMapPipe, pCustMapPipe, pOrdMapPipe, pProbePipe,
               pSuppKeyBuf, pSuppNationBuf, pSuppNationMapBuf,
-              pCustKeyBuf, pCustNationBuf, pCustNationMapBuf,
-              pOrdKeyBuf, pOrdCustBuf, pOrdMapBuf,
-              pLineOrdKeyBuf, pLineSuppKeyBuf, pLineShipDateBuf, pLinePriceBuf, pLineDiscBuf,
+              pCustNationMapBuf,
+              pOrdMapBuf,
               pRevenueBinsBuf);
+    // Input buffers owned by cCols/oCols/lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

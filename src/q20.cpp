@@ -18,17 +18,19 @@ void runQ20Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     auto parseStart = std::chrono::high_resolution_clock::now();
-    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}});
-    auto& p_partkey = pCols.ints(0); auto& p_name = pCols.chars(1);
+    auto pCols = loadQueryColumns(device, sf_path + "part.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 55}});
+    const char* p_name_p = pCols.chars(1);
 
-    auto sCols = loadColumnsMulti(sf_path + "supplier.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {3, ColType::INT}});
-    auto& s_suppkey = sCols.ints(0); auto& s_name = sCols.chars(1); auto& s_address = sCols.chars(2); auto& s_nationkey = sCols.ints(3);
+    auto sCols = loadQueryColumns(device, sf_path + "supplier.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {3, ColType::INT}});
+    const int* s_suppkey_p = sCols.ints(0);
+    const char* s_name_p = sCols.chars(1);
+    const char* s_address_p = sCols.chars(2);
+    const int* s_nationkey_p = sCols.ints(3);
+    size_t suppCount = sCols.rows();
 
-    auto psCols = loadColumnsMulti(sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}});
-    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1); auto& ps_availqty = psCols.ints(2);
+    auto psCols = loadQueryColumns(device, sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{1, ColType::INT}, {2, ColType::INT}, {4, ColType::FLOAT}, {10, ColType::DATE}});
-    auto& l_partkey = lCols.ints(1); auto& l_suppkey = lCols.ints(2); auto& l_quantity = lCols.floats(4); auto& l_shipdate = lCols.ints(10);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{1, ColType::INT}, {2, ColType::INT}, {4, ColType::FLOAT}, {10, ColType::DATE}});
 
     auto nat = loadNation(sf_path);
     auto parseEnd = std::chrono::high_resolution_clock::now();
@@ -38,11 +40,11 @@ void runQ20Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     int canada_nk = findNationKey(nat, "CANADA");
 
     // Build part bitmap: p_name LIKE 'forest%'
-    auto part_bm = buildCPUBitmap(p_partkey, [&](size_t i) {
-        return trimFixed(p_name.data(), i, 55).substr(0, 6) == "forest";
+    auto part_bm = buildCPUBitmap(pCols.ints(0), pCols.rows(), [&](size_t i) {
+        return trimFixed(p_name_p, i, 55).substr(0, 6) == "forest";
     });
 
-    uint liSize = (uint)l_partkey.size();
+    uint liSize = (uint)lCols.rows();
     // Hash table sized for ~10% of lineitem qualifying
     uint htCapacity = nextPow2(std::max(liSize / 4, 1024u));
     uint htMask = htCapacity - 1;
@@ -55,27 +57,27 @@ void runQ20Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 
     // Build CANADA supplier bitmap before GPU dispatch (needed as GPU input)
     int max_sk = 0;
-    for (size_t i = 0; i < s_suppkey.size(); i++) max_sk = std::max(max_sk, s_suppkey[i]);
+    for (size_t i = 0; i < suppCount; i++) max_sk = std::max(max_sk, s_suppkey_p[i]);
     uint canada_bv_ints = (max_sk + 32) / 32;
     std::vector<uint> canada_bm(canada_bv_ints, 0);
-    for (size_t i = 0; i < s_suppkey.size(); i++) {
-        if (s_nationkey[i] == canada_nk) {
-            int sk = s_suppkey[i];
+    for (size_t i = 0; i < suppCount; i++) {
+        if (s_nationkey_p[i] == canada_nk) {
+            int sk = s_suppkey_p[i];
             canada_bm[sk / 32] |= (1u << (sk % 32));
         }
     }
 
-    uint psSize = (uint)ps_partkey.size();
+    uint psSize = (uint)psCols.rows();
 
-    MTL::Buffer* pLinePartKeyBuf = device->newBuffer(l_partkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineSuppKeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineQtyBuf = device->newBuffer(l_quantity.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineDateBuf = device->newBuffer(l_shipdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLinePartKeyBuf = lCols.buffer(1);
+    MTL::Buffer* pLineSuppKeyBuf = lCols.buffer(2);
+    MTL::Buffer* pLineQtyBuf = lCols.buffer(4);
+    MTL::Buffer* pLineDateBuf = lCols.buffer(10);
     MTL::Buffer* pPartBitmapBuf = uploadBitmap(device, part_bm);
     MTL::Buffer* pHTBuf = device->newBuffer((size_t)htCapacity * sizeof(Q20HTEntry_CPU), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPSPartKeyBuf = device->newBuffer(ps_partkey.data(), psSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPSSuppKeyBuf = device->newBuffer(ps_suppkey.data(), psSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPSAvailQtyBuf = device->newBuffer(ps_availqty.data(), psSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPSPartKeyBuf = psCols.buffer(0);
+    MTL::Buffer* pPSSuppKeyBuf = psCols.buffer(1);
+    MTL::Buffer* pPSAvailQtyBuf = psCols.buffer(2);
     MTL::Buffer* pCanadaBmBuf = device->newBuffer(canada_bm.data(), canada_bv_ints * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pQualBmBuf = device->newBuffer(canada_bv_ints * sizeof(uint), MTL::ResourceStorageModeShared);
 
@@ -131,10 +133,10 @@ void runQ20Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 
     struct Q20Result { std::string s_name; std::string s_address; };
     std::vector<Q20Result> results;
-    for (size_t i = 0; i < s_suppkey.size(); i++) {
-        int sk = s_suppkey[i];
+    for (size_t i = 0; i < suppCount; i++) {
+        int sk = s_suppkey_p[i];
         if (sk >= 0 && (uint)sk <= (uint)max_sk && ((qual_bm[sk / 32] >> (sk % 32)) & 1)) {
-            results.push_back({trimFixed(s_name.data(), i, 25), trimFixed(s_address.data(), i, 40)});
+            results.push_back({trimFixed(s_name_p, i, 25), trimFixed(s_address_p, i, 40)});
         }
     }
     std::sort(results.begin(), results.end(), [](const Q20Result& a, const Q20Result& b) {
@@ -157,9 +159,10 @@ void runQ20Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ20 | %u lineitem\n", liSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(pAggPipe, pProbePipe, pLinePartKeyBuf, pLineSuppKeyBuf, pLineQtyBuf, pLineDateBuf,
-              pPartBitmapBuf, pHTBuf, pPSPartKeyBuf, pPSSuppKeyBuf, pPSAvailQtyBuf,
+    releaseAll(pAggPipe, pProbePipe,
+              pPartBitmapBuf, pHTBuf,
               pCanadaBmBuf, pQualBmBuf);
+    // Input buffers owned by pCols/sCols/psCols/lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

@@ -10,15 +10,11 @@ void runQ21Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     auto parseStart = std::chrono::high_resolution_clock::now();
-    auto sCols = loadColumnsMulti(sf_path + "supplier.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {3, ColType::INT}});
-    auto& s_suppkey = sCols.ints(0); auto& s_name = sCols.chars(1); auto& s_nationkey = sCols.ints(3);
+    auto sCols = loadQueryColumns(device, sf_path + "supplier.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {3, ColType::INT}});
 
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {2, ColType::CHAR1}});
-    auto& o_orderkey = oCols.ints(0); auto& o_orderstatus = oCols.chars(2);
+    auto oCols = loadQueryColumns(device, sf_path + "orders.tbl", {{0, ColType::INT}, {2, ColType::CHAR1}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {11, ColType::DATE}, {12, ColType::DATE}});
-    auto& l_orderkey = lCols.ints(0); auto& l_suppkey = lCols.ints(2);
-    auto& l_commitdate = lCols.ints(11); auto& l_receiptdate = lCols.ints(12);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {11, ColType::DATE}, {12, ColType::DATE}});
 
     auto nat = loadNation(sf_path);
     auto parseEnd = std::chrono::high_resolution_clock::now();
@@ -27,29 +23,34 @@ void runQ21Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     int sa_nk = findNationKey(nat, "SAUDI ARABIA");
 
     // Build SAUDI ARABIA supplier bitmap
-    auto sa_bm = buildCPUBitmap(s_suppkey, [&](size_t i) { return s_nationkey[i] == sa_nk; });
+    const int* s_suppkey = sCols.ints(0);
+    const int* s_nationkey = sCols.ints(3);
+    const char* s_name = sCols.chars(1);
+    auto sa_bm = buildCPUBitmap(s_suppkey, sCols.rows(), [&](size_t i) { return s_nationkey[i] == sa_nk; });
     int max_suppkey = sa_bm.max_key;
 
     // Build orders status map: orderkey → 1 if 'F', -1 otherwise
     int max_orderkey = 0;
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     uint map_size = max_orderkey + 1;
     std::vector<int> orders_status_map(map_size, -1);
-    for (size_t i = 0; i < o_orderkey.size(); i++) {
+    const int* o_orderkey = oCols.ints(0);
+    const char* o_orderstatus = oCols.chars(2);
+    for (size_t i = 0; i < oCols.rows(); i++) {
         if (o_orderstatus[i] == 'F') orders_status_map[o_orderkey[i]] = 1;
     }
 
-    uint liSize = (uint)l_orderkey.size();
+    uint liSize = (uint)lCols.rows();
     uint bitmapInts = (map_size + 31) / 32 + 1;
 
     auto pBuildPipe = createPipeline(device, library, "q21_build_order_tracking_kernel");
     auto pCountPipe = createPipeline(device, library, "q21_count_qualifying_kernel");
     if (!pBuildPipe || !pCountPipe) return;
 
-    MTL::Buffer* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineSuppKeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineReceiptBuf = device->newBuffer(l_receiptdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineCommitBuf = device->newBuffer(l_commitdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineOrdKeyBuf = lCols.buffer(0);
+    MTL::Buffer* pLineSuppKeyBuf = lCols.buffer(2);
+    MTL::Buffer* pLineReceiptBuf = lCols.buffer(12);
+    MTL::Buffer* pLineCommitBuf = lCols.buffer(11);
     MTL::Buffer* pOrderStatusMapBuf = device->newBuffer(orders_status_map.data(), map_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pFirstSuppBuf = device->newBuffer((size_t)map_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pMultiSuppBmBuf = device->newBuffer((size_t)bitmapInts * sizeof(uint), MTL::ResourceStorageModeShared);
@@ -82,7 +83,8 @@ void runQ21Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc->setBuffer(pMultiLateBmBuf, 0, 8);
         enc->setBytes(&liSize, sizeof(liSize), 9);
         enc->setBytes(&map_size, sizeof(map_size), 10);
-        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+        const uint q21Pass1TGs = std::min(2048u, (liSize + 1023u) / 1024u);
+        enc->dispatchThreadgroups(MTL::Size(q21Pass1TGs, 1, 1), MTL::Size(1024, 1, 1));
 
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
@@ -101,7 +103,8 @@ void runQ21Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc->setBuffer(pSuppCountBuf, 0, 10);
         enc->setBytes(&liSize, sizeof(liSize), 11);
         enc->setBytes(&map_size, sizeof(map_size), 12);
-        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+        const uint q21Pass2TGs = std::min(2048u, (liSize + 1023u) / 1024u);
+        enc->dispatchThreadgroups(MTL::Size(q21Pass2TGs, 1, 1), MTL::Size(1024, 1, 1));
 
         enc->endEncoding();
         cb->commit(); cb->waitUntilCompleted();
@@ -116,11 +119,11 @@ void runQ21Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 
     // Build suppkey→name index
     std::vector<int> supp_idx(max_suppkey + 1, -1);
-    for (size_t i = 0; i < s_suppkey.size(); i++) supp_idx[s_suppkey[i]] = (int)i;
+    for (size_t i = 0; i < sCols.rows(); i++) supp_idx[s_suppkey[i]] = (int)i;
 
     for (int sk = 0; sk <= max_suppkey; sk++) {
         if (suppCounts[sk] > 0 && supp_idx[sk] >= 0) {
-            results.push_back({trimFixed(s_name.data(), supp_idx[sk], 25), suppCounts[sk]});
+            results.push_back({trimFixed(s_name, supp_idx[sk], 25), suppCounts[sk]});
         }
     }
 
@@ -147,9 +150,10 @@ void runQ21Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ21 | %u lineitem\n", liSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(pBuildPipe, pCountPipe, pLineOrdKeyBuf, pLineSuppKeyBuf, pLineReceiptBuf,
-              pLineCommitBuf, pOrderStatusMapBuf, pFirstSuppBuf, pMultiSuppBmBuf,
+    releaseAll(pBuildPipe, pCountPipe,
+              pOrderStatusMapBuf, pFirstSuppBuf, pMultiSuppBmBuf,
               pLateSuppBuf, pMultiLateBmBuf, pSaBitmapBuf, pSuppCountBuf);
+    // Input buffers owned by lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

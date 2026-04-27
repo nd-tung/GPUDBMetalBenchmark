@@ -76,6 +76,38 @@ clean:
 	@echo "Clean complete"
 
 # ---------------------------------------------------------------------------
+# tbl_to_colbin tool — converts .tbl files to the shared .colbin columnar
+# format (byte-compatible with GPUDBMetalCodeGen). Run once per scale factor
+# to eliminate the one-time text-parse cost from all subsequent benchmarks.
+# ---------------------------------------------------------------------------
+.PHONY: tools colbin-sf1 colbin-sf10 colbin-sf50 colbin-sf100 clean-colbin
+
+TBL2COLBIN_SRC = tools/tbl_to_colbin.cpp
+TBL2COLBIN_OBJ = $(OBJ_DIR)/tbl_to_colbin.o
+TBL2COLBIN     = $(BIN_DIR)/tbl_to_colbin
+
+tools: $(TBL2COLBIN)
+
+$(TBL2COLBIN_OBJ): $(TBL2COLBIN_SRC) $(SOURCE_DIR)/infra.h | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(TBL2COLBIN): $(TBL2COLBIN_OBJ) | $(BIN_DIR)
+	@echo "Linking tbl_to_colbin..."
+	$(CXX) $(TBL2COLBIN_OBJ) $(FRAMEWORKS) -o $@
+	@echo "Build complete: $@"
+
+colbin-sf1:   $(TBL2COLBIN) ; ./$(TBL2COLBIN) $(DATA_DIR)/SF-1
+colbin-sf10:  $(TBL2COLBIN) ; ./$(TBL2COLBIN) $(DATA_DIR)/SF-10
+colbin-sf50:  $(TBL2COLBIN) ; ./$(TBL2COLBIN) $(DATA_DIR)/SF-50
+colbin-sf100: $(TBL2COLBIN) ; ./$(TBL2COLBIN) $(DATA_DIR)/SF-100
+
+clean-colbin:
+	@echo "Removing .colbin files under $(DATA_DIR)/..."
+	@find $(DATA_DIR) -maxdepth 2 -name '*.colbin*' -delete 2>/dev/null || true
+	@echo "Done."
+
+# ---------------------------------------------------------------------------
 # Run  —  make run  /  make run SF=sf100  /  make run SF=sf10 Q=q1
 # ---------------------------------------------------------------------------
 .PHONY: run

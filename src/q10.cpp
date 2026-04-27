@@ -10,34 +10,32 @@ void runQ10Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     auto parseStart = std::chrono::high_resolution_clock::now();
-    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {
+    auto cCols = loadQueryColumns(device, sf_path + "customer.tbl", {
         {0, ColType::INT}, {1, ColType::CHAR_FIXED, 18}, {2, ColType::CHAR_FIXED, 40},
         {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT}, {7, ColType::CHAR_FIXED, 117}
     });
-    auto& c_custkey = cCols.ints(0); auto& c_name = cCols.chars(1); auto& c_address = cCols.chars(2);
-    auto& c_nationkey = cCols.ints(3); auto& c_phone = cCols.chars(4); auto& c_acctbal = cCols.floats(5);
-    auto& c_comment = cCols.chars(7);
+    const int* c_custkey_p = cCols.ints(0);
+    const char* c_name_p = cCols.chars(1);
+    const int* c_nationkey_p = cCols.ints(3);
+    const float* c_acctbal_p = cCols.floats(5);
+    size_t custCount = cCols.rows();
 
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
-    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1); auto& o_orderdate = oCols.ints(4);
+    auto oCols = loadQueryColumns(device, sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {8, ColType::CHAR1}});
-    auto& l_orderkey = lCols.ints(0); auto& l_extendedprice = lCols.floats(5);
-    auto& l_discount = lCols.floats(6); auto& l_returnflag = lCols.chars(8);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{0, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {8, ColType::CHAR1}});
 
-    auto nCols = loadColumnsMulti(sf_path + "nation.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-    auto& n_nationkey = nCols.ints(0); auto& n_name = nCols.chars(1);
+    auto nCols = loadQueryColumns(device, sf_path + "nation.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
-    uint ordSize = (uint)o_orderkey.size();
-    uint liSize = (uint)l_orderkey.size();
+    uint ordSize = (uint)oCols.rows();
+    uint liSize = (uint)lCols.rows();
 
     // Build custkey → row index and nation names
     int max_custkey = 0;
-    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    for (size_t i = 0; i < custCount; i++) max_custkey = std::max(max_custkey, c_custkey_p[i]);
     std::vector<size_t> cust_index(max_custkey + 1, SIZE_MAX);
-    for (size_t i = 0; i < c_custkey.size(); i++) cust_index[c_custkey[i]] = i;
+    for (size_t i = 0; i < custCount; i++) cust_index[c_custkey_p[i]] = i;
 
     auto nat = loadNation(sf_path);
     auto nation_names = buildNationNames(nat.nationkey, nat.name.data(), NationData::NAME_WIDTH);
@@ -48,18 +46,18 @@ void runQ10Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     if (!pBuildOrdersPipe || !pProbeAggPipe) return;
 
     int max_orderkey = 0;
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     uint map_size = max_orderkey + 1;
 
-    MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCustBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdKeyBuf = oCols.buffer(0);
+    MTL::Buffer* pOrdCustBuf = oCols.buffer(1);
+    MTL::Buffer* pOrdDateBuf = oCols.buffer(4);
     MTL::Buffer* pOrdersMapBuf = device->newBuffer((size_t)map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineRetFlagBuf = device->newBuffer(l_returnflag.data(), liSize * sizeof(char), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineDiscBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineOrdKeyBuf = lCols.buffer(0);
+    MTL::Buffer* pLineRetFlagBuf = lCols.buffer(8);
+    MTL::Buffer* pLinePriceBuf = lCols.buffer(5);
+    MTL::Buffer* pLineDiscBuf = lCols.buffer(6);
 
     uint cust_rev_size = max_custkey + 1;
     MTL::Buffer* pCustRevenueBuf = device->newBuffer(cust_rev_size * sizeof(float), MTL::ResourceStorageModeShared);
@@ -136,9 +134,9 @@ void runQ10Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         size_t ci = cust_index[ck];
         if (ci == SIZE_MAX) continue;
         printf("| %7d | %-16s | $%10.2f| %8.2f | %-16s |\n",
-               ck, trimFixed(c_name.data(), ci, 18).c_str(),
-               topHeap[i].revenue, c_acctbal[ci],
-               nation_names[c_nationkey[ci]].c_str());
+               ck, trimFixed(c_name_p, ci, 18).c_str(),
+               topHeap[i].revenue, c_acctbal_p[ci],
+               nation_names[c_nationkey_p[ci]].c_str());
     }
     printf("+---------+------------------+------------+----------+------------------+\n");
 
@@ -149,8 +147,8 @@ void runQ10Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
     releaseAll(pBuildOrdersPipe, pProbeAggPipe,
-              pOrdKeyBuf, pOrdCustBuf, pOrdDateBuf, pOrdersMapBuf,
-              pLineOrdKeyBuf, pLineRetFlagBuf, pLinePriceBuf, pLineDiscBuf, pCustRevenueBuf);
+              pOrdersMapBuf, pCustRevenueBuf);
+    // Input buffers owned by cCols/oCols/lCols/nCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

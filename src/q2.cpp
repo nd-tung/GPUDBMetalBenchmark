@@ -12,49 +12,54 @@ void runQ2Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     // 1. Load data
     auto q2ParseStart = std::chrono::high_resolution_clock::now();
-    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {2, ColType::CHAR_FIXED, 25}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
-    auto& p_partkey = pCols.ints(0); auto& p_mfgr = pCols.chars(2); auto& p_type = pCols.chars(4); auto& p_size = pCols.ints(5);
+    auto pCols = loadQueryColumns(pDevice, sf_path + "part.tbl", {{0, ColType::INT}, {2, ColType::CHAR_FIXED, 25}, {4, ColType::CHAR_FIXED, 25}, {5, ColType::INT}});
 
-    auto sCols = loadColumnsMulti(sf_path + "supplier.tbl", {
+    auto sCols = loadQueryColumns(pDevice, sf_path + "supplier.tbl", {
         {0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40},
         {3, ColType::INT}, {4, ColType::CHAR_FIXED, 15}, {5, ColType::FLOAT}, {6, ColType::CHAR_FIXED, 101}
     });
-    auto& s_suppkey = sCols.ints(0); auto& s_name = sCols.chars(1); auto& s_address = sCols.chars(2);
-    auto& s_nationkey = sCols.ints(3); auto& s_phone = sCols.chars(4); auto& s_acctbal = sCols.floats(5);
-    auto& s_comment = sCols.chars(6);
+    const int* s_suppkey_p = sCols.ints(0);
+    const char* s_name_p = sCols.chars(1);
+    const char* s_address_p = sCols.chars(2);
+    const int* s_nationkey_p = sCols.ints(3);
+    const char* s_phone_p = sCols.chars(4);
+    const float* s_acctbal_p = sCols.floats(5);
+    const char* s_comment_p = sCols.chars(6);
 
-    auto psCols = loadColumnsMulti(sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
-    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1); auto& ps_supplycost = psCols.floats(3);
+    auto psCols = loadQueryColumns(pDevice, sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}});
 
-    auto nCols = loadColumnsMulti(sf_path + "nation.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::INT}});
-    auto& n_nationkey = nCols.ints(0); auto& n_name = nCols.chars(1); auto& n_regionkey = nCols.ints(2);
+    auto nCols = loadQueryColumns(pDevice, sf_path + "nation.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::INT}});
+    std::vector<int> n_nationkey(nCols.ints(0), nCols.ints(0) + nCols.rows());
+    std::vector<int> n_regionkey(nCols.ints(2), nCols.ints(2) + nCols.rows());
+    const char* n_name_p = nCols.chars(1);
 
-    auto rCols = loadColumnsMulti(sf_path + "region.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-    auto& r_regionkey = rCols.ints(0); auto& r_name = rCols.chars(1);
+    auto rCols = loadQueryColumns(pDevice, sf_path + "region.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
+    std::vector<int> r_regionkey(rCols.ints(0), rCols.ints(0) + rCols.rows());
+    const char* r_name_p = rCols.chars(1);
     auto q2ParseEnd = std::chrono::high_resolution_clock::now();
     double q2CpuParseMs = std::chrono::duration<double, std::milli>(q2ParseEnd - q2ParseStart).count();
 
-    const uint part_size = (uint)p_partkey.size();
-    const uint supplier_size = (uint)s_suppkey.size();
-    const uint partsupp_size = (uint)ps_partkey.size();
+    const uint part_size = (uint)pCols.rows();
+    const uint supplier_size = (uint)sCols.rows();
+    const uint partsupp_size = (uint)psCols.rows();
     std::cout << "Loaded data. Part: " << part_size << ", Supplier: " << supplier_size
               << ", PartSupp: " << partsupp_size << std::endl;
 
     // 2. CPU: Build EUROPE nation set and supplier bitmap
     // Find EUROPE region key
-    int europe_regionkey = findRegionKey(r_regionkey, r_name.data(), 25, "EUROPE");
+    int europe_regionkey = findRegionKey(r_regionkey, r_name_p, 25, "EUROPE");
     if (europe_regionkey == -1) {
         std::cerr << "Error: EUROPE region not found" << std::endl;
         return;
     }
 
     // Build nation name map and europe nation set
-    auto nation_names = buildNationNames(n_nationkey, n_name.data(), 25);
+    auto nation_names = buildNationNames(n_nationkey, n_name_p, 25);
     auto europe_nation_keys = filterNationsByRegion(n_nationkey, n_regionkey, europe_regionkey);
     std::cout << "EUROPE nations: " << europe_nation_keys.size() << std::endl;
 
     // Build supplier bitmap (suppliers in EUROPE nations)
-    auto suppBitmap = buildSuppBitmapAndIndex(s_suppkey.data(), s_nationkey.data(),
+    auto suppBitmap = buildSuppBitmapAndIndex(s_suppkey_p, s_nationkey_p,
                                               supplier_size, europe_nation_keys);
     auto& cpu_supp_bitmap = suppBitmap.bitmap;
     auto supp_bitmap_ints = suppBitmap.bitmap_ints;
@@ -68,19 +73,19 @@ void runQ2Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     // 4. Create GPU buffers
     int max_partkey = 0;
-    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    for (int k : pCols.intSpan(0)) max_partkey = std::max(max_partkey, k);
     const uint part_bitmap_ints = (max_partkey + 31) / 32 + 1;
 
-    MTL::Buffer* pPartKeyBuf = pDevice->newBuffer(p_partkey.data(), part_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPartSizeBuf = pDevice->newBuffer(p_size.data(), part_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPartTypeBuf = pDevice->newBuffer(p_type.data(), p_type.size() * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartKeyBuf = pCols.buffer(0);
+    MTL::Buffer* pPartSizeBuf = pCols.buffer(5);
+    MTL::Buffer* pPartTypeBuf = pCols.buffer(4);
     MTL::Buffer* pPartBitmapBuf = pDevice->newBuffer(part_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
 
     MTL::Buffer* pSuppBitmapBuf = pDevice->newBuffer(cpu_supp_bitmap.data(), supp_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pPsPartKeyBuf = pDevice->newBuffer(ps_partkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPsSuppKeyBuf = pDevice->newBuffer(ps_suppkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPsSupplyCostBuf = pDevice->newBuffer(ps_supplycost.data(), partsupp_size * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsPartKeyBuf = psCols.buffer(0);
+    MTL::Buffer* pPsSuppKeyBuf = psCols.buffer(1);
+    MTL::Buffer* pPsSupplyCostBuf = psCols.buffer(3);
 
     // min_cost array: one uint per partkey, initialized to UINT_MAX
     MTL::Buffer* pMinCostBuf = pDevice->newBuffer((max_partkey + 1) * sizeof(uint), MTL::ResourceStorageModeShared);
@@ -155,9 +160,9 @@ void runQ2Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     uint result_count = *(uint*)pResultCountBuf->contents();
     if (result_count > max_results) result_count = max_results;
     postProcessQ2((Q2MatchResult_CPU*)pResultsBuf->contents(), result_count,
-                  supp_index, s_acctbal.data(), s_nationkey.data(),
-                  s_name.data(), s_address.data(), s_phone.data(), s_comment.data(),
-                  nation_names, p_partkey.data(), part_size, p_mfgr.data());
+                  supp_index, s_acctbal_p, s_nationkey_p,
+                  s_name_p, s_address_p, s_phone_p, s_comment_p,
+                  nation_names, pCols.ints(0), part_size, pCols.chars(2));
     auto q2CpuPostEnd = std::chrono::high_resolution_clock::now();
     double q2CpuPostMs = std::chrono::duration<double, std::milli>(q2CpuPostEnd - q2CpuPostStart).count();
 
@@ -166,10 +171,9 @@ void runQ2Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printTimingSummary(q2CpuParseMs, q2GpuMs, q2CpuPostMs);
 
     releaseAll(pFilterPartPipe, pMinCostPipe, pMatchPipe,
-              pPartKeyBuf, pPartSizeBuf, pPartTypeBuf,
               pPartBitmapBuf, pSuppBitmapBuf,
-              pPsPartKeyBuf, pPsSuppKeyBuf, pPsSupplyCostBuf,
               pMinCostBuf, pResultsBuf, pResultCountBuf);
+    // Input buffers owned by pCols/sCols/psCols/nCols/rCols (QueryColumns).
 }
 
 

@@ -19,6 +19,64 @@
 // Scan lineitem: pre-filter shipmode(first char 'A') + shipinstruct(first char 'D'),
 // then probe part map and check quantity range for the matched group.
 
+// ===================================================================
+// Fused Q19 kernel (SF1/SF10 path) — single dispatch, no qualifies buffer,
+// no partial array, no stage2. Accumulates revenue in long cents and writes
+// one atomic_add_long_pair per threadgroup.
+// ===================================================================
+kernel void q19_fused_kernel(
+    const device int*   l_partkey         [[buffer(0)]],
+    const device float* l_quantity        [[buffer(1)]],
+    const device float* l_extendedprice   [[buffer(2)]],
+    const device float* l_discount        [[buffer(3)]],
+    const device char*  l_shipmode        [[buffer(4)]],
+    const device char*  l_shipinstruct    [[buffer(5)]],
+    const device uchar* part_group_map    [[buffer(6)]],
+    device atomic_uint* d_revenue_pair    [[buffer(7)]],   // [2] lo/hi
+    constant uint& data_size              [[buffer(8)]],
+    constant uint& map_size               [[buffer(9)]],
+    constant uint& shipmode_stride        [[buffer(10)]],
+    constant uint& shipinstruct_stride    [[buffer(11)]],
+    uint group_id           [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group  [[threads_per_threadgroup]],
+    uint grid_size          [[threads_per_grid]])
+{
+    long local_revenue_c = 0;
+
+    for (uint i = (group_id * threads_per_group) + thread_id_in_group;
+         i < data_size; i += grid_size) {
+        // Inline shipmode + shipinstruct filter (no materialized buffer)
+        const device char* sm = l_shipmode     + (uint64_t)i * shipmode_stride;
+        const device char* si = l_shipinstruct + (uint64_t)i * shipinstruct_stride;
+        if (!(si[0]=='D' && si[1]=='E' && si[2]=='L')) continue;
+        bool is_air     = (sm[0]=='A' && sm[1]=='I' && sm[2]=='R' && (sm[3]=='\0' || sm[3]==' '));
+        bool is_reg_air = (sm[0]=='R' && sm[1]=='E' && sm[2]=='G' && sm[3]==' ' && sm[4]=='A');
+        if (!(is_air || is_reg_air)) continue;
+
+        int pk = l_partkey[i];
+        if (pk < 0 || (uint)pk >= map_size) continue;
+        uchar grp = part_group_map[pk];
+        if (grp > 2) continue;
+
+        float qty = l_quantity[i];
+        bool match;
+        if (grp == 0)      match = (qty >= 1.0f  && qty <= 11.0f);
+        else if (grp == 1) match = (qty >= 10.0f && qty <= 20.0f);
+        else               match = (qty >= 20.0f && qty <= 30.0f);
+        if (!match) continue;
+
+        float rev = l_extendedprice[i] * (1.0f - l_discount[i]);
+        local_revenue_c += (long)((uint)(rev * 100.0f));
+    }
+
+    threadgroup long tg64[32];
+    long total = tg_reduce_long(local_revenue_c, thread_id_in_group, threads_per_group, tg64);
+    if (thread_id_in_group == 0) {
+        atomic_add_long_pair(&d_revenue_pair[0], &d_revenue_pair[1], total);
+    }
+}
+
 kernel void q19_filter_and_sum_stage1(
     const device int*   l_partkey         [[buffer(0)]],
     const device float* l_quantity        [[buffer(1)]],

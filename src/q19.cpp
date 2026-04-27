@@ -12,24 +12,20 @@ void runQ19Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     // Load part data (pure I/O)
-    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {5, ColType::INT}, {6, ColType::CHAR_FIXED, 10}});
-    auto& p_partkey = pCols.ints(0); auto& p_brand = pCols.chars(3); auto& p_size = pCols.ints(5); auto& p_container = pCols.chars(6);
+    auto pCols = loadQueryColumns(device, sf_path + "part.tbl", {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {5, ColType::INT}, {6, ColType::CHAR_FIXED, 10}});
 
     // Load lineitem columns
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{1, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {13, ColType::CHAR_FIXED, 25}, {14, ColType::CHAR_FIXED, 10}});
-    auto& l_partkey = lCols.ints(1); auto& l_quantity = lCols.floats(4);
-    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
-    auto& l_shipinstruct = lCols.chars(13); auto& l_shipmode = lCols.chars(14);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{1, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {13, ColType::CHAR_FIXED, 25}, {14, ColType::CHAR_FIXED, 10}});
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
-    uint dataSize = (uint)l_partkey.size();
-    uint partSize = (uint)p_partkey.size();
+    uint dataSize = (uint)lCols.rows();
+    uint partSize = (uint)pCols.rows();
     if (dataSize == 0) { std::cerr << "Q19: no data loaded" << std::endl; return; }
     std::cout << "Loaded " << dataSize << " lineitem rows for Q19." << std::endl;
 
     int max_partkey = 0;
-    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    for (int k : pCols.intSpan(0)) max_partkey = std::max(max_partkey, k);
     uint mapSize = (uint)(max_partkey + 1);
     const uint brand_stride = 10;
     const uint container_stride = 10;
@@ -37,37 +33,35 @@ void runQ19Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const uint shipinstruct_stride = 25;
 
     auto mapPSO      = createPipeline(device, library, "q19_build_part_group_map_kernel");
-    auto filterPSO   = createPipeline(device, library, "q19_shipmode_filter_kernel");
-    auto s1PSO       = createPipeline(device, library, "q19_filter_and_sum_stage1");
-    auto s2PSO       = createPipeline(device, library, "q19_final_sum_stage2");
-    if (!mapPSO || !filterPSO || !s1PSO || !s2PSO) return;
+    auto fusedPSO    = createPipeline(device, library, "q19_fused_kernel");
+    if (!mapPSO || !fusedPSO) return;
 
-    const int numTG = 2048;
+    // Cap dispatch by lineitem size (the dominant scan input).
+    const int numTG = std::min(2048, (int)((dataSize + 1023u) / 1024u));
 
     // Part group map buffers
-    MTL::Buffer* pPartKeyBuf   = device->newBuffer(p_partkey.data(), partSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pBrandBuf     = device->newBuffer(p_brand.data(), (size_t)partSize * brand_stride, MTL::ResourceStorageModeShared);
-    MTL::Buffer* pContainerBuf = device->newBuffer(p_container.data(), (size_t)partSize * container_stride, MTL::ResourceStorageModeShared);
-    MTL::Buffer* pSizeBuf      = device->newBuffer(p_size.data(), partSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartKeyBuf   = pCols.buffer(0);
+    MTL::Buffer* pBrandBuf     = pCols.buffer(3);
+    MTL::Buffer* pContainerBuf = pCols.buffer(6);
+    MTL::Buffer* pSizeBuf      = pCols.buffer(5);
     MTL::Buffer* mapBuf        = device->newBuffer(mapSize * sizeof(uint8_t), MTL::ResourceStorageModeShared);
     memset(mapBuf->contents(), 0xFF, mapSize * sizeof(uint8_t));
 
-    // Shipmode filter buffers 
-    MTL::Buffer* smBuf         = device->newBuffer(l_shipmode.data(), (size_t)dataSize * shipmode_stride, MTL::ResourceStorageModeShared);
-    MTL::Buffer* siBuf         = device->newBuffer(l_shipinstruct.data(), (size_t)dataSize * shipinstruct_stride, MTL::ResourceStorageModeShared);
-    MTL::Buffer* qualifiesBuf  = device->newBuffer(dataSize * sizeof(uint8_t), MTL::ResourceStorageModeShared);
+    // Lineitem buffers (no materialized qualifies buffer)
+    MTL::Buffer* smBuf         = lCols.buffer(14);
+    MTL::Buffer* siBuf         = lCols.buffer(13);
 
     // Main computation buffers
-    MTL::Buffer* partkeyBuf   = device->newBuffer(l_partkey.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* qtyBuf       = device->newBuffer(l_quantity.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* priceBuf     = device->newBuffer(l_extendedprice.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* discBuf      = device->newBuffer(l_discount.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* partialBuf   = device->newBuffer(numTG * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* finalBuf     = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* partkeyBuf   = lCols.buffer(1);
+    MTL::Buffer* qtyBuf       = lCols.buffer(4);
+    MTL::Buffer* priceBuf     = lCols.buffer(5);
+    MTL::Buffer* discBuf      = lCols.buffer(6);
+    MTL::Buffer* revPairBuf   = device->newBuffer(2 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
 
     double gpuSec = 0.0;
     for (int iter = 0; iter < 3; ++iter) {
         memset(mapBuf->contents(), 0xFF, mapSize * sizeof(uint8_t));
+        memset(revPairBuf->contents(), 0, 2 * sizeof(uint32_t));
 
         MTL::CommandBuffer* cb = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
@@ -91,45 +85,23 @@ void runQ19Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
-        // Phase 2: Compute shipmode qualifies flag on GPU
-        enc->setComputePipelineState(filterPSO);
-        enc->setBuffer(smBuf, 0, 0);
-        enc->setBuffer(siBuf, 0, 1);
-        enc->setBuffer(qualifiesBuf, 0, 2);
-        enc->setBytes(&dataSize, sizeof(dataSize), 3);
-        enc->setBytes(&shipmode_stride, sizeof(shipmode_stride), 4);
-        enc->setBytes(&shipinstruct_stride, sizeof(shipinstruct_stride), 5);
-        {
-            NS::UInteger tgSize = filterPSO->maxTotalThreadsPerThreadgroup();
-            if (tgSize > 1024) tgSize = 1024;
-            uint numGroups = (dataSize + (uint)tgSize - 1) / (uint)tgSize;
-            enc->dispatchThreadgroups(MTL::Size::Make(numGroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
-        }
-
-        enc->memoryBarrier(MTL::BarrierScopeBuffers);
-
-        // Phase 3: Main filter+sum
-        enc->setComputePipelineState(s1PSO);
+        // Phase 2: fused shipmode filter + part probe + qty range + revenue sum
+        enc->setComputePipelineState(fusedPSO);
         enc->setBuffer(partkeyBuf, 0, 0);
         enc->setBuffer(qtyBuf, 0, 1);
         enc->setBuffer(priceBuf, 0, 2);
         enc->setBuffer(discBuf, 0, 3);
-        enc->setBuffer(qualifiesBuf, 0, 4);
-        enc->setBuffer(mapBuf, 0, 5);
-        enc->setBuffer(partialBuf, 0, 6);
-        enc->setBytes(&dataSize, sizeof(dataSize), 7);
-        enc->setBytes(&mapSize, sizeof(mapSize), 8);
-        NS::UInteger tgSize = s1PSO->maxTotalThreadsPerThreadgroup();
+        enc->setBuffer(smBuf, 0, 4);
+        enc->setBuffer(siBuf, 0, 5);
+        enc->setBuffer(mapBuf, 0, 6);
+        enc->setBuffer(revPairBuf, 0, 7);
+        enc->setBytes(&dataSize, sizeof(dataSize), 8);
+        enc->setBytes(&mapSize, sizeof(mapSize), 9);
+        enc->setBytes(&shipmode_stride, sizeof(shipmode_stride), 10);
+        enc->setBytes(&shipinstruct_stride, sizeof(shipinstruct_stride), 11);
+        NS::UInteger tgSize = fusedPSO->maxTotalThreadsPerThreadgroup();
         if (tgSize > 1024) tgSize = 1024;
         enc->dispatchThreadgroups(MTL::Size::Make(numTG, 1, 1), MTL::Size::Make(tgSize, 1, 1));
-
-        enc->memoryBarrier(MTL::BarrierScopeBuffers);
-        const uint numTGs = numTG;
-        enc->setComputePipelineState(s2PSO);
-        enc->setBuffer(partialBuf, 0, 0);
-        enc->setBuffer(finalBuf, 0, 1);
-        enc->setBytes(&numTGs, sizeof(numTGs), 2);
-        enc->dispatchThreads(MTL::Size::Make(1,1,1), MTL::Size::Make(1,1,1));
         enc->endEncoding();
 
         cb->commit();
@@ -138,7 +110,9 @@ void runQ19Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     }
 
     auto cpuPostStart = std::chrono::high_resolution_clock::now();
-    float revenue = *(float*)finalBuf->contents();
+    const uint32_t* revPair = (const uint32_t*)revPairBuf->contents();
+    uint64_t rev_cents_u = ((uint64_t)revPair[1] << 32) | (uint64_t)revPair[0];
+    double revenue = (double)(int64_t)rev_cents_u / 100.0;
     auto cpuPostEnd = std::chrono::high_resolution_clock::now();
     double cpuPostMs = std::chrono::duration<double, std::milli>(cpuPostEnd - cpuPostStart).count();
 
@@ -146,11 +120,8 @@ void runQ19Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ19 | %u rows\n", dataSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(mapPSO, filterPSO, s1PSO, s2PSO,
-               pPartKeyBuf, pBrandBuf, pContainerBuf, pSizeBuf,
-               smBuf, siBuf, qualifiesBuf,
-               partkeyBuf, qtyBuf, priceBuf, discBuf,
-               mapBuf, partialBuf, finalBuf);
+    releaseAll(mapPSO, fusedPSO, mapBuf, revPairBuf);
+    // Input buffers owned by pCols/lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

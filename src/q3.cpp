@@ -11,22 +11,17 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     // 1. Load data for all three tables
     auto q3ParseStart = std::chrono::high_resolution_clock::now();
     const std::string sf_path = g_dataset_path;
-    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}, {6, ColType::CHAR1}});
-    auto& c_custkey = cCols.ints(0); auto& c_mktsegment = cCols.chars(6);
+    auto cCols = loadQueryColumns(pDevice, sf_path + "customer.tbl", {{0, ColType::INT}, {6, ColType::CHAR1}});
 
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}, {7, ColType::INT}});
-    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1);
-    auto& o_orderdate = oCols.ints(4); auto& o_shippriority = oCols.ints(7);
+    auto oCols = loadQueryColumns(pDevice, sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}, {7, ColType::INT}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
-    auto& l_orderkey = lCols.ints(0); auto& l_shipdate = lCols.ints(10);
-    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto lCols = loadQueryColumns(pDevice, sf_path + "lineitem.tbl", {{0, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
     auto q3ParseEnd = std::chrono::high_resolution_clock::now();
     double q3CpuParseMs = std::chrono::duration<double, std::milli>(q3ParseEnd - q3ParseStart).count();
     
-    const uint customer_size = (uint)c_custkey.size();
-    const uint orders_size = (uint)o_orderkey.size();
-    const uint lineitem_size = (uint)l_orderkey.size();
+    const uint customer_size = (uint)cCols.rows();
+    const uint orders_size = (uint)oCols.rows();
+    const uint lineitem_size = (uint)lCols.rows();
     std::cout << "Loaded " << customer_size << " customers, " << orders_size << " orders, " << lineitem_size << " lineitem rows." << std::endl;
 
     // 2. Setup all kernels
@@ -39,31 +34,33 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     // 3. Create Buffers
     // Optimization 1: Bitmap for Customer (filter 'BUILDING')
     int max_custkey = 0;
-    for(int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    for(int k : cCols.intSpan(0)) max_custkey = std::max(max_custkey, k);
     MTL::Buffer* pCustomerBitmapBuffer = createBitmapBuffer(pDevice, max_custkey);
 
-    MTL::Buffer* pCustKeyBuffer = pDevice->newBuffer(c_custkey.data(), customer_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pCustMktBuffer = pDevice->newBuffer(c_mktsegment.data(), customer_size * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCustKeyBuffer = cCols.buffer(0);
+    MTL::Buffer* pCustMktBuffer = cCols.buffer(6);
 
     // Optimization 2: Direct Map for Orders
     int max_orderkey = 0;
-    for(int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for(int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     const uint orders_map_size = max_orderkey + 1;
     MTL::Buffer* pOrdersMapBuffer = pDevice->newBuffer(orders_map_size * sizeof(int), MTL::ResourceStorageModeShared);
     // Initialize with -1
     std::memset(pOrdersMapBuffer->contents(), -1, orders_map_size * sizeof(int));
 
-    MTL::Buffer* pOrdKeyBuffer = pDevice->newBuffer(o_orderkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCustKeyBuffer = pDevice->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdDateBuffer = pDevice->newBuffer(o_orderdate.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdPrioBuffer = pDevice->newBuffer(o_shippriority.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdKeyBuffer = oCols.buffer(0);
+    MTL::Buffer* pOrdCustKeyBuffer = oCols.buffer(1);
+    MTL::Buffer* pOrdDateBuffer = oCols.buffer(4);
+    MTL::Buffer* pOrdPrioBuffer = oCols.buffer(7);
     
-    MTL::Buffer* pLineOrdKeyBuffer = pDevice->newBuffer(l_orderkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineShipDateBuffer = pDevice->newBuffer(l_shipdate.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLinePriceBuffer = pDevice->newBuffer(l_extendedprice.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineDiscBuffer = pDevice->newBuffer(l_discount.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineOrdKeyBuffer = lCols.buffer(0);
+    MTL::Buffer* pLineShipDateBuffer = lCols.buffer(10);
+    MTL::Buffer* pLinePriceBuffer = lCols.buffer(5);
+    MTL::Buffer* pLineDiscBuffer = lCols.buffer(6);
     
-    const uint num_threadgroups = 2048;
+    // Cap dispatch by input size: oversubscribing TGs adds atomic-write traffic
+    // without parallelism gain (M1 has 7 GPU cores; ~256 active TGs already saturate).
+    const uint num_threadgroups = std::min(2048u, (lineitem_size + 1023u) / 1024u);
     const uint final_ht_size = nextPow2(orders_size * 2);
     MTL::Buffer* pFinalHTBuffer = pDevice->newBuffer(final_ht_size * sizeof(Q3Aggregates_CPU), MTL::ResourceStorageModeShared);
     std::memset(pFinalHTBuffer->contents(), 0, final_ht_size * sizeof(Q3Aggregates_CPU));
@@ -166,10 +163,10 @@ void runQ3Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     
     //Cleanup
     releaseAll(pCustBuildPipe, pOrdersBuildPipe, pFusedProbeAggPipe, pCompactPipe,
-              pCustKeyBuffer, pCustMktBuffer, pCustomerBitmapBuffer,
-              pOrdKeyBuffer, pOrdCustKeyBuffer, pOrdDateBuffer, pOrdPrioBuffer, pOrdersMapBuffer,
-              pLineOrdKeyBuffer, pLineShipDateBuffer, pLinePriceBuffer, pLineDiscBuffer,
+              pCustomerBitmapBuffer,
+              pOrdersMapBuffer,
               pFinalHTBuffer, pDenseBuffer, pCountBuffer);
+    // Input buffers owned by cCols/oCols/lCols (QueryColumns).
 }
 
 

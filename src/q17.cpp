@@ -10,32 +10,33 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     auto parseStart = std::chrono::high_resolution_clock::now();
-    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {6, ColType::CHAR_FIXED, 10}});
-    auto& p_partkey = pCols.ints(0); auto& p_brand = pCols.chars(3); auto& p_container = pCols.chars(6);
+    auto pCols = loadQueryColumns(device, sf_path + "part.tbl", {{0, ColType::INT}, {3, ColType::CHAR_FIXED, 10}, {6, ColType::CHAR_FIXED, 10}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{1, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}});
-    auto& l_partkey = lCols.ints(1); auto& l_quantity = lCols.floats(4); auto& l_extendedprice = lCols.floats(5);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{1, ColType::INT}, {4, ColType::FLOAT}, {5, ColType::FLOAT}});
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
     // Build part bitmap: Brand#23, MED BOX
-    auto part_bm = buildCPUBitmap(p_partkey, [&](size_t i) {
-        return trimFixed(p_brand.data(), i, 10) == "Brand#23" &&
-               trimFixed(p_container.data(), i, 10) == "MED BOX";
+    const char* p_brand = pCols.chars(3);
+    const char* p_container = pCols.chars(6);
+    auto part_bm = buildCPUBitmap(pCols.ints(0), pCols.rows(), [&](size_t i) {
+        return trimFixed(p_brand, i, 10) == "Brand#23" &&
+               trimFixed(p_container, i, 10) == "MED BOX";
     });
     int max_partkey = part_bm.max_key;
 
-    uint liSize = (uint)l_partkey.size();
+    uint liSize = (uint)lCols.rows();
     uint mapSize = max_partkey + 1;
 
     auto pStatsPipe = createPipeline(device, library, "q17_aggregate_qty_stats_kernel");
+    auto pThreshPipe = createPipeline(device, library, "q17_compute_threshold_kernel");
     auto pRevPipe = createPipeline(device, library, "q17_sum_revenue_kernel");
-    if (!pStatsPipe || !pRevPipe) return;
+    if (!pStatsPipe || !pThreshPipe || !pRevPipe) return;
 
     MTL::Buffer* pPartBitmapBuf = uploadBitmap(device, part_bm);
-    MTL::Buffer* pLinePartKeyBuf = device->newBuffer(l_partkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineQtyBuf = device->newBuffer(l_quantity.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLinePartKeyBuf = lCols.buffer(1);
+    MTL::Buffer* pLineQtyBuf = lCols.buffer(4);
+    MTL::Buffer* pLinePriceBuf = lCols.buffer(5);
     MTL::Buffer* pSumQtyMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pCountMapBuf = device->newBuffer((size_t)mapSize * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pThresholdMapBuf = device->newBuffer((size_t)mapSize * sizeof(float), MTL::ResourceStorageModeShared);
@@ -47,9 +48,11 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         memset(pCountMapBuf->contents(), 0, (size_t)mapSize * sizeof(uint));
         *(float*)pTotalRevenueBuf->contents() = 0.0f;
 
-        // Pass 1: aggregate stats
-        MTL::CommandBuffer* cb1 = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* enc1 = cb1->computeCommandEncoder();
+        // Single command buffer with all 3 stages — no host sync between passes.
+        MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+
+        // Stage 1: aggregate stats
+        MTL::ComputeCommandEncoder* enc1 = cb->computeCommandEncoder();
         enc1->setComputePipelineState(pStatsPipe);
         enc1->setBuffer(pLinePartKeyBuf, 0, 0);
         enc1->setBuffer(pLineQtyBuf, 0, 1);
@@ -59,23 +62,24 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc1->setBytes(&liSize, sizeof(liSize), 5);
         enc1->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
         enc1->endEncoding();
-        cb1->commit(); cb1->waitUntilCompleted();
 
-        // CPU: compute threshold = 0.2 * avg per partkey
-        float* sumQty = (float*)pSumQtyMapBuf->contents();
-        uint* countQty = (uint*)pCountMapBuf->contents();
-        float* threshold = (float*)pThresholdMapBuf->contents();
-        for (uint pk = 0; pk < mapSize; pk++) {
-            if (countQty[pk] > 0) {
-                threshold[pk] = 0.2f * (sumQty[pk] / (float)countQty[pk]);
-            } else {
-                threshold[pk] = 0.0f;
-            }
+        // Stage 2 (GPU): compute threshold per partkey. Concurrent encoders enforce
+        // ordering across encoder boundary on Apple Silicon.
+        MTL::ComputeCommandEncoder* encT = cb->computeCommandEncoder();
+        encT->setComputePipelineState(pThreshPipe);
+        encT->setBuffer(pSumQtyMapBuf, 0, 0);
+        encT->setBuffer(pCountMapBuf, 0, 1);
+        encT->setBuffer(pThresholdMapBuf, 0, 2);
+        encT->setBytes(&mapSize, sizeof(mapSize), 3);
+        {
+            NS::UInteger tg = pThreshPipe->maxTotalThreadsPerThreadgroup();
+            if (tg > 256) tg = 256;
+            encT->dispatchThreads(MTL::Size(mapSize, 1, 1), MTL::Size(tg, 1, 1));
         }
+        encT->endEncoding();
 
-        // Pass 2: sum revenue
-        MTL::CommandBuffer* cb2 = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* enc2 = cb2->computeCommandEncoder();
+        // Stage 3: sum revenue
+        MTL::ComputeCommandEncoder* enc2 = cb->computeCommandEncoder();
         enc2->setComputePipelineState(pRevPipe);
         enc2->setBuffer(pLinePartKeyBuf, 0, 0);
         enc2->setBuffer(pLineQtyBuf, 0, 1);
@@ -86,11 +90,12 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc2->setBytes(&liSize, sizeof(liSize), 6);
         enc2->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
         enc2->endEncoding();
-        cb2->commit(); cb2->waitUntilCompleted();
+
+        cb->commit();
+        cb->waitUntilCompleted();
 
         if (iter == 2) {
-            gpuSec = (cb1->GPUEndTime() - cb1->GPUStartTime()) +
-                     (cb2->GPUEndTime() - cb2->GPUStartTime());
+            gpuSec = cb->GPUEndTime() - cb->GPUStartTime();
         }
     }
 
@@ -106,8 +111,9 @@ void runQ17Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ17 | %u lineitem\n", liSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, 0.0);
 
-    releaseAll(pStatsPipe, pRevPipe, pPartBitmapBuf, pLinePartKeyBuf, pLineQtyBuf, pLinePriceBuf,
+    releaseAll(pStatsPipe, pThreshPipe, pRevPipe, pPartBitmapBuf,
               pSumQtyMapBuf, pCountMapBuf, pThresholdMapBuf, pTotalRevenueBuf);
+    // Input buffers owned by lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

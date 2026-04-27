@@ -11,24 +11,18 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     auto q14ParseStart = std::chrono::high_resolution_clock::now();
     const std::string sf_path = g_dataset_path;
 
-    // Load part data (pure I/O)
-    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {4, ColType::CHAR_FIXED, 25}});
-    auto& p_partkey = pCols.ints(0); auto& p_type = pCols.chars(4);
-
-    // Load lineitem columns
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{1, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
-    auto& l_partkey = lCols.ints(1); auto& l_shipdate = lCols.ints(10);
-    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto pCols = loadQueryColumns(device, sf_path + "part.tbl", {{0, ColType::INT}, {4, ColType::CHAR_FIXED, 25}});
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{1, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
     auto q14ParseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(q14ParseEnd - q14ParseStart).count();
 
-    uint dataSize = (uint)l_partkey.size();
-    uint partSize = (uint)p_partkey.size();
+    uint dataSize = (uint)lCols.rows();
+    uint partSize = (uint)pCols.rows();
     if (dataSize == 0) { std::cerr << "Q14: no data loaded" << std::endl; return; }
     std::cout << "Loaded " << dataSize << " lineitem rows for Q14." << std::endl;
 
     int max_partkey = 0;
-    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    for (int k : pCols.intSpan(0)) max_partkey = std::max(max_partkey, k);
     uint bitmapInts = (max_partkey + 31) / 32 + 1;
     const uint type_stride = 25;
 
@@ -40,14 +34,14 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const int numTG = 2048;
     int start_date = 19950901, end_date = 19951001;
 
-    MTL::Buffer* pPartKeyBuf = device->newBuffer(p_partkey.data(), partSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pTypeBuf    = device->newBuffer(p_type.data(), (size_t)partSize * type_stride * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPartKeyBuf = pCols.buffer(0);
+    MTL::Buffer* pTypeBuf    = pCols.buffer(4);
     MTL::Buffer* bitmapBuf   = device->newBuffer(bitmapInts * sizeof(uint), MTL::ResourceStorageModeShared);
     memset(bitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
-    MTL::Buffer* partkeyBuf  = device->newBuffer(l_partkey.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* shipdateBuf = device->newBuffer(l_shipdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* priceBuf    = device->newBuffer(l_extendedprice.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* discBuf     = device->newBuffer(l_discount.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* partkeyBuf  = lCols.buffer(1);
+    MTL::Buffer* shipdateBuf = lCols.buffer(10);
+    MTL::Buffer* priceBuf    = lCols.buffer(5);
+    MTL::Buffer* discBuf     = lCols.buffer(6);
     MTL::Buffer* partialPromo = device->newBuffer(numTG * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* partialTotal = device->newBuffer(numTG * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* finalBuf     = device->newBuffer(2 * sizeof(float), MTL::ResourceStorageModeShared);
@@ -116,8 +110,9 @@ void runQ14Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ14 | %u rows\n", dataSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(bitmapPSO, s1PSO, s2PSO, pPartKeyBuf, pTypeBuf, partkeyBuf, shipdateBuf, priceBuf, discBuf,
+    releaseAll(bitmapPSO, s1PSO, s2PSO,
                bitmapBuf, partialPromo, partialTotal, finalBuf);
+    // Input buffers owned by pCols/lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

@@ -37,58 +37,72 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     std::cout << "Loaded data for all tables." << std::endl;
     std::cout << "Part size: " << part_size << ", Supplier size: " << supplier_size << ", Lineitem size: " << lineitem_size << std::endl;
 
-    // Debug: Check for 'green' in p_name
+    // -------------------------------------------------------------------
+    // CPU-SIDE BUILD PHASE (eliminates 3 GPU build kernels: part_bitmap,
+    // supp_nation_map, orders_year_map). Mirrors codegen's CPU preprocessing.
+    // The data is already in CPU memory from loadColumnsMulti so this is
+    // essentially free (no extra I/O).
+    // -------------------------------------------------------------------
+    int max_partkey = 0;
+    for (int k : p_partkey) max_partkey = std::max(max_partkey, k);
+    int max_suppkey = 0;
+    for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
+    int max_orderkey = 0;
+    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    std::cout << "Max PartKey: " << max_partkey
+              << ", Max SuppKey: " << max_suppkey
+              << ", Max OrderKey: " << max_orderkey << std::endl;
+
+    // Build part bitmap (LIKE '%green%') on CPU. Same scan that previously
+    // counted green_count + the GPU q9_build_part_ht_kernel.
+    const uint bitmap_words = (uint)((max_partkey + 31) / 32 + 1);
+    std::vector<uint32_t> cpu_part_bitmap(bitmap_words, 0u);
     int green_count = 0;
     for (size_t i = 0; i < part_size; ++i) {
+        const char* nm = p_name.data() + i * 55;
         bool match = false;
-        for(int j = 0; j < 50; ++j) {
-            if (p_name[i * 55 + j] == 'g' && p_name[i * 55 + j + 1] == 'r' &&
-                p_name[i * 55 + j + 2] == 'e' && p_name[i * 55 + j + 3] == 'e' &&
-                p_name[i * 55 + j + 4] == 'n') {
-                match = true;
-                break;
+        for (int j = 0; j <= 50; ++j) {
+            if (nm[j]=='g' && nm[j+1]=='r' && nm[j+2]=='e' && nm[j+3]=='e' && nm[j+4]=='n') {
+                match = true; break;
             }
         }
-        if (match) green_count++;
+        if (match) {
+            int pk = p_partkey[i];
+            cpu_part_bitmap[pk >> 5] |= (1u << (pk & 31));
+            ++green_count;
+        }
     }
     std::cout << "Found " << green_count << " parts with 'green' in name (CPU check)." << std::endl;
 
+    // Build supp_nation_map[suppkey] = nationkey on CPU.
+    const uint supp_map_size = (uint)max_suppkey + 1u;
+    std::vector<int> cpu_supp_map(supp_map_size, -1);
+    for (size_t i = 0; i < supplier_size; ++i) {
+        cpu_supp_map[s_suppkey[i]] = s_nationkey[i];
+    }
 
-    // 2. Setup all kernel pipelines
-    auto pPartBuildPipe = createPipeline(pDevice, pLibrary, "q9_build_part_ht_kernel");
-    auto pSuppBuildPipe = createPipeline(pDevice, pLibrary, "q9_build_supplier_ht_kernel");
+    // Build orders_year_map[orderkey] = year on CPU.
+    const uint orders_map_size = (uint)max_orderkey + 1u;
+    std::vector<int> cpu_orders_year_map(orders_map_size, -1);
+    for (size_t i = 0; i < orders_size; ++i) {
+        cpu_orders_year_map[o_orderkey[i]] = o_orderdate[i] / 10000;
+    }
+
+    // 2. Setup remaining kernel pipelines (only partsupp build + probe).
     auto pPartSuppBuildPipe = createPipeline(pDevice, pLibrary, "q9_build_partsupp_ht_kernel");
-    auto pOrdersBuildPipe = createPipeline(pDevice, pLibrary, "q9_build_orders_ht_kernel");
-    auto pProbeAggPipe = createPipeline(pDevice, pLibrary, "q9_probe_and_global_agg_kernel");
-    if (!pPartBuildPipe || !pSuppBuildPipe || !pPartSuppBuildPipe || !pOrdersBuildPipe || !pProbeAggPipe) return;
+    auto pProbeAggPipe      = createPipeline(pDevice, pLibrary, "q9_probe_directorders_dense_kernel");
+    if (!pPartSuppBuildPipe || !pProbeAggPipe) return;
 
-    // 3. Create all GPU buffers
-    // Part Bitmap (Optimization 1)
-    int max_partkey = 0;
-    for(int k : p_partkey) max_partkey = std::max(max_partkey, k);
-    std::cout << "Max PartKey: " << max_partkey << std::endl;
-    MTL::Buffer* pPartBitmapBuffer = createBitmapBuffer(pDevice, max_partkey);
-    
-    MTL::Buffer* pPartKeyBuffer = pDevice->newBuffer(p_partkey.data(), part_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPartNameBuffer = pDevice->newBuffer(p_name.data(), p_name.size() * sizeof(char), MTL::ResourceStorageModeShared);
-    // Dummy size for compatibility
-    const uint part_ht_size = 0; 
+    // 3. Create GPU buffers. Bitmap / supp_map / orders_year_map are populated
+    // directly from the CPU-built vectors (single shared-memory upload).
+    MTL::Buffer* pPartBitmapBuffer = pDevice->newBuffer(
+        cpu_part_bitmap.data(), bitmap_words * sizeof(uint32_t),
+        MTL::ResourceStorageModeShared);
 
-    // Supplier Direct Map (Optimization 2)
-    int max_suppkey = 0;
-    for(int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
-    std::cout << "Max SuppKey: " << max_suppkey << std::endl;
-    const uint supp_map_size = max_suppkey + 1;
-    MTL::Buffer* pSuppMapBuffer = pDevice->newBuffer(supp_map_size * sizeof(int), MTL::ResourceStorageModeShared);
-    // Initialize with -1 to be safe
-    std::memset(pSuppMapBuffer->contents(), -1, supp_map_size * sizeof(int));
+    MTL::Buffer* pSuppMapBuffer = pDevice->newBuffer(
+        cpu_supp_map.data(), supp_map_size * sizeof(int),
+        MTL::ResourceStorageModeShared);
 
-    
-    MTL::Buffer* pSuppKeyBuffer = pDevice->newBuffer(s_suppkey.data(), supplier_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pSuppNationKeyBuffer = pDevice->newBuffer(s_nationkey.data(), supplier_size * sizeof(int), MTL::ResourceStorageModeShared);
-    // Dummy size for compatibility
-    const uint supplier_ht_size = 0;
-    
     const uint partsupp_ht_size = nextPow2(partsupp_size); // power-of-2 for bitwise AND probing
     // PartSuppEntry has 4 ints (partkey, suppkey, idx, pad); initialize all to -1 to mark empty
     std::vector<int> cpu_partsupp_ht(partsupp_ht_size * 4, -1);
@@ -96,12 +110,10 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     MTL::Buffer* pPsSuppKeyBuffer = pDevice->newBuffer(ps_suppkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pPsSupplyCostBuffer = pDevice->newBuffer(ps_supplycost.data(), partsupp_size * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pPartSuppHTBuffer = pDevice->newBuffer(cpu_partsupp_ht.data(), partsupp_ht_size * sizeof(int) * 4, MTL::ResourceStorageModeShared);
-    
-    const uint orders_ht_size = nextPow2(orders_size * 2);
-    std::vector<int> cpu_orders_ht(orders_ht_size * 2, -1);
-    MTL::Buffer* pOrdKeyBuffer = pDevice->newBuffer(o_orderkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdDateBuffer = pDevice->newBuffer(o_orderdate.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdersHTBuffer = pDevice->newBuffer(cpu_orders_ht.data(), orders_ht_size * sizeof(int) * 2, MTL::ResourceStorageModeShared);
+
+    MTL::Buffer* pOrdersHTBuffer = pDevice->newBuffer(
+        cpu_orders_year_map.data(), orders_map_size * sizeof(int),
+        MTL::ResourceStorageModeShared);
 
     MTL::Buffer* pLinePartKeyBuffer = pDevice->newBuffer(l_partkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pLineSuppKeyBuffer = pDevice->newBuffer(l_suppkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
@@ -111,58 +123,29 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     MTL::Buffer* pLineDiscBuffer = pDevice->newBuffer(l_discount.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
 
     const uint num_threadgroups = 2048;
-    const uint final_ht_size = nextPow2(25 * 10); // 25 nations * ~10 years, rounded to power-of-2
-    std::vector<uint> cpu_final_ht(final_ht_size * (sizeof(Q9Aggregates_CPU)/sizeof(uint)), 0);
-    MTL::Buffer* pFinalHTBuffer = pDevice->newBuffer(cpu_final_ht.data(), final_ht_size * sizeof(Q9Aggregates_CPU), MTL::ResourceStorageModeShared);
+    // Dense profit array: 25 nations * 8 year-slots = 200 floats. Indexed by
+    // (nationkey * 8 + (year - 1992)) inside q9_probe_directorders_dense_kernel.
+    // Replaces the 256-slot CAS hashtable previously used for global aggregation.
+    static constexpr uint kQ9DenseSlots = 25u * 8u;
+    MTL::Buffer* pFinalHTBuffer = pDevice->newBuffer(kQ9DenseSlots * sizeof(float), MTL::ResourceStorageModeShared);
 
-    // 4. Dispatch the entire 6-stage pipeline (2 warmup + 1 measured)
+    // 4. Dispatch only partsupp build + probe (2 warmup + 1 measured).
     double q9_gpu_compute_time = 0.0;
     
     for(int iter = 0; iter < 3; ++iter) {
-        // Reset Buffers
-        std::memset(pPartBitmapBuffer->contents(), 0, pPartBitmapBuffer->length());
-        std::memset(pSuppMapBuffer->contents(), -1, supp_map_size * sizeof(int));
+        // Reset only the GPU-built/aggregated buffers between iters.
         std::memset(pPartSuppHTBuffer->contents(), 0xFF, partsupp_ht_size * sizeof(int) * 4);
-        std::memset(pOrdersHTBuffer->contents(), 0xFF, orders_ht_size * sizeof(int) * 2);
-        std::memset(pFinalHTBuffer->contents(), 0, final_ht_size * sizeof(Q9Aggregates_CPU));
-        
+        std::memset(pFinalHTBuffer->contents(), 0, kQ9DenseSlots * sizeof(float));
+
         MTL::CommandBuffer* pCommandBuffer = pCommandQueue->commandBuffer();
 
-        // Encoder 1: Build Phase (Stages 1-4)
+        // Encoder 1: PartSupp HT build (kept on GPU — largest table, scales with SF)
         MTL::ComputeCommandEncoder* pBuildEnc = pCommandBuffer->computeCommandEncoder();
-        
-        // Stage 1: Part build (Bitmap)
-        pBuildEnc->setComputePipelineState(pPartBuildPipe);
-        pBuildEnc->setBuffer(pPartKeyBuffer, 0, 0); pBuildEnc->setBuffer(pPartNameBuffer, 0, 1);
-        pBuildEnc->setBuffer(pPartBitmapBuffer, 0, 2); pBuildEnc->setBytes(&part_size, sizeof(part_size), 3);
-        {
-            NS::UInteger threadGroupSize = pPartBuildPipe->maxTotalThreadsPerThreadgroup();
-            if (threadGroupSize > 256) threadGroupSize = 256;
-            MTL::Size threadgroupSize = MTL::Size(threadGroupSize, 1, 1);
-            MTL::Size threadgroups = MTL::Size((part_size + threadGroupSize - 1) / threadGroupSize, 1, 1);
-            pBuildEnc->dispatchThreadgroups(threadgroups, threadgroupSize);
-        }
-        
-        // Stage 2: Supplier build (Direct Map)
-        pBuildEnc->setComputePipelineState(pSuppBuildPipe);
-        pBuildEnc->setBuffer(pSuppKeyBuffer, 0, 0); pBuildEnc->setBuffer(pSuppNationKeyBuffer, 0, 1);
-        pBuildEnc->setBuffer(pSuppMapBuffer, 0, 2); pBuildEnc->setBytes(&supplier_size, sizeof(supplier_size), 3);
-        {
-            NS::UInteger threadGroupSize = pSuppBuildPipe->maxTotalThreadsPerThreadgroup();
-            if (threadGroupSize > 256) threadGroupSize = 256;
-            MTL::Size threadgroupSize = MTL::Size(threadGroupSize, 1, 1);
-            MTL::Size threadgroups = MTL::Size((supplier_size + threadGroupSize - 1) / threadGroupSize, 1, 1);
-            pBuildEnc->dispatchThreadgroups(threadgroups, threadgroupSize);
-        }
-        
-        // Stage 3: PartSupp build
         pBuildEnc->setComputePipelineState(pPartSuppBuildPipe);
         pBuildEnc->setBuffer(pPsPartKeyBuffer, 0, 0); pBuildEnc->setBuffer(pPsSuppKeyBuffer, 0, 1);
         pBuildEnc->setBuffer(pPartSuppHTBuffer, 0, 2); pBuildEnc->setBytes(&partsupp_size, sizeof(partsupp_size), 3);
         pBuildEnc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 4);
-        pBuildEnc->setBuffer(pPartBitmapBuffer, 0, 5); // bitmap pre-filter for green parts
-        // Barrier: ensure part bitmap writes from Stage 1 are visible
-        pBuildEnc->memoryBarrier(MTL::BarrierScopeBuffers);
+        pBuildEnc->setBuffer(pPartBitmapBuffer, 0, 5); // bitmap pre-filter for green parts (CPU-built)
         {
             NS::UInteger threadGroupSize = pPartSuppBuildPipe->maxTotalThreadsPerThreadgroup();
             if (threadGroupSize > 256) threadGroupSize = 256;
@@ -170,42 +153,27 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
             MTL::Size threadgroups = MTL::Size((partsupp_size + threadGroupSize - 1) / threadGroupSize, 1, 1);
             pBuildEnc->dispatchThreadgroups(threadgroups, threadgroupSize);
         }
-        
-        // Stage 4: Orders build
-        pBuildEnc->setComputePipelineState(pOrdersBuildPipe);
-        pBuildEnc->setBuffer(pOrdKeyBuffer, 0, 0); pBuildEnc->setBuffer(pOrdDateBuffer, 0, 1);
-        pBuildEnc->setBuffer(pOrdersHTBuffer, 0, 2); pBuildEnc->setBytes(&orders_size, sizeof(orders_size), 3);
-        pBuildEnc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 4);
-        {
-            NS::UInteger threadGroupSize = pOrdersBuildPipe->maxTotalThreadsPerThreadgroup();
-            if (threadGroupSize > 256) threadGroupSize = 256;
-            MTL::Size threadgroupSize = MTL::Size(threadGroupSize, 1, 1);
-            MTL::Size threadgroups = MTL::Size((orders_size + threadGroupSize - 1) / threadGroupSize, 1, 1);
-            pBuildEnc->dispatchThreadgroups(threadgroups, threadgroupSize);
-        }
-        
         pBuildEnc->endEncoding();
 
         // Encoder 2: Probe & Direct Global Aggregation (single kernel, no merge needed)
         MTL::ComputeCommandEncoder* pProbeEnc = pCommandBuffer->computeCommandEncoder();
         
-        // Probe + global aggregation
+        // Probe + dense global aggregation. Uses non-atomic RO reads on partsupp HT
+        // (cached in L2) + direct array lookup for orders + dense [25*8] float
+        // accumulator indexed by (nationkey, year).
         pProbeEnc->setComputePipelineState(pProbeAggPipe);
         pProbeEnc->setBuffer(pLineSuppKeyBuffer, 0, 0); pProbeEnc->setBuffer(pLinePartKeyBuffer, 0, 1);
         pProbeEnc->setBuffer(pLineOrdKeyBuffer, 0, 2); pProbeEnc->setBuffer(pLinePriceBuffer, 0, 3);
         pProbeEnc->setBuffer(pLineDiscBuffer, 0, 4); pProbeEnc->setBuffer(pLineQtyBuffer, 0, 5);
-        pProbeEnc->setBuffer(pPsSupplyCostBuffer, 0, 6); 
+        pProbeEnc->setBuffer(pPsSupplyCostBuffer, 0, 6);
         pProbeEnc->setBuffer(pPartBitmapBuffer, 0, 7);
         pProbeEnc->setBuffer(pSuppMapBuffer, 0, 8);
         pProbeEnc->setBuffer(pPartSuppHTBuffer, 0, 9);
         pProbeEnc->setBuffer(pOrdersHTBuffer, 0, 10);
         pProbeEnc->setBuffer(pFinalHTBuffer, 0, 11);
         pProbeEnc->setBytes(&lineitem_size, sizeof(lineitem_size), 12);
-        pProbeEnc->setBytes(&part_ht_size, sizeof(part_ht_size), 13);
-        pProbeEnc->setBytes(&supplier_ht_size, sizeof(supplier_ht_size), 14);
-        pProbeEnc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 15);
-        pProbeEnc->setBytes(&orders_ht_size, sizeof(orders_ht_size), 16);
-        pProbeEnc->setBytes(&final_ht_size, sizeof(final_ht_size), 17);
+        pProbeEnc->setBytes(&partsupp_ht_size, sizeof(partsupp_ht_size), 13);
+        pProbeEnc->setBytes(&orders_map_size, sizeof(orders_map_size), 14);
         pProbeEnc->dispatchThreadgroups(MTL::Size(num_threadgroups, 1, 1), MTL::Size(1024, 1, 1));
         
         pProbeEnc->endEncoding();
@@ -219,9 +187,43 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
         }
     }
 
-    // 6. CPU post-processing: read, aggregate, and sort results
+    // 6. CPU post-processing: read dense [25*8] profit array and emit results.
     auto q9_cpu_post_start = std::chrono::high_resolution_clock::now();
-    postProcessQ9(pFinalHTBuffer->contents(), final_ht_size, nation_names);
+    {
+        const float* profits = (const float*)pFinalHTBuffer->contents();
+        struct Q9Row { int nation; int year; float profit; };
+        std::vector<Q9Row> rows;
+        rows.reserve(kQ9DenseSlots);
+        for (uint slot = 0; slot < kQ9DenseSlots; ++slot) {
+            float p = profits[slot];
+            if (p == 0.0f) continue;
+            int nation = (int)(slot / 8u);
+            int year = 1992 + (int)(slot % 8u);
+            rows.push_back({nation, year, p});
+        }
+        std::sort(rows.begin(), rows.end(), [](const Q9Row& a, const Q9Row& b) {
+            if (a.nation != b.nation) return a.nation < b.nation;
+            return a.year > b.year;
+        });
+        printf("\nTPC-H Query 9 Results (Top 15):\n");
+        printf("+------------+------+---------------+\n");
+        printf("| Nation     | Year |        Profit |\n");
+        printf("+------------+------+---------------+\n");
+        for (size_t i = 0; i < 15 && i < rows.size(); ++i) {
+            printf("| %-10s | %4d | $%13.2f |\n",
+                   nation_names[rows[i].nation].c_str(), rows[i].year, rows[i].profit);
+        }
+        printf("+------------+------+---------------+\n");
+        printf("Total results found: %lu\n", rows.size());
+        std::map<int, double> year_totals;
+        for (const auto& r : rows) year_totals[r.year] += (double)r.profit;
+        printf("\nComparable TPC-H Q9 (yearly sum_profit):\n");
+        printf("+--------+---------------+\n");
+        printf("| o_year |   sum_profit  |\n");
+        printf("+--------+---------------+\n");
+        for (const auto& kv : year_totals) printf("| %6d | %13.4f |\n", kv.first, kv.second);
+        printf("+--------+---------------+\n");
+    }
     auto q9_cpu_post_end = std::chrono::high_resolution_clock::now();
     double q9_cpu_ms = std::chrono::duration<double, std::milli>(q9_cpu_post_end - q9_cpu_post_start).count();
 
@@ -230,11 +232,11 @@ void runQ9Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printTimingSummary(q9CpuParseMs, q9GpuMs, q9_cpu_ms);
     
     // Release all
-    releaseAll(pPartBuildPipe, pSuppBuildPipe, pPartSuppBuildPipe, pOrdersBuildPipe, pProbeAggPipe,
-              pPartKeyBuffer, pPartNameBuffer, pPartBitmapBuffer,
-              pSuppKeyBuffer, pSuppNationKeyBuffer, pSuppMapBuffer,
+    releaseAll(pPartSuppBuildPipe, pProbeAggPipe,
+              pPartBitmapBuffer,
+              pSuppMapBuffer,
               pPsPartKeyBuffer, pPsSuppKeyBuffer, pPsSupplyCostBuffer, pPartSuppHTBuffer,
-              pOrdKeyBuffer, pOrdDateBuffer, pOrdersHTBuffer,
+              pOrdersHTBuffer,
               pLinePartKeyBuffer, pLineSuppKeyBuffer, pLineOrdKeyBuffer,
               pLineQtyBuffer, pLinePriceBuffer, pLineDiscBuffer,
               pFinalHTBuffer);

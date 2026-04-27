@@ -392,3 +392,76 @@ kernel void q9_probe_directorders_kernel(
         }
     }
 }
+
+
+// KERNEL 7: Dense-agg probe (SF1/SF10).
+// Replaces the open-addressing CAS hashtable used for the FINAL Q9 aggregation
+// with a dense [25 nations * 8 year-slots] = 200-slot float array indexed by
+// (nationkey * 8 + (year - 1992)). Q9 has fixed result cardinality (TPC-H has
+// exactly 25 nations and dates land in 1992-1998), so hashing is unnecessary.
+// Eliminates per-row CAS-claim contention which was the dominant cost on SF10.
+kernel void q9_probe_directorders_dense_kernel(
+    // lineitem columns
+    const device int* l_suppkey [[buffer(0)]],
+    const device int* l_partkey [[buffer(1)]],
+    const device int* l_orderkey [[buffer(2)]],
+    const device float* l_extendedprice [[buffer(3)]],
+    const device float* l_discount [[buffer(4)]],
+    const device float* l_quantity [[buffer(5)]],
+    const device float* ps_supplycost [[buffer(6)]],
+    // Pre-built lookups
+    const device uint* part_bitmap [[buffer(7)]],
+    const device int* supplier_nation_map [[buffer(8)]],
+    const device PartSuppEntryRO* partsupp_ht [[buffer(9)]],
+    const device int* orders_year_map [[buffer(10)]],
+    // Dense agg output: profit[nationkey*8 + (year - 1992)]
+    device atomic_float* profit_dense [[buffer(11)]],
+    // Parameters
+    constant uint& lineitem_size [[buffer(12)]],
+    constant uint& partsupp_ht_size [[buffer(13)]],
+    constant uint& orders_map_size [[buffer(14)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_id_in_group [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
+{
+    const uint global_tid = (group_id * threads_per_group) + thread_id_in_group;
+    const uint BATCH = 4;
+    const uint stride = grid_size * BATCH;
+    const uint ps_mask = partsupp_ht_size - 1;
+
+    for (uint base = global_tid * BATCH; base < lineitem_size; base += stride) {
+        for (uint k = 0; k < BATCH; ++k) {
+            uint i = base + k;
+            if (i >= lineitem_size) break;
+
+            int partkey = l_partkey[i];
+            if (!bitmap_test(part_bitmap, partkey)) continue;
+
+            int suppkey = l_suppkey[i];
+            int nationkey = supplier_nation_map[suppkey];
+            if (nationkey < 0 || nationkey >= 25) continue;
+
+            int ps_idx = -1;
+            uint ps_hash = ((uint)partkey * 0x9E3779B1u ^ (uint)suppkey * 0x85EBCA77u) & ps_mask;
+            for (uint j = 0; j <= ps_mask; ++j) {
+                uint probe_idx = (ps_hash + j) & ps_mask;
+                int pk2 = partsupp_ht[probe_idx].partkey;
+                if (pk2 == -1) break;
+                if (pk2 == partkey && partsupp_ht[probe_idx].suppkey == suppkey) {
+                    ps_idx = partsupp_ht[probe_idx].idx;
+                    break;
+                }
+            }
+            if (ps_idx == -1) continue;
+
+            int orderkey = l_orderkey[i];
+            int year = ((uint)orderkey < orders_map_size) ? orders_year_map[orderkey] : -1;
+            if (year < 1992 || year > 1998) continue;
+
+            float profit = l_extendedprice[i] * (1.0f - l_discount[i]) - ps_supplycost[ps_idx] * l_quantity[i];
+            uint slot = (uint)(nationkey * 8 + (year - 1992));
+            atomic_fetch_add_explicit(&profit_dense[slot], profit, memory_order_relaxed);
+        }
+    }
+}

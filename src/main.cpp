@@ -188,13 +188,28 @@ int main(int argc, const char * argv[]) {
     };
 
     auto& benchmarks = g_sf100_mode ? sf100_benchmarks : std_benchmarks;
+
+    // Resolve human-readable scale-factor label for timing output.
+    auto sfLabel = []() -> std::string {
+        if (g_dataset_path.find("SF-100") != std::string::npos) return "SF-100";
+        if (g_dataset_path.find("SF-10")  != std::string::npos) return "SF-10";
+        return "SF-1";
+    };
+    g_current_sf = sfLabel();
+
+    auto dispatchOne = [&](const std::string& name, BenchFn fn) {
+        g_current_query = name;          // drives TIMING_CSV line
+        g_detailed_timing.reset();       // fresh per-stage accumulator
+        fn(device, commandQueue, library);
+    };
+
     if (query == "all") {
-        for (auto& [name, fn] : benchmarks) fn(device, commandQueue, library);
+        for (auto& [name, fn] : benchmarks) dispatchOne(name, fn);
     } else {
         auto it = std::find_if(benchmarks.begin(), benchmarks.end(),
                                [&](const BenchEntry& e) { return e.first == query; });
         if (it != benchmarks.end()) {
-            it->second(device, commandQueue, library);
+            dispatchOne(it->first, it->second);
         } else {
             std::cerr << "Unknown query: " << query << std::endl;
             std::cerr << "Use 'help' to see available options." << std::endl;

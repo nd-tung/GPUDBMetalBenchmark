@@ -10,27 +10,24 @@ void runQ15Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     auto parseStart = std::chrono::high_resolution_clock::now();
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
-    auto& l_suppkey = lCols.ints(2); auto& l_shipdate = lCols.ints(10);
-    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}});
 
-    auto sCols = loadColumnsMulti(sf_path + "supplier.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {4, ColType::CHAR_FIXED, 15}});
-    auto& s_suppkey = sCols.ints(0); auto& s_name = sCols.chars(1); auto& s_address = sCols.chars(2); auto& s_phone = sCols.chars(4);
+    auto sCols = loadQueryColumns(device, sf_path + "supplier.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}, {2, ColType::CHAR_FIXED, 40}, {4, ColType::CHAR_FIXED, 15}});
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
-    uint liSize = (uint)l_suppkey.size();
+    uint liSize = (uint)lCols.rows();
     int max_suppkey = 0;
-    for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
+    for (int k : sCols.intSpan(0)) max_suppkey = std::max(max_suppkey, k);
     uint map_size = max_suppkey + 1;
 
     auto pAggregatePipe = createPipeline(device, library, "q15_aggregate_revenue_kernel");
     if (!pAggregatePipe) return;
 
-    MTL::Buffer* pSuppKeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pShipDateBuf = device->newBuffer(l_shipdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pExtPriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pDiscountBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pSuppKeyBuf = lCols.buffer(2);
+    MTL::Buffer* pShipDateBuf = lCols.buffer(10);
+    MTL::Buffer* pExtPriceBuf = lCols.buffer(5);
+    MTL::Buffer* pDiscountBuf = lCols.buffer(6);
     MTL::Buffer* pRevenueMapBuf = device->newBuffer(map_size * sizeof(float), MTL::ResourceStorageModeShared);
 
     int date_start = 19960101, date_end = 19960401;
@@ -68,7 +65,8 @@ void runQ15Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 
     // Build suppkey → row index
     std::vector<size_t> supp_index(map_size, SIZE_MAX);
-    for (size_t i = 0; i < s_suppkey.size(); i++) supp_index[s_suppkey[i]] = i;
+    const int* s_suppkey_p = sCols.ints(0);
+    for (size_t i = 0; i < sCols.rows(); i++) supp_index[s_suppkey_p[i]] = i;
 
     printf("\nTPC-H Q15 Results:\n");
     printf("+---------+------------------+------------------+------------------+------------------+\n");
@@ -80,9 +78,9 @@ void runQ15Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
             if (si == SIZE_MAX) continue;
             printf("| %7d | %-16s | %-16s | %-16s | %16.2f |\n",
                    (int)i,
-                   trimFixed(s_name.data(), si, 25).c_str(),
-                   trimFixed(s_address.data(), si, 40).c_str(),
-                   trimFixed(s_phone.data(), si, 15).c_str(),
+                   trimFixed(sCols.chars(1), si, 25).c_str(),
+                   trimFixed(sCols.chars(2), si, 40).c_str(),
+                   trimFixed(sCols.chars(4), si, 15).c_str(),
                    revenue_map[i]);
         }
     }
@@ -95,7 +93,8 @@ void runQ15Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ15 | %u rows (lineitem)\n", liSize);
     printTimingSummary(cpuParseMs, gpuMs, cpuPostMs);
 
-    releaseAll(pAggregatePipe, pSuppKeyBuf, pShipDateBuf, pExtPriceBuf, pDiscountBuf, pRevenueMapBuf);
+    releaseAll(pAggregatePipe, pRevenueMapBuf);
+    // Input buffers owned by lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

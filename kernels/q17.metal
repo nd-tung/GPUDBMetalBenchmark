@@ -30,6 +30,21 @@ kernel void q17_aggregate_qty_stats_kernel(
     }
 }
 
+// Pass 1.5 (GPU): compute threshold[pk] = 0.2 * sum/count for each qualifying partkey.
+// Eliminates host-side sync (commit/wait) between the two passes — they now share
+// a single command buffer with a memory barrier in between.
+kernel void q17_compute_threshold_kernel(
+    const device float* sum_qty_map      [[buffer(0)]],
+    const device uint* count_map         [[buffer(1)]],
+    device float* threshold_map          [[buffer(2)]],
+    constant uint& map_size              [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= map_size) return;
+    uint cnt = count_map[gid];
+    threshold_map[gid] = (cnt > 0u) ? (0.2f * (sum_qty_map[gid] / (float)cnt)) : 0.0f;
+}
+
 // Pass 2: Sum extendedprice where qty < threshold
 kernel void q17_sum_revenue_kernel(
     const device int* l_partkey          [[buffer(0)]],

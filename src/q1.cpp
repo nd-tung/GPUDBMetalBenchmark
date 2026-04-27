@@ -10,46 +10,46 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     auto q1ParseStart = std::chrono::high_resolution_clock::now();
     const std::string filepath = g_dataset_path + "lineitem.tbl";
-    auto cols = loadColumnsMulti(filepath, {
+    auto cols = loadQueryColumns(device, filepath, {
         {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {7, ColType::FLOAT},
         {8, ColType::CHAR1}, {9, ColType::CHAR1}, {10, ColType::DATE}
     });
-    auto& l_quantity = cols.floats(4); auto& l_extendedprice = cols.floats(5);
-    auto& l_discount = cols.floats(6); auto& l_tax = cols.floats(7);
-    auto& l_returnflag = cols.chars(8); auto& l_linestatus = cols.chars(9);
-    auto& l_shipdate = cols.ints(10);
     auto q1ParseEnd = std::chrono::high_resolution_clock::now();
     double q1CpuParseMs = std::chrono::duration<double, std::milli>(q1ParseEnd - q1ParseStart).count();
-    const uint data_size = (uint)l_shipdate.size();
+    const uint data_size = (uint)cols.rows();
     if (data_size == 0) { std::cerr << "Q1: no data loaded" << std::endl; return; }
 
     // Create pipeline for fused single-pass Q1
     auto fusedPSO = createPipeline(device, library, "q1_fused_kernel");
     if (!fusedPSO) return;
 
-    // Create buffers for columns
-    MTL::Buffer* shipdateBuffer = device->newBuffer(l_shipdate.data(), data_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* flagBuffer = device->newBuffer(l_returnflag.data(), data_size * sizeof(char), MTL::ResourceStorageModeShared);
-    MTL::Buffer* statusBuffer = device->newBuffer(l_linestatus.data(), data_size * sizeof(char), MTL::ResourceStorageModeShared);
-    MTL::Buffer* qtyBuffer = device->newBuffer(l_quantity.data(), data_size * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* priceBuffer = device->newBuffer(l_extendedprice.data(), data_size * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* discBuffer = device->newBuffer(l_discount.data(), data_size * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* taxBuffer = device->newBuffer(l_tax.data(), data_size * sizeof(float), MTL::ResourceStorageModeShared);
+    // Inputs from QueryColumns (zero-copy when .colbin v2 present).
+    MTL::Buffer* shipdateBuffer = cols.buffer(10);
+    MTL::Buffer* flagBuffer     = cols.buffer(8);
+    MTL::Buffer* statusBuffer   = cols.buffer(9);
+    MTL::Buffer* qtyBuffer      = cols.buffer(4);
+    MTL::Buffer* priceBuffer    = cols.buffer(5);
+    MTL::Buffer* discBuffer     = cols.buffer(6);
+    MTL::Buffer* taxBuffer      = cols.buffer(7);
 
-    // Output buffers: 6 bins, long metrics stored as lo/hi uint pairs
+    // Output buffer: single packed [60] atomic_uint, stride 10 per bin.
+    // Layout per bin: qty_lo, qty_hi, base_lo, base_hi, disc_lo, disc_hi,
+    //                 charge_lo, charge_hi, disc_bp, count.
     const uint bins = 6;
-    const uint num_threadgroups = 1024;
+    const uint kQ1AggsCount = bins * 10;  // 60 uints
+    // Threadgroup count: 1024 TGs maximises in-flight occupancy on M1 / latency-hiding
+    // for the lineitem scan. Atomic contention is bounded because the kernel does a
+    // full TG-local reduction (`tg_reduce_*`) and only emits 6×ops atomic writes per TG.
+    // We still cap by row count so tiny SF inputs don't dispatch idle TGs.
+    uint num_threadgroups = 1024;
+    {
+        const uint tg_threads = 1024;
+        uint required = (data_size + tg_threads - 1) / tg_threads;
+        if (required < 32) required = 32;
+        if (num_threadgroups > required) num_threadgroups = required;
+    }
 
-    MTL::Buffer* out_qty_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_qty_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_base_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_base_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_disc_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_disc_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_charge_lo = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_charge_hi = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_discount_bp = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* out_count = device->newBuffer(bins * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* aggsBuffer = device->newBuffer(kQ1AggsCount * sizeof(uint32_t), MTL::ResourceStorageModeShared);
 
     const int cutoffDate = 19980902; // DATE '1998-12-01' - INTERVAL '90' DAY
 
@@ -57,17 +57,8 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     double q1_gpu_ms = 0.0;
     
     for(int iter = 0; iter < 3; ++iter) {
-        // Zero all output buffers
-        memset(out_qty_lo->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_qty_hi->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_base_lo->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_base_hi->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_disc_lo->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_disc_hi->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_charge_lo->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_charge_hi->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_discount_bp->contents(), 0, bins * sizeof(uint32_t));
-        memset(out_count->contents(), 0, bins * sizeof(uint32_t));
+        // Zero packed output buffer
+        memset(aggsBuffer->contents(), 0, kQ1AggsCount * sizeof(uint32_t));
 
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
         MTL::ComputeCommandEncoder* enc = commandBuffer->computeCommandEncoder();
@@ -80,18 +71,9 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
         enc->setBuffer(priceBuffer, 0, 4);
         enc->setBuffer(discBuffer, 0, 5);
         enc->setBuffer(taxBuffer, 0, 6);
-        enc->setBuffer(out_qty_lo, 0, 7);
-        enc->setBuffer(out_qty_hi, 0, 8);
-        enc->setBuffer(out_base_lo, 0, 9);
-        enc->setBuffer(out_base_hi, 0, 10);
-        enc->setBuffer(out_disc_lo, 0, 11);
-        enc->setBuffer(out_disc_hi, 0, 12);
-        enc->setBuffer(out_charge_lo, 0, 13);
-        enc->setBuffer(out_charge_hi, 0, 14);
-        enc->setBuffer(out_discount_bp, 0, 15);
-        enc->setBuffer(out_count, 0, 16);
-        enc->setBytes(&data_size, sizeof(data_size), 17);
-        enc->setBytes(&cutoffDate, sizeof(cutoffDate), 18);
+        enc->setBuffer(aggsBuffer, 0, 7);
+        enc->setBytes(&data_size, sizeof(data_size), 8);
+        enc->setBytes(&cutoffDate, sizeof(cutoffDate), 9);
         NS::UInteger tgSize = fusedPSO->maxTotalThreadsPerThreadgroup();
         if (tgSize > 1024) tgSize = 1024;
         enc->dispatchThreadgroups(MTL::Size::Make(num_threadgroups, 1, 1), MTL::Size::Make(tgSize, 1, 1));
@@ -108,17 +90,8 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     // CPU post-processing (build final results) timing start
     auto q1_cpu_post_start = std::chrono::high_resolution_clock::now();
 
-    // Read back final results from lo/hi pairs
-    uint32_t* qty_lo = (uint32_t*)out_qty_lo->contents();
-    uint32_t* qty_hi = (uint32_t*)out_qty_hi->contents();
-    uint32_t* base_lo = (uint32_t*)out_base_lo->contents();
-    uint32_t* base_hi = (uint32_t*)out_base_hi->contents();
-    uint32_t* disc_lo = (uint32_t*)out_disc_lo->contents();
-    uint32_t* disc_hi = (uint32_t*)out_disc_hi->contents();
-    uint32_t* charge_lo = (uint32_t*)out_charge_lo->contents();
-    uint32_t* charge_hi = (uint32_t*)out_charge_hi->contents();
-    uint32_t* sum_discount_bp = (uint32_t*)out_discount_bp->contents();
-    uint32_t* counts = (uint32_t*)out_count->contents();
+    // Read back final results from packed buffer
+    const uint32_t* aggs = (const uint32_t*)aggsBuffer->contents();
 
     auto reconstruct_long = [](uint32_t lo, uint32_t hi) -> long {
         uint64_t v = ((uint64_t)hi << 32) | (uint64_t)lo;
@@ -128,18 +101,20 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     struct Q1Result { double sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc; uint count; };
     std::map<std::pair<char,char>, Q1Result> final_results;
     auto emit_bin = [&](int rfIdx, int lsIdx, int bin){
-        if (counts[bin] == 0) return;
+        const uint32_t* row = aggs + bin * 10;
+        uint count = row[9];
+        if (count == 0) return;
         char rf = (rfIdx==0?'A':rfIdx==1?'N':'R');
         char ls = (lsIdx==0?'F':'O');
         Q1Result r;
-        r.sum_qty = (double)reconstruct_long(qty_lo[bin], qty_hi[bin]) / 100.0;
-        r.sum_base_price = (double)reconstruct_long(base_lo[bin], base_hi[bin]) / 100.0;
-        r.sum_disc_price = (double)reconstruct_long(disc_lo[bin], disc_hi[bin]) / 100.0;
-        r.sum_charge = (double)reconstruct_long(charge_lo[bin], charge_hi[bin]) / 100.0;
-        r.count = counts[bin];
-        r.avg_qty = r.sum_qty / (double)r.count;
+        r.sum_qty        = (double)reconstruct_long(row[0], row[1]) / 100.0;
+        r.sum_base_price = (double)reconstruct_long(row[2], row[3]) / 100.0;
+        r.sum_disc_price = (double)reconstruct_long(row[4], row[5]) / 100.0;
+        r.sum_charge     = (double)reconstruct_long(row[6], row[7]) / 100.0;
+        r.count          = count;
+        r.avg_qty   = r.sum_qty        / (double)r.count;
         r.avg_price = r.sum_base_price / (double)r.count;
-        r.avg_disc = ((double)sum_discount_bp[bin] / 100.0) / (double)r.count;
+        r.avg_disc  = ((double)row[8] / 100.0) / (double)r.count;
         final_results[{rf, ls}] = r;
     };
     emit_bin(0,0,0); // A/F
@@ -165,11 +140,9 @@ void runQ1Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     printf("\nQ1 | %u rows\n", data_size);
     printTimingSummary(q1CpuParseMs, q1_gpu_ms, q1_cpu_ms);
 
-    releaseAll(fusedPSO, shipdateBuffer, flagBuffer, statusBuffer,
-              qtyBuffer, priceBuffer, discBuffer, taxBuffer,
-              out_qty_lo, out_qty_hi, out_base_lo, out_base_hi,
-              out_disc_lo, out_disc_hi, out_charge_lo, out_charge_hi,
-              out_discount_bp, out_count);
+    releaseAll(fusedPSO, aggsBuffer);
+    // Input buffers (shipdate/flag/status/qty/price/disc/tax) are owned by
+    // `cols` (QueryColumns) and released on scope exit.
 }
 
 

@@ -19,14 +19,12 @@ void runQ11Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     auto& s_suppkey = s.suppkey;
     auto& s_nationkey = s.nationkey;
 
-    auto psCols = loadColumnsMulti(sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {3, ColType::FLOAT}});
-    auto& ps_partkey = psCols.ints(0); auto& ps_suppkey = psCols.ints(1);
-    auto& ps_availqty = psCols.ints(2); auto& ps_supplycost = psCols.floats(3);
+    auto psCols = loadQueryColumns(device, sf_path + "partsupp.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {3, ColType::FLOAT}});
 
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
-    const uint partsupp_size = (uint)ps_partkey.size();
+    const uint partsupp_size = (uint)psCols.rows();
     const uint supplier_size = (uint)s_suppkey.size();
     std::cout << "Loaded data. PartSupp: " << partsupp_size << ", Supplier: " << supplier_size << std::endl;
 
@@ -48,7 +46,7 @@ void runQ11Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     if (!pAggregatePipe) return;
 
     int max_partkey = 0;
-    for (int k : ps_partkey) max_partkey = std::max(max_partkey, k);
+    for (int k : psCols.intSpan(0)) max_partkey = std::max(max_partkey, k);
     const uint value_map_size = (uint)(max_partkey + 1);
 
     // Compute number of threadgroups for partial sums
@@ -56,10 +54,10 @@ void runQ11Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const uint num_threadgroups = (partsupp_size + tg_size - 1) / tg_size;
 
     // 4. Create GPU buffers
-    MTL::Buffer* pPsPartKeyBuf = device->newBuffer(ps_partkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPsSuppKeyBuf = device->newBuffer(ps_suppkey.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPsSupplyCostBuf = device->newBuffer(ps_supplycost.data(), partsupp_size * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pPsAvailQtyBuf = device->newBuffer(ps_availqty.data(), partsupp_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pPsPartKeyBuf = psCols.buffer(0);
+    MTL::Buffer* pPsSuppKeyBuf = psCols.buffer(1);
+    MTL::Buffer* pPsSupplyCostBuf = psCols.buffer(3);
+    MTL::Buffer* pPsAvailQtyBuf = psCols.buffer(2);
     MTL::Buffer* pSuppBitmapBuf = device->newBuffer(cpu_supp_bitmap.data(), supp_bitmap_ints * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* pValueMapBuf = device->newBuffer(value_map_size * sizeof(float), MTL::ResourceStorageModeShared);
     MTL::Buffer* pPartialSumsBuf = device->newBuffer(num_threadgroups * sizeof(float), MTL::ResourceStorageModeShared);
@@ -133,8 +131,8 @@ void runQ11Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ11 | %u rows (partsupp)\n", partsupp_size);
     printTimingSummary(cpuParseMs, gpuMs, cpuPostMs);
 
-    releaseAll(pAggregatePipe, pPsPartKeyBuf, pPsSuppKeyBuf, pPsSupplyCostBuf,
-              pPsAvailQtyBuf, pSuppBitmapBuf, pValueMapBuf, pPartialSumsBuf);
+    releaseAll(pAggregatePipe, pSuppBitmapBuf, pValueMapBuf, pPartialSumsBuf);
+    // Input buffers owned by psCols (QueryColumns).
 }
 
 

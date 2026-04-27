@@ -12,17 +12,15 @@ void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     const std::string sf_path = g_dataset_path;
 
     // Load lineitem columns for late-delivery bitmap
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {11, ColType::DATE}, {12, ColType::DATE}});
-    auto& l_orderkey = lCols.ints(0); auto& l_commitdate = lCols.ints(11); auto& l_receiptdate = lCols.ints(12);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{0, ColType::INT}, {11, ColType::DATE}, {12, ColType::DATE}});
 
     // Load orders columns
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {4, ColType::DATE}, {5, ColType::CHAR1}});
-    auto& o_orderkey = oCols.ints(0); auto& o_orderdate = oCols.ints(4); auto& o_orderpriority = oCols.chars(5);
+    auto oCols = loadQueryColumns(device, sf_path + "orders.tbl", {{0, ColType::INT}, {4, ColType::DATE}, {5, ColType::CHAR1}});
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
-    uint liSize = (uint)l_orderkey.size();
-    uint ordSize = (uint)o_orderkey.size();
+    uint liSize = (uint)lCols.rows();
+    uint ordSize = (uint)oCols.rows();
     if (liSize == 0 || ordSize == 0) { std::cerr << "Q4: no data loaded" << std::endl; return; }
     std::cout << "Loaded " << liSize << " lineitem, " << ordSize << " orders rows for Q4." << std::endl;
 
@@ -33,21 +31,22 @@ void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     // Bitmap size based on max orderkey
     int max_orderkey = 0;
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
-    for (int k : l_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
+    for (int k : lCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     uint bitmapInts = (max_orderkey + 31) / 32 + 1;
 
-    const int numTG = 2048;
+    // Cap dispatch by input size; pick larger of the two scan inputs (lineitem/orders).
+    const int numTG = std::min(2048, (int)((std::max(liSize, ordSize) + 1023u) / 1024u));
     int date_start = 19930701, date_end = 19931001;
 
-    MTL::Buffer* liOrderkeyBuf  = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* liCommitBuf    = device->newBuffer(l_commitdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* liReceiptBuf   = device->newBuffer(l_receiptdate.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* liOrderkeyBuf  = lCols.buffer(0);
+    MTL::Buffer* liCommitBuf    = lCols.buffer(11);
+    MTL::Buffer* liReceiptBuf   = lCols.buffer(12);
     MTL::Buffer* lateBitmapBuf  = device->newBuffer(bitmapInts * sizeof(uint), MTL::ResourceStorageModeShared);
     memset(lateBitmapBuf->contents(), 0, bitmapInts * sizeof(uint));
-    MTL::Buffer* ordKeyBuf  = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* ordDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* ordPrioBuf = device->newBuffer(o_orderpriority.data(), ordSize * sizeof(char), MTL::ResourceStorageModeShared);
+    MTL::Buffer* ordKeyBuf  = oCols.buffer(0);
+    MTL::Buffer* ordDateBuf = oCols.buffer(4);
+    MTL::Buffer* ordPrioBuf = oCols.buffer(5);
     MTL::Buffer* partialBuf = device->newBuffer(numTG * 5 * sizeof(uint), MTL::ResourceStorageModeShared);
     MTL::Buffer* finalBuf   = device->newBuffer(5 * sizeof(uint), MTL::ResourceStorageModeShared);
 
@@ -124,8 +123,8 @@ void runQ4Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
     releaseAll(bitmapPSO, s1PSO, s2PSO,
-               liOrderkeyBuf, liCommitBuf, liReceiptBuf,
-               lateBitmapBuf, ordKeyBuf, ordDateBuf, ordPrioBuf, partialBuf, finalBuf);
+               lateBitmapBuf, partialBuf, finalBuf);
+    // Input buffers owned by lCols/oCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

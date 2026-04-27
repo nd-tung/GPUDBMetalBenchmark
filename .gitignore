@@ -11,6 +11,7 @@ kernels/*.metallib
 # TPC-H data files
 data/**/*.tbl
 data/**/*.duckdb
+data/**/*.colbin
 
 # macOS system files
 .DS_Store
@@ -29,3 +30,5 @@ results/old_format/
 
 # Tooling
 temp_tpch/
+
+OPTIMIZATION_PLAN.md

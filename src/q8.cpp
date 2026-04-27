@@ -11,22 +11,17 @@ void runQ8Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
 
     auto parseStart = std::chrono::high_resolution_clock::now();
     // Part: filter p_type = 'ECONOMY ANODIZED STEEL'
-    auto pCols = loadColumnsMulti(sf_path + "part.tbl", {{0, ColType::INT}, {4, ColType::CHAR_FIXED, 25}});
-    auto& p_partkey = pCols.ints(0); auto& p_type = pCols.chars(4);
+    auto pCols = loadQueryColumns(device, sf_path + "part.tbl", {{0, ColType::INT}, {4, ColType::CHAR_FIXED, 25}});
 
     auto s = loadSupplierBasic(sf_path);
     auto& s_suppkey = s.suppkey;
     auto& s_nationkey = s.nationkey;
 
-    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
-    auto& c_custkey = cCols.ints(0); auto& c_nationkey = cCols.ints(3);
+    auto cCols = loadQueryColumns(device, sf_path + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
 
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
-    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1); auto& o_orderdate = oCols.ints(4);
+    auto oCols = loadQueryColumns(device, sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
-    auto& l_orderkey = lCols.ints(0); auto& l_partkey = lCols.ints(1); auto& l_suppkey = lCols.ints(2);
-    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{0, ColType::INT}, {1, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
 
     auto nat = loadNation(sf_path, true);
     auto reg = loadRegion(sf_path);
@@ -38,20 +33,24 @@ void runQ8Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     int brazil_nk = findNationKey(nat, "BRAZIL");
 
     // Build part bitmap: p_type = 'ECONOMY ANODIZED STEEL'
-    auto part_bm = buildCPUBitmap(p_partkey, [&](size_t i) {
-        return trimFixed(p_type.data(), i, 25) == "ECONOMY ANODIZED STEEL";
+    const char* p_type_p = pCols.chars(4);
+    auto part_bm = buildCPUBitmap(pCols.ints(0), pCols.rows(), [&](size_t i) {
+        return trimFixed(p_type_p, i, 25) == "ECONOMY ANODIZED STEEL";
     });
 
     // Build customer→nationkey map (only AMERICA customers)
+    const int* c_custkey_p = cCols.ints(0);
+    const int* c_nationkey_p = cCols.ints(3);
+    size_t custCount = cCols.rows();
     int max_custkey = 0;
-    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    for (size_t i = 0; i < custCount; i++) max_custkey = std::max(max_custkey, c_custkey_p[i]);
     uint cust_map_size = max_custkey + 1;
     std::vector<int> cust_nation_map(cust_map_size, -1);
     uint america_bitmap = buildNationBitmap(nat.nationkey, nat.regionkey, america_rk);
-    for (size_t i = 0; i < c_custkey.size(); i++) {
-        int nk = c_nationkey[i];
+    for (size_t i = 0; i < custCount; i++) {
+        int nk = c_nationkey_p[i];
         if ((america_bitmap >> nk) & 1)
-            cust_nation_map[c_custkey[i]] = nk;
+            cust_nation_map[c_custkey_p[i]] = nk;
     }
 
     // Build supplier→nationkey map
@@ -61,11 +60,11 @@ void runQ8Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     std::vector<int> supp_nation_map(supp_map_size, -1);
     for (size_t i = 0; i < s_suppkey.size(); i++) supp_nation_map[s_suppkey[i]] = s_nationkey[i];
 
-    uint ordSize = (uint)o_orderkey.size();
-    uint liSize = (uint)l_orderkey.size();
+    uint ordSize = (uint)oCols.rows();
+    uint liSize = (uint)lCols.rows();
 
     int max_orderkey = 0;
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     uint ord_map_size = max_orderkey + 1;
 
     auto pBuildOrdersPipe = createPipeline(device, library, "q8_build_orders_map_kernel");
@@ -76,17 +75,17 @@ void runQ8Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     MTL::Buffer* pCustNationMapBuf = device->newBuffer(cust_nation_map.data(), cust_map_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pSuppNationMapBuf = device->newBuffer(supp_nation_map.data(), supp_map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCustBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdKeyBuf = oCols.buffer(0);
+    MTL::Buffer* pOrdCustBuf = oCols.buffer(1);
+    MTL::Buffer* pOrdDateBuf = oCols.buffer(4);
     MTL::Buffer* pOrdCustMapBuf = device->newBuffer((size_t)ord_map_size * sizeof(int), MTL::ResourceStorageModeShared);
     MTL::Buffer* pOrdYearMapBuf = device->newBuffer((size_t)ord_map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLinePartKeyBuf = device->newBuffer(l_partkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineSuppKeyBuf = device->newBuffer(l_suppkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLinePriceBuf = device->newBuffer(l_extendedprice.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineDiscBuf = device->newBuffer(l_discount.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineOrdKeyBuf = lCols.buffer(0);
+    MTL::Buffer* pLinePartKeyBuf = lCols.buffer(1);
+    MTL::Buffer* pLineSuppKeyBuf = lCols.buffer(2);
+    MTL::Buffer* pLinePriceBuf = lCols.buffer(5);
+    MTL::Buffer* pLineDiscBuf = lCols.buffer(6);
 
     MTL::Buffer* pResultBinsBuf = device->newBuffer(4 * sizeof(float), MTL::ResourceStorageModeShared);
 
@@ -153,9 +152,9 @@ void runQ8Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
     releaseAll(pBuildOrdersPipe, pProbePipe, pPartBitmapBuf, pCustNationMapBuf, pSuppNationMapBuf,
-              pOrdKeyBuf, pOrdCustBuf, pOrdDateBuf, pOrdCustMapBuf, pOrdYearMapBuf,
-              pLineOrdKeyBuf, pLinePartKeyBuf, pLineSuppKeyBuf, pLinePriceBuf, pLineDiscBuf,
+              pOrdCustMapBuf, pOrdYearMapBuf,
               pResultBinsBuf);
+    // Input buffers owned by pCols/cCols/oCols/lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

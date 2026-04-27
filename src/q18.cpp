@@ -10,37 +10,34 @@ void runQ18Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     const std::string sf_path = g_dataset_path;
 
     auto parseStart = std::chrono::high_resolution_clock::now();
-    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
-    auto& c_custkey = cCols.ints(0); auto& c_name = cCols.chars(1);
+    auto cCols = loadQueryColumns(device, sf_path + "customer.tbl", {{0, ColType::INT}, {1, ColType::CHAR_FIXED, 25}});
 
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}});
-    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1); auto& o_totalprice = oCols.floats(3); auto& o_orderdate = oCols.ints(4);
+    auto oCols = loadQueryColumns(device, sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {3, ColType::FLOAT}, {4, ColType::DATE}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {4, ColType::FLOAT}});
-    auto& l_orderkey = lCols.ints(0); auto& l_quantity = lCols.floats(4);
+    auto lCols = loadQueryColumns(device, sf_path + "lineitem.tbl", {{0, ColType::INT}, {4, ColType::FLOAT}});
     auto parseEnd = std::chrono::high_resolution_clock::now();
     double cpuParseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
-    uint liSize = (uint)l_orderkey.size();
-    uint ordSize = (uint)o_orderkey.size();
+    uint liSize = (uint)lCols.rows();
+    uint ordSize = (uint)oCols.rows();
 
     int max_orderkey = 0;
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     uint qty_map_size = max_orderkey + 1;
 
     auto pAggPipe = createPipeline(device, library, "q18_aggregate_quantity_kernel");
     auto pFilterPipe = createPipeline(device, library, "q18_filter_orders_kernel");
     if (!pAggPipe || !pFilterPipe) return;
 
-    MTL::Buffer* pLineOrdKeyBuf = device->newBuffer(l_orderkey.data(), liSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineQtyBuf = device->newBuffer(l_quantity.data(), liSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineOrdKeyBuf = lCols.buffer(0);
+    MTL::Buffer* pLineQtyBuf = lCols.buffer(4);
     MTL::Buffer* pQtyMapBuf = device->newBuffer((size_t)qty_map_size * sizeof(float), MTL::ResourceStorageModeShared);
 
     // Order columns for the filter kernel
-    MTL::Buffer* pOrdKeyBuf = device->newBuffer(o_orderkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCustKeyBuf = device->newBuffer(o_custkey.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdDateBuf = device->newBuffer(o_orderdate.data(), ordSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdPriceBuf = device->newBuffer(o_totalprice.data(), ordSize * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdKeyBuf = oCols.buffer(0);
+    MTL::Buffer* pOrdCustKeyBuf = oCols.buffer(1);
+    MTL::Buffer* pOrdDateBuf = oCols.buffer(4);
+    MTL::Buffer* pOrdPriceBuf = oCols.buffer(3);
 
     // Output buffer for qualifying orders (worst case: all orders qualify)
     // Q18OutputRow = {int, int, int, float, float} = 20 bytes
@@ -63,7 +60,8 @@ void runQ18Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         enc->setBuffer(pLineQtyBuf, 0, 1);
         enc->setBuffer(pQtyMapBuf, 0, 2);
         enc->setBytes(&liSize, sizeof(liSize), 3);
-        enc->dispatchThreadgroups(MTL::Size(2048, 1, 1), MTL::Size(1024, 1, 1));
+        const uint q18AggTGs = std::min(2048u, (liSize + 1023u) / 1024u);
+        enc->dispatchThreadgroups(MTL::Size(q18AggTGs, 1, 1), MTL::Size(1024, 1, 1));
 
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
@@ -95,9 +93,11 @@ void runQ18Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
 
     // Build custkey→row index for customer
     int max_custkey = 0;
-    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    for (int k : cCols.intSpan(0)) max_custkey = std::max(max_custkey, k);
     std::vector<int> cust_index(max_custkey + 1, -1);
-    for (size_t i = 0; i < c_custkey.size(); i++) cust_index[c_custkey[i]] = (int)i;
+    const int* c_custkey = cCols.ints(0);
+    const char* c_name = cCols.chars(1);
+    for (size_t i = 0; i < cCols.rows(); i++) cust_index[c_custkey[i]] = (int)i;
 
     struct Q18Result {
         std::string c_name; int c_custkey; int o_orderkey; int o_orderdate;
@@ -109,7 +109,7 @@ void runQ18Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
         int ck = gpuRows[i].o_custkey;
         std::string name;
         if (ck <= max_custkey && cust_index[ck] >= 0)
-            name = trimFixed(c_name.data(), cust_index[ck], 25);
+            name = trimFixed(c_name, cust_index[ck], 25);
         results.push_back({name, ck, gpuRows[i].o_orderkey, gpuRows[i].o_orderdate,
                           gpuRows[i].o_totalprice, gpuRows[i].sum_qty});
     }
@@ -139,9 +139,9 @@ void runQ18Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::
     printf("\nQ18 | %u lineitem\n", liSize);
     printTimingSummary(cpuParseMs, gpuSec * 1000.0, cpuPostMs);
 
-    releaseAll(pAggPipe, pFilterPipe, pLineOrdKeyBuf, pLineQtyBuf, pQtyMapBuf,
-              pOrdKeyBuf, pOrdCustKeyBuf, pOrdDateBuf, pOrdPriceBuf,
+    releaseAll(pAggPipe, pFilterPipe, pQtyMapBuf,
               pOutputBuf, pOutputCountBuf);
+    // Input buffers owned by cCols/oCols/lCols (QueryColumns).
 }
 
 // --- SF100 Chunked ---

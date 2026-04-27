@@ -36,6 +36,12 @@ inline int q1_ls_index(char ls) {
 // then thread 0 of each TG does atomic_add to 6 global result slots.
 // Eliminates intermediate buffers and Stage 2 entirely.
 // Long values use split lo/hi uint32 atomic pairs (Metal lacks atomic_long).
+// Output layout: 60 uints, stride 10 per bin:
+//   [bin*10 + 0] qty_lo,   [bin*10 + 1] qty_hi
+//   [bin*10 + 2] base_lo,  [bin*10 + 3] base_hi
+//   [bin*10 + 4] disc_lo,  [bin*10 + 5] disc_hi
+//   [bin*10 + 6] charge_lo,[bin*10 + 7] charge_hi
+//   [bin*10 + 8] disc_bp,  [bin*10 + 9] count
 kernel void q1_fused_kernel(
     const device int*   l_shipdate        [[buffer(0)]],
     const device char*  l_returnflag      [[buffer(1)]],
@@ -44,19 +50,9 @@ kernel void q1_fused_kernel(
     const device float* l_extendedprice   [[buffer(4)]],
     const device float* l_discount        [[buffer(5)]],
     const device float* l_tax             [[buffer(6)]],
-    // Outputs: 6 bins × (4 long metrics as lo/hi pairs + 2 uint metrics) = 6×10 = 60 uint slots
-    device atomic_uint* out_qty_lo        [[buffer(7)]],   // [6] lo halves
-    device atomic_uint* out_qty_hi        [[buffer(8)]],   // [6] hi halves
-    device atomic_uint* out_base_lo       [[buffer(9)]],
-    device atomic_uint* out_base_hi       [[buffer(10)]],
-    device atomic_uint* out_disc_lo       [[buffer(11)]],
-    device atomic_uint* out_disc_hi       [[buffer(12)]],
-    device atomic_uint* out_charge_lo     [[buffer(13)]],
-    device atomic_uint* out_charge_hi     [[buffer(14)]],
-    device atomic_uint* out_discount_bp   [[buffer(15)]],
-    device atomic_uint* out_count         [[buffer(16)]],
-    constant uint& data_size              [[buffer(17)]],
-    constant int&  cutoff_date            [[buffer(18)]],
+    device atomic_uint* d_q1_aggs         [[buffer(7)]],   // [60] packed
+    constant uint& data_size              [[buffer(8)]],
+    constant int&  cutoff_date            [[buffer(9)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_id_in_group [[thread_index_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]],
@@ -81,16 +77,19 @@ kernel void q1_fused_kernel(
         float d    = l_discount[i];
         float t    = l_tax[i];
 
-        long base_c = (long)floor(base * 100.0f + 0.5f);
-        long qty_c  = (long)floor(qty  * 100.0f + 0.5f);
-        int  d_bp   = (int)floor(d * 100.0f + 0.5f);
-        int  t_bp   = (int)floor(t * 100.0f + 0.5f);
-        long disc_c   = (base_c * (long)(100 - d_bp) + 50) / 100;
-        long charge_c = (disc_c * (long)(100 + t_bp) + 50) / 100;
+        // Codegen-style fixed-point: truncating cast (matches CG numerics +
+        // eliminates floor() and the two long integer divisions per row).
+        float disc_price = base * (1.0f - d);
+        float charge     = disc_price * (1.0f + t);
+        long base_c   = (long)((uint)(base       * 100.0f));
+        long qty_c    = (long)((uint)(qty        * 100.0f));
+        long disc_c   = (long)((uint)(disc_price * 100.0f));
+        long charge_c = (long)((uint)(charge     * 100.0f));
+        uint d_bp     =       (uint)(d           * 100.0f);
 
         sum_qty_c[bin] += qty_c; sum_base_c[bin] += base_c;
         sum_disc_c[bin] += disc_c; sum_charge_c[bin] += charge_c;
-        sum_disc_bp[bin] += (uint)d_bp; cnt[bin] += 1u;
+        sum_disc_bp[bin] += d_bp; cnt[bin] += 1u;
     }
 
     // SIMD-accelerated threadgroup reduction, then thread 0 atomically adds to global
@@ -98,25 +97,26 @@ kernel void q1_fused_kernel(
     threadgroup uint tg32[32];
 
     for (int b = 0; b < BINS; ++b) {
+        const int base_idx = b * 10;
         long r;
         r = tg_reduce_long(sum_qty_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_qty_lo[b], &out_qty_hi[b], r);
+        if (thread_id_in_group == 0) atomic_add_long_pair(&d_q1_aggs[base_idx + 0], &d_q1_aggs[base_idx + 1], r);
 
         r = tg_reduce_long(sum_base_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_base_lo[b], &out_base_hi[b], r);
+        if (thread_id_in_group == 0) atomic_add_long_pair(&d_q1_aggs[base_idx + 2], &d_q1_aggs[base_idx + 3], r);
 
         r = tg_reduce_long(sum_disc_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_disc_lo[b], &out_disc_hi[b], r);
+        if (thread_id_in_group == 0) atomic_add_long_pair(&d_q1_aggs[base_idx + 4], &d_q1_aggs[base_idx + 5], r);
 
         r = tg_reduce_long(sum_charge_c[b], thread_id_in_group, threads_per_group, tg64);
-        if (thread_id_in_group == 0) atomic_add_long_pair(&out_charge_lo[b], &out_charge_hi[b], r);
+        if (thread_id_in_group == 0) atomic_add_long_pair(&d_q1_aggs[base_idx + 6], &d_q1_aggs[base_idx + 7], r);
 
         uint u;
         u = tg_reduce_uint(sum_disc_bp[b], thread_id_in_group, threads_per_group, tg32);
-        if (thread_id_in_group == 0) atomic_fetch_add_explicit(&out_discount_bp[b], u, memory_order_relaxed);
+        if (thread_id_in_group == 0) atomic_fetch_add_explicit(&d_q1_aggs[base_idx + 8], u, memory_order_relaxed);
 
         u = tg_reduce_uint(cnt[b], thread_id_in_group, threads_per_group, tg32);
-        if (thread_id_in_group == 0) atomic_fetch_add_explicit(&out_count[b], u, memory_order_relaxed);
+        if (thread_id_in_group == 0) atomic_fetch_add_explicit(&d_q1_aggs[base_idx + 9], u, memory_order_relaxed);
     }
 }
 

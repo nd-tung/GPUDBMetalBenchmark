@@ -7,24 +7,24 @@
 // --- Standard (SF1/SF10) ---
 void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::Library* library) {
     std::cout << "--- Running TPC-H Query 6 Benchmark ---" << std::endl;
-    
-    // Load required columns from lineitem table
+
     auto q6ParseStart = std::chrono::high_resolution_clock::now();
-    auto cols = loadColumnsMulti(g_dataset_path + "lineitem.tbl", {
-        {4, ColType::FLOAT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}, {10, ColType::DATE}
+    auto cols = loadQueryColumns(device, g_dataset_path + "lineitem.tbl", {
+        {4,  ColType::FLOAT},   // l_quantity
+        {5,  ColType::FLOAT},   // l_extendedprice
+        {6,  ColType::FLOAT},   // l_discount
+        {10, ColType::DATE},    // l_shipdate
     });
-    auto& l_quantity = cols.floats(4); auto& l_extendedprice = cols.floats(5);
-    auto& l_discount = cols.floats(6); auto& l_shipdate = cols.ints(10);
     auto q6ParseEnd = std::chrono::high_resolution_clock::now();
     double q6CpuParseMs = std::chrono::duration<double, std::milli>(q6ParseEnd - q6ParseStart).count();
 
-    if (l_shipdate.empty() || l_discount.empty() || l_quantity.empty() || l_extendedprice.empty()) {
+    uint dataSize = (uint)cols.rows();
+    if (dataSize == 0) {
         std::cerr << "Error: Could not load required columns for Q6 benchmark" << std::endl;
         return;
     }
-
-    uint dataSize = (uint)l_shipdate.size();
-    std::cout << "Loaded " << dataSize << " rows for TPC-H Query 6." << std::endl;
+    std::cout << "Loaded " << dataSize << " rows for TPC-H Query 6."
+              << (cols.zeroCopy() ? " [zero-copy]" : " [copy]") << std::endl;
 
     // Query parameters
     int start_date = 19940101;   // 1994-01-01
@@ -37,14 +37,15 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     auto stage2Pipeline = createPipeline(device, library, "q6_final_sum_stage2");
     if (!stage1Pipeline || !stage2Pipeline) return;
 
-    // Create GPU buffers
-    const int numThreadgroups = 2048;
-    MTL::Buffer* shipdateBuffer = device->newBuffer(l_shipdate.data(), dataSize * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* discountBuffer = device->newBuffer(l_discount.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* quantityBuffer = device->newBuffer(l_quantity.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* extendedpriceBuffer = device->newBuffer(l_extendedprice.data(), dataSize * sizeof(float), MTL::ResourceStorageModeShared);
+    // Cap dispatch by input size; one partial-revenue slot per TG, so fewer TGs
+    // means a smaller stage-2 reduction.
+    const int numThreadgroups = std::min(2048, (int)((dataSize + 1023u) / 1024u));
+    MTL::Buffer* shipdateBuffer       = cols.buffer(10);
+    MTL::Buffer* discountBuffer       = cols.buffer(6);
+    MTL::Buffer* quantityBuffer       = cols.buffer(4);
+    MTL::Buffer* extendedpriceBuffer  = cols.buffer(5);
     MTL::Buffer* partialRevenuesBuffer = device->newBuffer(numThreadgroups * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* finalRevenueBuffer = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* finalRevenueBuffer    = device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
 
     // Execute GPU kernels (2 warmup + 1 measured)
     double q6_gpu_s = 0.0;
@@ -115,8 +116,8 @@ void runQ6Benchmark(MTL::Device* device, MTL::CommandQueue* commandQueue, MTL::L
     printf("  Bandwidth:          %10.2f GB/s\n", bandwidth);
 
     releaseAll(stage1Pipeline, stage2Pipeline,
-              shipdateBuffer, discountBuffer, quantityBuffer, extendedpriceBuffer,
               partialRevenuesBuffer, finalRevenueBuffer);
+    // Input buffers are owned by `cols` (QueryColumns) and released on scope exit.
 }
 
 

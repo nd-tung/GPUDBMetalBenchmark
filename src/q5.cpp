@@ -12,29 +12,25 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     // 1. Load data
     auto q5ParseStart = std::chrono::high_resolution_clock::now();
-    auto cCols = loadColumnsMulti(sf_path + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
-    auto& c_custkey = cCols.ints(0); auto& c_nationkey = cCols.ints(3);
+    auto cCols = loadQueryColumns(pDevice, sf_path + "customer.tbl", {{0, ColType::INT}, {3, ColType::INT}});
 
     auto s = loadSupplierBasic(sf_path);
     auto& s_suppkey = s.suppkey;
     auto& s_nationkey = s.nationkey;
 
-    auto oCols = loadColumnsMulti(sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
-    auto& o_orderkey = oCols.ints(0); auto& o_custkey = oCols.ints(1); auto& o_orderdate = oCols.ints(4);
+    auto oCols = loadQueryColumns(pDevice, sf_path + "orders.tbl", {{0, ColType::INT}, {1, ColType::INT}, {4, ColType::DATE}});
 
-    auto lCols = loadColumnsMulti(sf_path + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
-    auto& l_orderkey = lCols.ints(0); auto& l_suppkey = lCols.ints(2);
-    auto& l_extendedprice = lCols.floats(5); auto& l_discount = lCols.floats(6);
+    auto lCols = loadQueryColumns(pDevice, sf_path + "lineitem.tbl", {{0, ColType::INT}, {2, ColType::INT}, {5, ColType::FLOAT}, {6, ColType::FLOAT}});
 
     auto nat = loadNation(sf_path, true);
     auto reg = loadRegion(sf_path);
     auto q5ParseEnd = std::chrono::high_resolution_clock::now();
     double q5CpuParseMs = std::chrono::duration<double, std::milli>(q5ParseEnd - q5ParseStart).count();
 
-    const uint customer_size = (uint)c_custkey.size();
+    const uint customer_size = (uint)cCols.rows();
     const uint supplier_size = (uint)s_suppkey.size();
-    const uint orders_size = (uint)o_orderkey.size();
-    const uint lineitem_size = (uint)l_orderkey.size();
+    const uint orders_size = (uint)oCols.rows();
+    const uint lineitem_size = (uint)lCols.rows();
     std::cout << "Loaded data. Customer: " << customer_size << ", Supplier: " << supplier_size
               << ", Orders: " << orders_size << ", Lineitem: " << lineitem_size << std::endl;
 
@@ -58,15 +54,15 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     // 4. Create GPU buffers
     int max_custkey = 0;
-    for (int k : c_custkey) max_custkey = std::max(max_custkey, k);
+    for (int k : cCols.intSpan(0)) max_custkey = std::max(max_custkey, k);
     int max_suppkey = 0;
     for (int k : s_suppkey) max_suppkey = std::max(max_suppkey, k);
 
     const uint cust_map_size = max_custkey + 1;
     const uint supp_map_size = max_suppkey + 1;
 
-    MTL::Buffer* pCustKeyBuf = pDevice->newBuffer(c_custkey.data(), customer_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pCustNationBuf = pDevice->newBuffer(c_nationkey.data(), customer_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pCustKeyBuf = cCols.buffer(0);
+    MTL::Buffer* pCustNationBuf = cCols.buffer(3);
     MTL::Buffer* pCustNationMapBuf = pDevice->newBuffer(cust_map_size * sizeof(int), MTL::ResourceStorageModeShared);
     std::memset(pCustNationMapBuf->contents(), -1, cust_map_size * sizeof(int));
 
@@ -77,27 +73,28 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
 
     MTL::Buffer* pNationBitmapBuf = pDevice->newBuffer(&cpu_nation_bitmap, sizeof(uint), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pOrdKeyBuf = pDevice->newBuffer(o_orderkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdCustKeyBuf = pDevice->newBuffer(o_custkey.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pOrdDateBuf = pDevice->newBuffer(o_orderdate.data(), orders_size * sizeof(int), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pOrdKeyBuf = oCols.buffer(0);
+    MTL::Buffer* pOrdCustKeyBuf = oCols.buffer(1);
+    MTL::Buffer* pOrdDateBuf = oCols.buffer(4);
 
     // Orders direct map: orderkey -> nationkey (replaces hash table)
     int max_orderkey = 0;
-    for (int k : o_orderkey) max_orderkey = std::max(max_orderkey, k);
+    for (int k : oCols.intSpan(0)) max_orderkey = std::max(max_orderkey, k);
     const uint map_size = max_orderkey + 1;
     MTL::Buffer* pOrdersMapBuf = pDevice->newBuffer((size_t)map_size * sizeof(int), MTL::ResourceStorageModeShared);
 
-    MTL::Buffer* pLineOrdKeyBuf = pDevice->newBuffer(l_orderkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineSuppKeyBuf = pDevice->newBuffer(l_suppkey.data(), lineitem_size * sizeof(int), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLinePriceBuf = pDevice->newBuffer(l_extendedprice.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
-    MTL::Buffer* pLineDiscBuf = pDevice->newBuffer(l_discount.data(), lineitem_size * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* pLineOrdKeyBuf = lCols.buffer(0);
+    MTL::Buffer* pLineSuppKeyBuf = lCols.buffer(2);
+    MTL::Buffer* pLinePriceBuf = lCols.buffer(5);
+    MTL::Buffer* pLineDiscBuf = lCols.buffer(6);
 
     // Revenue array: 25 nations (floats)
     MTL::Buffer* pNationRevenueBuf = pDevice->newBuffer(25 * sizeof(float), MTL::ResourceStorageModeShared);
 
     const int date_start = 19940101;
     const int date_end = 19950101;
-    const uint num_threadgroups = 2048;
+    // Cap dispatch by lineitem size (the dominant scan).
+    const uint num_threadgroups = std::min(2048u, (lineitem_size + 1023u) / 1024u);
 
     // 5. Execute GPU pipeline (2 warmup + 1 measured)
     double q5_gpu_compute_time = 0.0;
@@ -188,12 +185,12 @@ void runQ5Benchmark(MTL::Device* pDevice, MTL::CommandQueue* pCommandQueue, MTL:
     printTimingSummary(q5CpuParseMs, q5GpuMs, q5CpuPostMs);
 
     releaseAll(pCustMapPipe, pSuppMapPipe, pOrdersMapPipe, pProbeAggPipe,
-              pCustKeyBuf, pCustNationBuf, pCustNationMapBuf,
+              pCustNationMapBuf,
               pSuppKeyBuf, pSuppNationBuf, pSuppNationMapBuf,
               pNationBitmapBuf,
-              pOrdKeyBuf, pOrdCustKeyBuf, pOrdDateBuf, pOrdersMapBuf,
-              pLineOrdKeyBuf, pLineSuppKeyBuf, pLinePriceBuf, pLineDiscBuf,
+              pOrdersMapBuf,
               pNationRevenueBuf);
+    // Input buffers owned by cCols/oCols/lCols (QueryColumns).
 }
 
 
