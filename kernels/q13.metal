@@ -185,34 +185,31 @@ kernel void q13_count_fused_kernel(
     uint threads_per_group [[threads_per_threadgroup]],
     uint grid_size [[threads_per_grid]])
 {
+    // Bounds: comments are zero-terminated, max 79 chars. "special" is 7 chars
+    // and "requests" is 8 chars, so:
+    //   - "special" can start at positions 0..(80-15)=65 (need room for "requestsX")
+    //   - "requests" can start at positions (sp_pos+7)..(80-8)=72
+    // The loops also early-exit on '\0', mirroring codegen's structure (no
+    // separate strlen pass — the inner loop bound + null check are fused).
     uint global_id = (group_id * threads_per_group) + thread_id_in_group;
     for (uint i = global_id; i < orders_size; i += grid_size) {
-        // Inline NOT LIKE '%special%requests%': qualifies when pattern is absent.
-        const device char* s = o_comment + (uint64_t)i * comment_stride;
-        uint len = 0;
-        while (len < comment_stride && s[len] != '\0') len++;
+        const device char* c = o_comment + (uint64_t)i * comment_stride;
 
-        bool found_special = false;
-        uint after_special = 0;
-        for (uint j = 0; j + 7 <= len; ++j) {
-            if (s[j]=='s' && s[j+1]=='p' && s[j+2]=='e' && s[j+3]=='c' &&
-                s[j+4]=='i' && s[j+5]=='a' && s[j+6]=='l') {
-                found_special = true;
-                after_special = j + 7;
-                break;
-            }
-        }
         bool found_pattern = false;
-        if (found_special) {
-            for (uint j = after_special; j + 8 <= len; ++j) {
-                if (s[j]=='r' && s[j+1]=='e' && s[j+2]=='q' && s[j+3]=='u' &&
-                    s[j+4]=='e' && s[j+5]=='s' && s[j+6]=='t' && s[j+7]=='s') {
-                    found_pattern = true;
-                    break;
+        for (uint p = 0; p <= 65u && c[p] != '\0'; ++p) {
+            if (c[p]=='s' && c[p+1]=='p' && c[p+2]=='e' && c[p+3]=='c' &&
+                c[p+4]=='i' && c[p+5]=='a' && c[p+6]=='l') {
+                for (uint q = p + 7u; q <= 72u && c[q] != '\0'; ++q) {
+                    if (c[q]=='r' && c[q+1]=='e' && c[q+2]=='q' && c[q+3]=='u' &&
+                        c[q+4]=='e' && c[q+5]=='s' && c[q+6]=='t' && c[q+7]=='s') {
+                        found_pattern = true;
+                        break;
+                    }
                 }
+                break; // codegen also breaks after first 'special' match attempt
             }
         }
-        if (found_pattern) continue; // NOT LIKE: skip when pattern is present
+        if (found_pattern) continue; // NOT LIKE: skip qualifying
 
         int ck = o_custkey[i];
         if (ck < 1 || (uint)ck > customer_size) continue;
